@@ -124,6 +124,11 @@ pub struct ChannelEstimator {
 
 impl ChannelEstimator {
     pub fn new(map: Arc<CellMap>) -> Self {
+        Self::new_at(map, crate::params::WorkingRate::R48)
+    }
+
+    /// [`Self::new`] at an explicit working sample rate (mode E needs 120 or 192 kHz).
+    pub fn new_at(map: Arc<CellMap>, rate: crate::params::WorkingRate) -> Self {
         let n_car = map.num_carriers;
         let x = map.scattered.freq_int;
         let num_pil = (n_car - 1) / x + 1;
@@ -137,8 +142,8 @@ impl ChannelEstimator {
         let track = PdsTracker::new(&map, num_pil, delay + 1);
         let fw_len = freq_wiener_len(map.mode());
         let ns = map.symbols_per_frame;
-        let sym_rate = Real::from(SAMPLE_RATE) / map.mode().symbol_len() as Real;
-        let sys_bw = n_car as Real / map.mode().fft_size() as Real * Real::from(SAMPLE_RATE);
+        let sym_rate = Real::from(rate.hz()) / map.mode().symbol_len_at(rate) as Real;
+        let sys_bw = n_car as Real / map.mode().fft_size_at(rate) as Real * Real::from(rate.hz());
         let nom_bw = map.occupancy().bandwidth_khz() * 1000.0;
         let mut est = Self {
             n_car,

@@ -20,8 +20,15 @@ pub struct OfdmDemod {
 
 impl OfdmDemod {
     pub fn new(map: &CellMap) -> Self {
-        let n = map.mode().fft_size();
-        let sym_rate = f64::from(crate::params::SAMPLE_RATE) / map.mode().symbol_len() as f64;
+        Self::new_at(map, crate::params::WorkingRate::R48)
+    }
+
+    /// [`Self::new`] at an explicit working sample rate: the FFT size, the guard interval and
+    /// the symbol rate all follow the mode's geometry at that rate, which is what makes mode E
+    /// (DRM+, which needs 120 or 192 kHz) demodulable.
+    pub fn new_at(map: &CellMap, rate: crate::params::WorkingRate) -> Self {
+        let n = map.mode().fft_size_at(rate);
+        let sym_rate = f64::from(rate.hz()) / map.mode().symbol_len_at(rate) as f64;
         Self {
             fft: Fft::new(n),
             n,

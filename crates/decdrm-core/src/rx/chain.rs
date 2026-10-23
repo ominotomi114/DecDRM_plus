@@ -13,7 +13,7 @@ use crate::fec::crc::Crc;
 use crate::fec::mlc::{MlcDecoder, MlcParams, MscProtection};
 use crate::fec::qam::EqCell;
 use super::mscdec::MscDecoder;
-use crate::params::{FRAMES_PER_SUPERFRAME, RobustnessMode, SAMPLE_RATE, SpectrumOccupancy};
+use crate::params::{RobustnessMode, SpectrumOccupancy, WorkingRate};
 use crate::tables::num_fac_cells;
 use crate::{Cplx, Real};
 use std::collections::VecDeque;
@@ -131,6 +131,8 @@ pub struct MscConfig {
 pub(super) struct SymbolChain {
     /// The robustness mode being received (its frame geometry and FAC size).
     mode: RobustnessMode,
+    /// Working sample rate of the input (mode E, DRM+, needs 120 or 192 kHz).
+    rate: WorkingRate,
     map: Arc<CellMap>,
     ofdm: OfdmDemod,
     frame: FrameSync,
@@ -168,9 +170,10 @@ pub(super) struct SymbolChain {
     msc_cells: Vec<EqCell>,
     /// MSC cells before each super-frame symbol (position of its first MSC cell).
     msc_offset: Vec<usize>,
-    /// Carrier offset (`k − kmin`) of each MSC cell of the multiplex frames at
-    /// positions 0, 1, 2 of the super frame (diversity branches hand them out).
-    frame_carriers: [Arc<[u16]>; FRAMES_PER_SUPERFRAME],
+    /// Carrier offset (`k − kmin`) of each MSC cell of the multiplex frames of the super
+    /// frame, in order (diversity branches hand them out). A `Vec` because the count is
+    /// per-mode: 3 for A–D, 4 for mode E (DRM+).
+    frame_carriers: Vec<Arc<[u16]>>,
     /// Collecting a multiplex frame that started at a frame boundary.
     msc_collecting: bool,
     /// Frames were lost: restart the cell deinterleaver before the next frame.
@@ -206,10 +209,11 @@ impl SymbolChain {
         sdc_dec.metric = cfg.metric;
         Some(Self {
             mode,
-            ofdm: OfdmDemod::new(&map),
-            frame: FrameSync::new(&map),
-            chanest: ChannelEstimator::new(Arc::clone(&map)),
-            history: super::scatter::ChannelHistory::new(&map),
+            rate: cfg.working_rate,
+            ofdm: OfdmDemod::new_at(&map, cfg.working_rate),
+            frame: FrameSync::new_at(&map, cfg.working_rate),
+            chanest: ChannelEstimator::new_at(Arc::clone(&map), cfg.working_rate),
+            history: super::scatter::ChannelHistory::new_at(&map, cfg.working_rate),
             cells: Vec::new(),
             recent: VecDeque::new(),
             frame_id: None,
@@ -288,9 +292,9 @@ impl SymbolChain {
             && let Some(map) = CellMap::new(self.map.mode(), fac.channel.occupancy)
         {
             let map = Arc::new(map);
-            self.ofdm = OfdmDemod::new(&map);
+            self.ofdm = OfdmDemod::new_at(&map, self.rate);
             self.frame.reconfigure(&map);
-            self.chanest = ChannelEstimator::new(Arc::clone(&map));
+            self.chanest = ChannelEstimator::new_at(Arc::clone(&map), self.rate);
             if self.tracking {
                 self.chanest.start_time_wiener_tracking();
             }
@@ -373,7 +377,7 @@ impl SymbolChain {
         }
         if fs.id_changed {
             // Frame alignment changed: channel history and demapper are invalid.
-            self.chanest = ChannelEstimator::new(Arc::clone(&self.map));
+            self.chanest = ChannelEstimator::new_at(Arc::clone(&self.map), self.rate);
             if self.tracking {
                 self.chanest.start_time_wiener_tracking();
             }
@@ -433,7 +437,7 @@ impl SymbolChain {
         // Frame within the super frame (unknown before the first FAC: assume a frame
         // without SDC so MSC cells are still plotted).
         let frame = match self.frame_id {
-            Some(f) if s == 0 => (f + 1) % FRAMES_PER_SUPERFRAME,
+            Some(f) if s == 0 => (f + 1) % self.mode.frames_per_superframe(),
             Some(f) => f,
             None => 1,
         };
@@ -479,7 +483,7 @@ impl SymbolChain {
         v.msc = self.vis_msc.iter().copied().collect();
         v.chan_rows = self.chan_rows.iter().cloned().collect();
         v.chan_seq = self.chan_seq;
-        v.symbol_s = self.map.mode().symbol_len() as Real / Real::from(SAMPLE_RATE);
+        v.symbol_s = self.map.mode().symbol_len_at(self.rate) as Real / Real::from(self.rate.hz());
         let (pds, axis) = self.chanest.power_delay_profile();
         v.pds = pds;
         v.pds_axis = Some(axis);
@@ -519,7 +523,7 @@ impl SymbolChain {
         if s == 0
             && let Some(f) = self.frame_id.as_mut()
         {
-            *f = (*f + 1) % FRAMES_PER_SUPERFRAME;
+            *f = (*f + 1) % self.mode.frames_per_superframe();
         }
         let Some(mut f) = self.frame_id else { return };
 
@@ -710,14 +714,15 @@ fn msc_offsets(map: &CellMap) -> Vec<usize> {
 
 /// The carrier offsets of the MSC cells of each multiplex frame of a super frame, in
 /// transmission order (the frames' cells follow `msc_carriers` symbol by symbol).
-fn msc_frame_carriers(map: &CellMap) -> [Arc<[u16]>; FRAMES_PER_SUPERFRAME] {
+fn msc_frame_carriers(map: &CellMap) -> Vec<Arc<[u16]>> {
+    let nframes = map.mode().frames_per_superframe();
     let n = map.msc_cells_per_frame.max(1);
-    let mut frames: [Vec<u16>; FRAMES_PER_SUPERFRAME] = Default::default();
+    let mut frames: Vec<Vec<u16>> = vec![Vec::new(); nframes];
     let carriers = (0..map.symbols_per_superframe).flat_map(|sym| map.msc_carriers(sym).iter().copied());
-    for (pos, c) in carriers.take(FRAMES_PER_SUPERFRAME * n).enumerate() {
+    for (pos, c) in carriers.take(nframes * n).enumerate() {
         frames[pos / n].push(c);
     }
-    frames.map(Arc::from)
+    frames.into_iter().map(Arc::from).collect()
 }
 
 fn track_reset(chanest: &mut ChannelEstimator) {

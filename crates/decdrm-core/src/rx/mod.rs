@@ -34,7 +34,7 @@ pub use input::{InputFormat, RealChannel};
 use crate::dsp::resampler::FracResampler;
 use crate::fac::{ChannelParams, Fac};
 use crate::fec::qam::MetricKind;
-use crate::params::{RobustnessMode, SAMPLE_RATE, SpectrumOccupancy};
+use crate::params::{RobustnessMode, SpectrumOccupancy, WorkingRate};
 use crate::{Cplx, Real};
 use chain::SymbolChain;
 use freqacq::FreqAcquisition;
@@ -103,6 +103,10 @@ pub struct ReceiverConfig {
     /// A branch of diversity reception: hand the equalised MSC cells out per multiplex
     /// frame ([`ReceiverEvent::MscCells`]) for the combiner instead of decoding them.
     pub diversity_branch: bool,
+    /// Working sample rate of the input: the rate the OFDM baseband is demodulated at, in Hz.
+    /// Modes A–D are received at 48 kHz (the default); robustness mode E (DRM+) needs
+    /// [`WorkingRate::R120`] or more, because its 213 carriers reach ±47.11 kHz.
+    pub working_rate: WorkingRate,
 }
 
 /// The default MSC soft metric: the Huber shape with Dream's amplitude weighting and a
@@ -125,6 +129,7 @@ impl Default for ReceiverConfig {
             msc_iterations: 2,
             metric: MSC_METRIC,
             diversity_branch: false,
+            working_rate: WorkingRate::R48,
         }
     }
 }
@@ -308,6 +313,8 @@ pub struct Receiver {
     timesync: TimeSync,
     chain: Option<SymbolChain>,
     mode: RobustnessMode,
+    /// A mode/occupancy the caller pinned with [`Receiver::set_mode`], instead of searching.
+    pinned: Option<(RobustnessMode, SpectrumOccupancy)>,
     state: RxState,
     symbols_without_fac: usize,
     bad_facs: usize,
@@ -338,6 +345,7 @@ impl Receiver {
         let real = input.is_real();
         let mode = RobustnessMode::B;
         Self {
+            pinned: None,
             acq: Some(FreqAcquisition::new(real, cfg.auto_flip)),
             acq_power: None,
             loud_samples: 0,
@@ -352,7 +360,7 @@ impl Receiver {
             track_hz: 0.0,
             nco_phase: 0.0,
             mixed: Vec::new(),
-            timesync: TimeSync::new(mode),
+            timesync: TimeSync::new_at(mode, cfg.working_rate),
             chain: None,
             mode,
             state: RxState::Acquisition,
@@ -410,9 +418,9 @@ impl Receiver {
             spectrum_db: self.spectrum.db(),
             waterfall_rows: self.spectrum.rows.iter().cloned().collect(),
             spectrum_seq: self.spectrum.count,
-            spectrum_row_s: InputSpectrum::LEN as Real / Real::from(SAMPLE_RATE),
+            spectrum_row_s: InputSpectrum::LEN as Real / Real::from(self.fs()),
             spectrum_centre_hz: 0.0,
-            spectrum_span_hz: Real::from(SAMPLE_RATE),
+            spectrum_span_hz: Real::from(self.fs()),
             real_input: self.input.is_real(),
             dc_hz,
             signal_band_hz,
@@ -425,12 +433,43 @@ impl Receiver {
         self.chain.as_ref().map(|c| c.msc_cells()).unwrap_or_default()
     }
 
-    /// Latest robustness-mode detection scores (A, B, C, D), for diagnostics.
-    pub fn mode_scores(&self) -> [Real; 4] {
+    /// Latest robustness-mode detection scores, one per mode (A, B, C, D, E), for
+    /// diagnostics.
+    pub fn mode_scores(&self) -> [Real; crate::params::RobustnessMode::ALL.len()] {
         self.timesync.last_mode_scores
     }
 
     /// Restart acquisition from scratch (e.g. after retuning).
+    /// Pin the robustness mode and spectrum occupancy instead of searching for them.
+    ///
+    /// The mode search cannot be relied on for mode E (DRM+): its 2-bit FAC field cannot
+    /// express the mode, and its geometry is out of the acquisition scan's 48 kHz design.
+    /// A caller that already knows the mode (decoding a recording, say) sets it here; the
+    /// receiver then does not try to detect it and does not re-derive the occupancy from
+    /// the FAC.
+    pub fn set_mode(&mut self, mode: RobustnessMode, occupancy: SpectrumOccupancy) {
+        self.pinned = Some((mode, occupancy));
+        self.mode = mode;
+        self.timesync.stop_mode_detection();
+        self.timesync.restart(mode);
+        self.chain = None;
+        // The caller has already told us what and where the signal is, so there is nothing
+        // to search for: drop the frequency acquisition and run at DC. (Its scan is built
+        // for 48 kHz geometry — a fixed 6144-point FFT over fixed pilot bins — and would
+        // not find a mode E signal at 120/192 kHz anyway.)
+        self.acq = None;
+        self.acq_power = None;
+        self.conj = false;
+        self.dc_hz = 0.0;
+        self.track_hz = 0.0;
+        self.state = RxState::Tracking;
+    }
+
+    /// The pinned mode and occupancy, if any (see [`Self::set_mode`]).
+    pub fn pinned_mode(&self) -> Option<(RobustnessMode, SpectrumOccupancy)> {
+        self.pinned
+    }
+
     pub fn restart(&mut self) {
         let real = self.input.is_real();
         self.acq = Some(FreqAcquisition::new(real, self.cfg.auto_flip));
@@ -439,7 +478,7 @@ impl Receiver {
         self.pending.clear();
         self.conj = false;
         self.track_hz = 0.0;
-        self.mode = RobustnessMode::B;
+        self.mode = self.pinned.map_or(RobustnessMode::B, |(m, _)| m);
         self.timesync.restart(self.mode);
         self.chain = None;
         self.state = RxState::Acquisition;
@@ -458,7 +497,7 @@ impl Receiver {
     /// Change the sample-rate correction. Frequencies at the resampler output scale
     /// with (fs - sro), so the mixer frequency is rescaled to stay on the signal.
     fn set_sro(&mut self, new_sro: Real) {
-        let fs = Real::from(SAMPLE_RATE);
+        let fs = Real::from(self.fs());
         let new_sro = new_sro.clamp(-MAX_SRO_HZ, MAX_SRO_HZ);
         let scale = (fs - new_sro) / (fs - self.sro_hz);
         self.dc_hz *= scale;
@@ -468,6 +507,13 @@ impl Receiver {
 
     /// Feed interleaved samples (any number of frames) at 48 kHz and return the
     /// events produced.
+    /// The working sample rate of the input, Hz: everything that converts between samples
+    /// and seconds (frequencies, the SRO, the spectrum axis) uses this. 48 kHz for modes
+    /// A–D; mode E (DRM+) is received at 120 or 192 kHz.
+    fn fs(&self) -> u32 {
+        self.cfg.working_rate.hz()
+    }
+
     pub fn push(&mut self, interleaved: &[f32]) -> Vec<ReceiverEvent> {
         let ch = self.cfg.channels.max(1);
         // Small chunks keep the feedback loops responsive.
@@ -483,7 +529,7 @@ impl Receiver {
         self.input.process(chunk, &mut self.conv);
         self.spectrum.push(&self.conv);
         self.res.clear();
-        let fs = Real::from(SAMPLE_RATE);
+        let fs = Real::from(self.fs());
         let sro = self.sro_hz.clamp(-MAX_SRO_HZ, MAX_SRO_HZ);
         let ratio = fs / (fs - sro);
         self.resampler.process(&self.conv, ratio, &mut self.res);
@@ -535,7 +581,7 @@ impl Receiver {
         // Process in pieces so frequency corrections take effect quickly.
         for piece in samples.chunks(256) {
             self.mixed.clear();
-            let fs = Real::from(SAMPLE_RATE);
+            let fs = Real::from(self.fs());
             let w = 2.0 * PI * (self.dc_hz + self.track_hz) / fs;
             for &s in piece {
                 let s = if self.conj { s.conj() } else { s };
@@ -572,7 +618,7 @@ impl Receiver {
 
     fn process_window(&mut self, win: timesync::SymbolWindow) {
         if self.chain.is_none() {
-            let so = SpectrumOccupancy::SO_3;
+            let so = self.pinned.map_or(SpectrumOccupancy::SO_3, |(_, so)| so);
             self.chain = SymbolChain::new(self.mode, so, &self.cfg);
             self.sro_reports = 0;
             self.sro_prev = None;
@@ -583,6 +629,8 @@ impl Receiver {
         if let Some(rho) = win.guard_corr {
             self.cp.update(rho, win.power, self.state == RxState::Locked && self.bad_facs == 0);
         }
+        // Read the rate before `chain` takes its mutable borrow of `self`.
+        let fs = self.fs();
         let Some(chain) = self.chain.as_mut() else { return };
         let out = chain.process(&win);
         // The time-pilot monitor alone misfires on harsh channels (mode D on channels
@@ -610,7 +658,7 @@ impl Receiver {
                     && eps.abs() > SRO_ACQ_THRESHOLD
                     && (prev - eps).abs() < 0.25 * prev.abs().max(eps.abs())
                 {
-                    sro_delta += 0.5 * (prev + eps) * Real::from(SAMPLE_RATE);
+                    sro_delta += 0.5 * (prev + eps) * Real::from(fs);
                     chain.reset_sro_estimate();
                     self.sro_reports = 0;
                     self.sro_prev = None;
@@ -664,7 +712,7 @@ impl Receiver {
                 chain::ChainEvent::FrameIdentity(trusted) => self.events.push(ReceiverEvent::FrameIdentity { trusted }),
                 chain::ChainEvent::Msc(m) => self.events.push(ReceiverEvent::Msc(m)),
                 chain::ChainEvent::MscCells { cells, index, gap, carriers, kmin } => {
-                    let time_s = self.samples_in as Real / Real::from(SAMPLE_RATE);
+                    let time_s = self.samples_in as Real / Real::from(self.fs());
                     self.events.push(ReceiverEvent::MscCells(MscCells { cells, index, gap, time_s, carriers, kmin }));
                 }
             }

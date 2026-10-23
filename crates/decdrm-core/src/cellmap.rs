@@ -5,7 +5,7 @@
 //! frame (3 frames) because SDC cells and the MSC dummy cells only occur once per
 //! super frame.
 
-use crate::params::{ChannelLayout, FRAMES_PER_SUPERFRAME, RobustnessMode, SpectrumOccupancy};
+use crate::params::{ChannelLayout, RobustnessMode, SpectrumOccupancy};
 use crate::tables::{self, BOOSTED_PILOT_POWER, DATA_CELL_POWER, PILOT_POWER};
 use crate::{Cplx, Real};
 use std::f64::consts::PI;
@@ -252,8 +252,10 @@ impl CellMap {
                 }
             }
         }
-        let msc_cells_per_frame = total_msc / FRAMES_PER_SUPERFRAME;
-        let msc_dummy_cells = total_msc - msc_cells_per_frame * FRAMES_PER_SUPERFRAME;
+        // The number of multiplex frames per super frame is per-mode: 3 for A–D, 4 for mode E.
+        let frames_per_sf = mode.frames_per_superframe();
+        let msc_cells_per_frame = total_msc / frames_per_sf;
+        let msc_dummy_cells = total_msc - msc_cells_per_frame * frames_per_sf;
 
         Some(Self {
             layout,
@@ -347,14 +349,17 @@ mod tests {
         v
     }
 
+    /// Every frame carries the mode's full FAC block: 65 cells for modes A–D, 244 for mode E
+    /// (which spreads them over symbols 5..=26 of each 40-symbol frame).
     #[test]
-    fn every_frame_has_65_fac_cells() {
+    fn every_frame_has_its_modes_fac_cells() {
         for map in all_layouts() {
-            for f in 0..FRAMES_PER_SUPERFRAME {
+            let want = num_fac_cells(map.layout.mode);
+            for f in 0..map.layout.mode.frames_per_superframe() {
                 let n: usize = (0..map.symbols_per_frame)
                     .map(|s| map.fac_carriers(f * map.symbols_per_frame + s).len())
                     .sum();
-                assert_eq!(n, num_fac_cells(map.layout.mode), "{}", map.layout);
+                assert_eq!(n, want, "{} frame {f}", map.layout);
             }
         }
     }

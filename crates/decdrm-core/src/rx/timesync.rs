@@ -11,8 +11,9 @@ use crate::params::RobustnessMode;
 use crate::{Cplx, Real};
 use std::collections::VecDeque;
 
-/// Decimation factor of the correlation path.
-const DEC: usize = 4;
+/// Number of robustness modes (`RobustnessMode::ALL`). The per-mode arrays are this
+/// long so that `RobustnessMode::index()` can never index out of bounds.
+const NMODES: usize = RobustnessMode::ALL.len();
 /// Guard correlation is evaluated every `STEP` decimated samples.
 const STEP: usize = 4;
 /// Robustness-mode detection observes this many symbols.
@@ -42,8 +43,23 @@ struct Geom {
     ts: usize,
 }
 
-fn geom(m: RobustnessMode) -> Geom {
-    Geom { nu: m.fft_size() / DEC, g: m.guard_len() / DEC, ts: m.symbol_len() / DEC }
+/// Decimation factor for `rate`: chosen so the correlation path runs at 12 kHz, which is
+/// where the guard-correlation filter was designed. 4 at 48 kHz, 10 at 120 kHz, 16 at
+/// 192 kHz — all exact, so the decimated symbol geometry stays whole.
+fn dec_for(rate: crate::params::WorkingRate) -> usize {
+    (rate.hz() / 12_000).max(1) as usize
+}
+
+/// The geometry of one mode at an explicit working sample rate. The correlation path runs
+/// at `rate / dec`,
+/// so the geometry in decimated samples is the mode's at that rate, divided by that factor.
+fn geom_at(m: RobustnessMode, rate: crate::params::WorkingRate) -> Geom {
+    let dec = dec_for(rate).max(1);
+    Geom {
+        nu: m.fft_size_at(rate) / dec,
+        g: m.guard_len_at(rate) / dec,
+        ts: m.symbol_len_at(rate) / dec,
+    }
 }
 
 /// One demodulation window: the useful part of an OFDM symbol.
@@ -74,6 +90,8 @@ pub enum TimeSyncEvent {
 #[derive(Debug)]
 pub struct TimeSync {
     mode: RobustnessMode,
+    /// Working sample rate of the input (mode E, DRM+, needs 120 or 192 kHz).
+    rate: crate::params::WorkingRate,
     fft_len: usize,
     sym_len: usize,
 
@@ -83,6 +101,8 @@ pub struct TimeSync {
 
     // Correlation path.
     lpf: FirDecimator,
+    /// Decimation factor actually used (rate / 12 kHz), for the correlation path.
+    dec_factor: usize,
     lpf_delay: Real,
     dec: Vec<Cplx>,
     dec_base: i64,
@@ -96,11 +116,11 @@ pub struct TimeSync {
     mode_acq: bool,
     /// Normalised guard correlation of each mode, one value per evaluation (the
     /// last `rm_len_long` evaluations).
-    rm_buf: [VecDeque<Real>; 4],
+    rm_buf: [VecDeque<Real>; NMODES],
     /// Sliding DFT at each mode's symbol rate over the last `rm_len` / `rm_len_long`
     /// evaluations.
-    rm_acc: [Cplx; 4],
-    rm_acc_long: [Cplx; 4],
+    rm_acc: [Cplx; NMODES],
+    rm_acc_long: [Cplx; NMODES],
     /// Evaluations since mode detection (re)started (phase reference of the DFT).
     rm_count: usize,
     rm_len: usize,
@@ -109,7 +129,7 @@ pub struct TimeSync {
     /// Mode that has been winning reliably, and for how many evaluations.
     rm_candidate: Option<RobustnessMode>,
     rm_streak: usize,
-    pub last_mode_scores: [Real; 4],
+    pub last_mode_scores: [Real; NMODES],
 
     // Timing acquisition.
     timing_acq: bool,
@@ -132,18 +152,29 @@ pub struct TimeSync {
 
 impl TimeSync {
     pub fn new(mode: RobustnessMode) -> Self {
+        Self::new_at(mode, crate::params::WorkingRate::R48)
+    }
+
+    /// [`Self::new`] at an explicit working sample rate. The correlation path decimates by
+    /// [`DEC`], which is chosen so that the decimated rate is 12 kHz at 48 kHz — the rate
+    /// Dream's guard-correlation path runs at. Mode E needs 120 or 192 kHz, where the same
+    /// filter shape and geometry still hold (only the sample counts scale).
+    pub fn new_at(mode: RobustnessMode, rate: crate::params::WorkingRate) -> Self {
         // Pass ±4.5 kHz, stop from 7.5 kHz (aliases of 7.5–12 kHz land outside ±4.5 kHz
         // after decimation to 12 kHz).
-        let taps = lowpass(97, 6000.0 / 48000.0, 60.0);
-        let lpf = FirDecimator::new(taps, DEC);
+        let dec = dec_for(rate);
+        let taps = lowpass(97, 6000.0 / f64::from(rate.hz()), 60.0);
+        let lpf = FirDecimator::new(taps, dec);
         let lpf_delay = lpf.delay();
         let mut s = Self {
             mode,
-            fft_len: mode.fft_size(),
-            sym_len: mode.symbol_len(),
+            rate,
+            fft_len: mode.fft_size_at(rate),
+            sym_len: mode.symbol_len_at(rate),
             buf: Vec::new(),
             buf_base: 0,
             lpf,
+            dec_factor: dec,
             lpf_delay,
             dec: Vec::new(),
             dec_base: 0,
@@ -153,15 +184,15 @@ impl TimeSync {
             dec_active: false,
             mode_acq: true,
             rm_buf: Default::default(),
-            rm_acc: [Cplx::new(0.0, 0.0); 4],
-            rm_acc_long: [Cplx::new(0.0, 0.0); 4],
+            rm_acc: [Cplx::new(0.0, 0.0); NMODES],
+            rm_acc_long: [Cplx::new(0.0, 0.0); NMODES],
             rm_count: 0,
             rm_len: 0,
             rm_len_long: 0,
             rm_init: 0,
             rm_candidate: None,
             rm_streak: 0,
-            last_mode_scores: [0.0; 4],
+            last_mode_scores: [0.0; NMODES],
             timing_acq: true,
             corr_av: Vec::new(),
             corr_av_idx: 0,
@@ -189,9 +220,9 @@ impl TimeSync {
     /// the sample history.
     pub fn configure(&mut self, mode: RobustnessMode) {
         self.mode = mode;
-        self.fft_len = mode.fft_size();
-        self.sym_len = mode.symbol_len();
-        let g = geom(mode);
+        self.fft_len = mode.fft_size_at(self.rate);
+        self.sym_len = mode.symbol_len_at(self.rate);
+        let g = geom_at(mode, self.rate);
         let rm_len = RM_BLOCKS * g.ts / STEP;
         if rm_len != self.rm_len {
             self.reset_mode_detection();
@@ -225,8 +256,8 @@ impl TimeSync {
         for b in &mut self.rm_buf {
             b.clear();
         }
-        self.rm_acc = [Cplx::new(0.0, 0.0); 4];
-        self.rm_acc_long = [Cplx::new(0.0, 0.0); 4];
+        self.rm_acc = [Cplx::new(0.0, 0.0); NMODES];
+        self.rm_acc_long = [Cplx::new(0.0, 0.0); NMODES];
         self.rm_count = 0;
         self.rm_init = 0;
         self.rm_candidate = None;
@@ -290,9 +321,12 @@ impl TimeSync {
     }
 
     fn evaluate(&mut self, events: &mut Vec<TimeSyncEvent>) {
-        // The receiver runs at 48 kHz, where only modes A-D have geometry; mode E
-        // (DRM+) needs a higher rate and is not auto-detected here.
-        let geoms: [Geom; 4] = RobustnessMode::DRM30.map(geom);
+        // Every mode's geometry at the working rate. A mode that cannot run at this rate
+        // (mode E below 100 kHz, whose carriers would fold) is marked undetectable and its
+        // score forced to zero, so it can never be chosen.
+        let geoms: [Geom; NMODES] = RobustnessMode::ALL.map(|m| geom_at(m, self.rate));
+        let detectable: [bool; NMODES] = RobustnessMode::ALL
+            .map(|m| crate::params::check_mode_rate(m, self.rate).is_ok());
         let span = geoms.iter().map(|g| g.g + g.nu).max().unwrap_or(0);
         let sel = self.mode.index();
         let dec_end = self.dec_base + self.dec.len() as i64;
@@ -301,9 +335,12 @@ impl TimeSync {
         }
         while self.next_eval + span as i64 <= dec_end {
             let t = (self.next_eval - self.dec_base) as usize;
-            let mut metric = [0.0; 4];
-            let mut rho = [0.0; 4];
+            let mut metric = [0.0; NMODES];
+            let mut rho = [0.0; NMODES];
             for (m, g) in geoms.iter().enumerate() {
+                if !detectable[m] {
+                    continue;
+                }
                 let mut c = Cplx::new(0.0, 0.0);
                 let mut p = 0.0;
                 for i in 0..g.g {
@@ -321,7 +358,7 @@ impl TimeSync {
                 // Mode detection uses the normalised coefficient: the ML metric also
                 // carries the symbol-periodic power fluctuation of the pilots, which
                 // makes modes A and B (same 37.5 Hz symbol rate) hard to tell apart.
-                self.push_mode_values(&geoms, &rho);
+                self.push_mode_values(&geoms, &rho, &detectable);
                 self.rm_init += 1;
                 if self.rm_init >= self.rm_len + RM_BLOCKS {
                     // Unlike Dream (first reliable result wins) require the same mode
@@ -330,7 +367,7 @@ impl TimeSync {
                     match self.detect_mode() {
                         Some((mode, rel)) if self.rm_candidate == Some(mode) => {
                             self.rm_streak += 1;
-                            if self.rm_streak >= geom(mode).ts / STEP {
+                            if self.rm_streak >= geom_at(mode, self.rate).ts / STEP {
                                 self.mode_acq = false;
                                 events.push(TimeSyncEvent::ModeDetected { mode, reliability: rel });
                             }
@@ -362,7 +399,7 @@ impl TimeSync {
     }
 
     /// Add one normalised guard correlation per mode to the sliding DFTs.
-    fn push_mode_values(&mut self, geoms: &[Geom; 4], rho: &[Real; 4]) {
+    fn push_mode_values(&mut self, geoms: &[Geom; NMODES], rho: &[Real; NMODES], detectable: &[bool; NMODES]) {
         // exp(-j2π·f·n) at each mode's symbol rate f = STEP/ts cycles per evaluation,
         // with the phase computed exactly from n mod ts.
         let phasor = |g: &Geom, n: usize| {
@@ -371,7 +408,7 @@ impl TimeSync {
         };
         let n = self.rm_count;
         for (m, g) in geoms.iter().enumerate() {
-            let v = rho[m];
+            let v = if detectable[m] { rho[m] } else { 0.0 };
             let b = &mut self.rm_buf[m];
             b.push_back(v);
             self.rm_acc[m] += v * phasor(g, n);
@@ -396,7 +433,7 @@ impl TimeSync {
     /// threshold) on weak or narrow ones.
     fn detect_mode(&mut self) -> Option<(RobustnessMode, Real)> {
         let len = self.rm_buf[0].len();
-        let short: [Real; 4] = self.rm_acc.map(|a| a.norm() / len.min(self.rm_len).max(1) as Real);
+        let short: [Real; NMODES] = self.rm_acc.map(|a| a.norm() / len.min(self.rm_len).max(1) as Real);
         self.last_mode_scores = short;
         if let Some(r) = decide(&short, RM_RELIABILITY) {
             return Some(r);
@@ -404,7 +441,7 @@ impl TimeSync {
         // The long window decides from 1.5× the short length on, over everything
         // observed so far.
         if 2 * len >= 3 * self.rm_len {
-            let long: [Real; 4] = self.rm_acc_long.map(|a| a.norm() / len as Real);
+            let long: [Real; NMODES] = self.rm_acc_long.map(|a| a.norm() / len as Real);
             return decide(&long, RM_RELIABILITY_LONG);
         }
         None
@@ -446,7 +483,7 @@ impl TimeSync {
         let center = (self.maxdet_len - 1) / 2;
         if imax == center {
             let tpos = self.maxdet[center].1;
-            let candidate = (self.dec_origin + tpos * DEC as i64) as Real - self.lpf_delay;
+            let candidate = (self.dec_origin + tpos * self.dec_factor as i64) as Real - self.lpf_delay;
             self.timing_candidate(candidate);
         }
     }
@@ -564,7 +601,7 @@ impl TimeSync {
 }
 
 /// Best mode and its ratio to the second best, if the ratio exceeds `threshold`.
-fn decide(scores: &[Real; 4], threshold: Real) -> Option<(RobustnessMode, Real)> {
+fn decide(scores: &[Real; NMODES], threshold: Real) -> Option<(RobustnessMode, Real)> {
     let (best, &max) = scores.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1))?;
     let second = scores.iter().enumerate().filter(|&(i, _)| i != best).map(|(_, &v)| v).fold(0.0, Real::max);
     let rel = if second > 0.0 { max / second } else { Real::INFINITY };
