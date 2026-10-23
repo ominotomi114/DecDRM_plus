@@ -55,9 +55,12 @@ pub use afs::{AfsMultiplexSettings, AfsOtherSettings, AfsRegionSettings, AfsSche
 pub use audio::AudioCounters;
 pub use config::{
     AppKind, AppSettings, AudioInputSettings, AudioSettings, ChannelSettings, Codec, EpgProgramme, FacLanguage,
-    JournalineFile, JournalinePage, MdiSettings, OutputSettings, Part, ProgrammeType, SampleFormat, ServiceSettings,
-    SignalFormat, SimulateSettings, StationConfig, TimeSettings,
+    JournalineFile, JournalinePage, MdiSettings, Mode, OutputSettings, Part, ProgrammeType, RateSetting,
+    SampleFormat, ServiceSettings, SignalFormat, SimulateSettings, StationConfig, TimeSettings,
 };
+/// The working sample rate of the transmit chain (`[channel] working_sample_rate`): re-exported
+/// so a caller need not depend on `decdrm-core` to name one.
+pub use decdrm_core::params::WorkingRate;
 pub use modulator::ModulatorStatus;
 pub use data::load_journaline;
 pub use error::{ConfigProblems, Result, StationError};

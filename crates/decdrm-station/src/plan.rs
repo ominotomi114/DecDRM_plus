@@ -69,8 +69,10 @@ use decdrm_core::mux::msc::MscGeometry;
 use decdrm_core::mux::sdc::{MultiplexDescription, StreamLengths};
 use decdrm_core::mux::service::{AudioCodec, AudioMode, AudioParams};
 use decdrm_codecs::{XHE_AAC_SAMPLE_RATES, XheAacConfig, XheAacEncoder};
-use decdrm_core::params::{ChannelLayout, MAX_SERVICES, MAX_STREAMS};
-use decdrm_core::tx::output::{OutputConfig, OutputFormat, OutputStage, suggested_if_hz};
+use decdrm_core::params::{ChannelLayout, MAX_SERVICES, MAX_STREAMS, WorkingRate};
+use decdrm_core::tx::output::{
+    OutputConfig, OutputFormat, OutputStage, suggested_if_hz_at,
+};
 use decdrm_core::tx::{MscCapacity, Transmitter, TxConfig};
 use decdrm_io::Container;
 use std::collections::BTreeMap;
@@ -513,14 +515,34 @@ impl StationConfig {
 }
 
 /// The output stage settings for `layout` (the IF, unless set, follows the bandwidth).
-pub(crate) fn output_config(out: &crate::config::OutputSettings, layout: Option<ChannelLayout>) -> OutputConfig {
+pub(crate) fn output_config(
+    out: &crate::config::OutputSettings,
+    layout: Option<ChannelLayout>,
+    rate: WorkingRate,
+) -> OutputConfig {
     OutputConfig {
         format: match out.format {
-            SignalFormat::Real => OutputFormat::Real { if_hz: out.if_hz.unwrap_or_else(|| layout.map_or(12_000.0, suggested_if_hz)) },
+            SignalFormat::Real => OutputFormat::Real {
+                if_hz: out
+                    .if_hz
+                    .unwrap_or_else(|| layout.map_or(rate.hz() as f64 / 4.0, |l| suggested_if_hz_at(l, rate))),
+            },
             SignalFormat::Iq => OutputFormat::Iq { offset_hz: out.iq_offset_hz, swap: out.iq_swap },
         },
         level_dbfs: out.level_dbfs,
         band_limit: out.band_limit,
+        working_rate: rate,
+    }
+}
+
+/// Checks of `[channel]` that depend on the sample rate: robustness mode E (DRM+) carries
+/// 213 carriers reaching ±47.11 kHz, so it needs a working sample rate above ~94 kHz. Modes
+/// A–D are unaffected.
+fn check_rate(cfg: &StationConfig, p: &mut Problems) {
+    let mode = cfg.channel.mode.0;
+    let rate = cfg.channel.working_sample_rate.0;
+    if let Err(e) = decdrm_core::params::check_mode_rate(mode, rate) {
+        p.push(format!("channel: {e}"));
     }
 }
 
@@ -584,6 +606,7 @@ fn build_mdi(cfg: &StationConfig, m: &crate::config::MdiSettings) -> Result<Mult
         p.push(format!("mdi: buffer_frames {} is outside 1-50", m.buffer_frames));
     }
     check_output(cfg, &mut p);
+    check_rate(cfg, &mut p);
     check_simulate(cfg, &mut p);
     p.finish()?;
     let tx = TxConfig::default();
@@ -601,7 +624,7 @@ fn build_mdi(cfg: &StationConfig, m: &crate::config::MdiSettings) -> Result<Mult
         multiplex: MultiplexDescription::new(0, tx.protection.part_b as u8, &[whole]),
         streams: Vec::new(),
         services: Vec::new(),
-        output: output_config(&cfg.output, None),
+        output: output_config(&cfg.output, None, cfg.channel.working_sample_rate.0),
         mdi: origin.map(|o| o.describe()),
     })
 }
@@ -622,7 +645,12 @@ fn build(cfg: &StationConfig) -> Result<MultiplexPlan> {
         Some(so) => {
             let l = ChannelLayout::new(ch.mode.0, so);
             if l.is_none() {
-                p.push(format!("channel: robustness mode {} is only defined with occupancy 3 or 5", ch.mode));
+                // The standard defines C and D at occupancy 3 or 5, and mode E at 0 only.
+                p.push(format!(
+                    "channel: robustness mode {} is not defined with occupancy {} \
+                     (mode E uses 0; modes C and D use 3 or 5)",
+                    ch.mode, ch.occupancy
+                ));
             }
             l
         }
@@ -652,7 +680,8 @@ fn build(cfg: &StationConfig) -> Result<MultiplexPlan> {
 
     // --- Output.
     check_output(cfg, &mut p);
-    let output = output_config(&cfg.output, layout);
+    check_rate(cfg, &mut p);
+    let output = output_config(&cfg.output, layout, cfg.channel.working_sample_rate.0);
     if let Some(l) = layout
         && let Err(e) = OutputStage::new(l, output)
     {
@@ -940,6 +969,7 @@ fn build(cfg: &StationConfig) -> Result<MultiplexPlan> {
         protection,
         part_a_bytes,
         afs_index: 0,
+        working_rate: cfg.channel.working_sample_rate.0,
     };
     let transmitter = Transmitter::new(tx)?;
     let capacity = transmitter.msc_capacity();

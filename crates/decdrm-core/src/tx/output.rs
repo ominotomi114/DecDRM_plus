@@ -23,7 +23,7 @@
 use super::TxError;
 use crate::cellmap::CellMap;
 use crate::dsp::fir::lowpass;
-use crate::params::{ChannelLayout, SAMPLE_RATE};
+use crate::params::{ChannelLayout, WorkingRate};
 use crate::{Cplx, Real};
 use std::f64::consts::PI;
 
@@ -62,17 +62,41 @@ pub struct OutputConfig {
     pub level_dbfs: Real,
     /// Apply the transmit channel filter (see the module docs).
     pub band_limit: bool,
+    /// Working sample rate of the chain: the rate the samples are produced at, and the one
+    /// whose Nyquist limits the output band. Modes A–D use [`WorkingRate::R48`]; robustness
+    /// mode E needs [`WorkingRate::R120`] or more.
+    pub working_rate: WorkingRate,
 }
 
 impl OutputConfig {
     /// Real IF output at `if_hz`, default level, band-limited.
     pub fn real(if_hz: Real) -> Self {
-        Self { format: OutputFormat::Real { if_hz }, level_dbfs: DEFAULT_LEVEL_DBFS, band_limit: true }
+        Self {
+            format: OutputFormat::Real { if_hz },
+            level_dbfs: DEFAULT_LEVEL_DBFS,
+            band_limit: true,
+            working_rate: WorkingRate::R48,
+        }
+    }
+
+    /// The same, at an explicit working sample rate.
+    pub fn real_at(if_hz: Real, rate: WorkingRate) -> Self {
+        Self { working_rate: rate, ..Self::real(if_hz) }
     }
 
     /// I/Q output with the DC carrier at `offset_hz`, default level, band-limited.
     pub fn iq(offset_hz: Real) -> Self {
-        Self { format: OutputFormat::Iq { offset_hz, swap: false }, level_dbfs: DEFAULT_LEVEL_DBFS, band_limit: true }
+        Self {
+            format: OutputFormat::Iq { offset_hz, swap: false },
+            level_dbfs: DEFAULT_LEVEL_DBFS,
+            band_limit: true,
+            working_rate: WorkingRate::R48,
+        }
+    }
+
+    /// The same, at an explicit working sample rate.
+    pub fn iq_at(offset_hz: Real, rate: WorkingRate) -> Self {
+        Self { working_rate: rate, ..Self::iq(offset_hz) }
     }
 
     /// Number of interleaved output channels (1 real, 2 I/Q).
@@ -98,8 +122,13 @@ pub fn carrier_span_hz(layout: ChannelLayout) -> (Real, Real) {
 /// kHz for 4.5 and 5 kHz (all carriers lie above the DC carrier), and ≈ 7–7.3 kHz for
 /// 18 and 20 kHz (most carriers lie above it).
 pub fn suggested_if_hz(layout: ChannelLayout) -> Real {
+    suggested_if_hz_at(layout, WorkingRate::R48)
+}
+
+/// [`suggested_if_hz`] at an explicit working sample rate (mode E needs a higher one).
+pub fn suggested_if_hz_at(layout: ChannelLayout, rate: WorkingRate) -> Real {
     let (lo, hi) = carrier_span_hz(layout);
-    let centre = Real::from(SAMPLE_RATE) / 4.0;
+    let centre = Real::from(rate) / 4.0;
     ((centre - (lo + hi) / 2.0) / 100.0).round() * 100.0
 }
 
@@ -108,8 +137,13 @@ pub fn suggested_if_hz(layout: ChannelLayout) -> Real {
 /// transformer), rounded inwards to 100 Hz. [`OutputStage::new`] accepts more: any
 /// IF that keeps the carriers strictly inside 0..fs/2.
 pub fn recommended_if_range_hz(layout: ChannelLayout) -> (Real, Real) {
+    recommended_if_range_hz_at(layout, WorkingRate::R48)
+}
+
+/// [`recommended_if_range_hz`] at an explicit working sample rate.
+pub fn recommended_if_range_hz_at(layout: ChannelLayout, rate: WorkingRate) -> (Real, Real) {
     let (lo, hi) = carrier_span_hz(layout);
-    let nyq = Real::from(SAMPLE_RATE) / 2.0;
+    let nyq = Real::from(rate) / 2.0;
     (((REAL_EDGE_GUARD_HZ - lo) / 100.0).ceil() * 100.0, ((nyq - REAL_EDGE_GUARD_HZ - hi) / 100.0).floor() * 100.0)
 }
 
@@ -156,10 +190,10 @@ struct BandFilter {
 }
 
 impl BandFilter {
-    fn new(layout: ChannelLayout) -> Self {
-        let fs = Real::from(SAMPLE_RATE);
+    fn new(layout: ChannelLayout, rate: WorkingRate) -> Self {
+        let fs = Real::from(rate);
         let (kmin, kmax) = layout.carrier_range();
-        let df = layout.mode.carrier_spacing();
+        let df = layout.mode.carrier_spacing_at(rate);
         let center = Real::from(kmin + kmax) / 2.0 * df;
         // Half-width including the outer carriers' main lobes (±Δf/2).
         let half = Real::from(kmax - kmin + 1) / 2.0 * df;
@@ -207,7 +241,7 @@ impl OutputStage {
     /// if the signal would not fit into the output band (0..fs/2 for real output
     /// with a margin for the receiver's Hilbert filter, ±fs/2 for I/Q).
     pub fn new(layout: ChannelLayout, cfg: OutputConfig) -> Result<Self, TxError> {
-        let fs = Real::from(SAMPLE_RATE);
+        let fs = Real::from(cfg.working_rate);
         let (lo, hi) = carrier_span_hz(layout);
         let (shift, lo_limit, hi_limit) = match cfg.format {
             OutputFormat::Real { if_hz } => (if_hz, 0.0, fs / 2.0),
@@ -220,7 +254,7 @@ impl OutputStage {
         let map = CellMap::new(layout.mode, layout.occupancy).expect("a ChannelLayout is always valid");
         // Per-channel power of Re{z} (or Im{z}) is P/2 for mean power P.
         let gain = 10f64.powf(cfg.level_dbfs / 20.0) * (2.0 / map.avg_power_per_symbol).sqrt();
-        let filter = cfg.band_limit.then(|| BandFilter::new(layout));
+        let filter = cfg.band_limit.then(|| BandFilter::new(layout, cfg.working_rate));
         let center_step = filter.as_ref().map_or(0.0, |f| f.center_step);
         Ok(Self {
             cfg,
@@ -307,7 +341,7 @@ impl OutputStage {
 mod tests {
     use super::*;
     use crate::dsp::fft::Fft;
-    use crate::params::{RobustnessMode, SpectrumOccupancy};
+    use crate::params::{check_mode_rate, RobustnessMode, SpectrumOccupancy, WorkingRate};
 
     fn layout(m: RobustnessMode, so: SpectrumOccupancy) -> ChannelLayout {
         ChannelLayout::new(m, so).unwrap()
@@ -326,6 +360,11 @@ mod tests {
     fn suggested_if_fits_every_layout() {
         let nyq = 24_000.0;
         for m in RobustnessMode::ALL {
+            // This test asserts 48 kHz geometry (12 kHz IF, a 24 kHz Nyquist), where only
+            // modes A-D are defined; mode E needs a higher working rate.
+            if check_mode_rate(m, WorkingRate::R48).is_err() {
+                continue;
+            }
             for so in SpectrumOccupancy::ALL {
                 let Some(l) = ChannelLayout::new(m, so) else { continue };
                 let f = suggested_if_hz(l);

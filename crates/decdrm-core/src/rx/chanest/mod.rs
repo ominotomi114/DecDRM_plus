@@ -30,6 +30,8 @@ fn freq_wiener_len(mode: RobustnessMode) -> usize {
         RobustnessMode::A => 6,
         RobustnessMode::B | RobustnessMode::C => 11,
         RobustnessMode::D => 13,
+        // Mode E reception is not implemented yet; widest DRM30 value (see time_wiener.rs).
+        RobustnessMode::E => 13,
     }
 }
 

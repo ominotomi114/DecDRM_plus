@@ -94,6 +94,8 @@ impl ChannelHistory {
             RobustnessMode::A | RobustnessMode::B => 5.0,
             RobustnessMode::C => 8.0,
             RobustnessMode::D => 10.0,
+            // Mode E (DRM+) reception is not implemented yet; widest DRM30 value.
+            RobustnessMode::E => 10.0,
         };
         Self {
             rows: VecDeque::new(),

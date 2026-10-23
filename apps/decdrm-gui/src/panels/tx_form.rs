@@ -8,7 +8,7 @@
 use super::meter::{MeterKind, meter_with_text};
 use super::source::DeviceLists;
 use decdrm_core::fac::{LANGUAGES, PROGRAMME_TYPES};
-use decdrm_core::params::{ChannelLayout, RobustnessMode, SpectrumOccupancy};
+use decdrm_core::params::{ChannelLayout, RobustnessMode, SpectrumOccupancy, WorkingRate};
 use decdrm_core::tx::output::{OutputFormat, recommended_if_range_hz, suggested_if_hz};
 use eframe::egui::{self, Color32, RichText, Ui};
 use std::path::Path;
@@ -238,11 +238,22 @@ fn section<'a>(doc: &'a mut DocumentMut, k: &str) -> &'a mut dyn TableLike {
 // Sections
 // ---------------------------------------------------------------------------------
 
+/// Robustness modes. Mode E (DRM+) is listed last: it needs a working sample rate above
+/// ~94 kHz, so it is offered only when the chosen rate allows it (`RATES` below).
 const MODES: &[(&str, &str)] = &[
     ("A", "A — ground wave, few echoes"),
     ("B", "B — sky wave (the usual choice)"),
     ("C", "C — long distance, strong echoes"),
     ("D", "D — severe Doppler and delay"),
+    ("E", "E — DRM+ (VHF, 100 kHz: needs 120 or 192 kHz)"),
+];
+/// Working sample rates of the transmit chain. Modes A–D run at 48 kHz; mode E (DRM+) needs
+/// a rate above ~94 kHz, because its 213 carriers reach ±47.11 kHz.
+const RATES: &[(&str, &str)] = &[
+    ("48", "48 kHz — modes A–D"),
+    ("96", "96 kHz — mode E, but only 0.9 kHz of margin: prefer 120"),
+    ("120", "120 kHz — mode E (12.9 kHz of margin)"),
+    ("192", "192 kHz — mode E (48.9 kHz of margin)"),
 ];
 const OCCUPANCIES: &[(&str, &str)] =
     &[("0", "4.5 kHz"), ("1", "5 kHz"), ("2", "9 kHz"), ("3", "10 kHz"), ("4", "18 kHz"), ("5", "20 kHz")];
@@ -267,20 +278,58 @@ fn channel(ui: &mut Ui, doc: &mut DocumentMut) -> bool {
     let sixteen = canon(&msc) == "16qam";
     let hierarchical = canon(&msc).starts_with("hm");
     grid(ui, "tx_form_channel", |ui| {
-        row_label(ui, "Robustness mode");
-        if let Some(v) = combo(ui, "tx_mode", &mode, MODES, 280.0) {
-            set(ch, "mode", v);
-            // Modes C and D only have 10 and 20 kHz.
-            if matches!(v, "C" | "D") && !matches!(get_int(ch, "occupancy"), Some(3 | 5)) {
-                set(ch, "occupancy", 3i64);
+        row_label(ui, "Sample rate");
+        let rate = get_int(ch, "working_sample_rate").unwrap_or(48).to_string();
+        if let Some(v) = combo(ui, "tx_rate", &rate, RATES, 280.0) {
+            set(ch, "working_sample_rate", v.parse::<i64>().unwrap_or(48));
+            // Dropping below 100 kHz makes mode E impossible, so fall back to B for the user
+            // rather than leave a configuration that cannot validate.
+            let hz = v.parse::<i64>().unwrap_or(48) * 1000;
+            if hz < 100_000 && mode == "E" {
+                set(ch, "mode", "B");
             }
             changed = true;
         }
         ui.end_row();
+        row_label(ui, "Robustness mode");
+        // Mode E is offered only when the working rate can carry it.
+        let rate_hz = get_int(ch, "working_sample_rate").unwrap_or(48) * 1000;
+        let modes: Vec<(&str, &str)> = MODES
+            .iter()
+            .copied()
+            .filter(|(v, _)| *v != "E" || rate_hz >= 100_000)
+            .collect();
+        if let Some(v) = combo(ui, "tx_mode", &mode, &modes, 280.0) {
+            set(ch, "mode", v);
+            // Modes C and D only have 10 and 20 kHz; mode E only has occupancy 0 (100 kHz).
+            match v {
+                "C" | "D" => {
+                    if !matches!(get_int(ch, "occupancy"), Some(3 | 5)) {
+                        set(ch, "occupancy", 3i64);
+                    }
+                }
+                "E" => set(ch, "occupancy", 0i64),
+                _ => {}
+            }
+            changed = true;
+        }
+        if mode == "E" {
+            ui.label(RichText::new(format!("{:.0} kHz carriers", 2.0 * 47.11)).weak())
+                .on_hover_text("Mode E occupies ±47.11 kHz, which is why it needs 120 or 192 kHz");
+        }
+        ui.end_row();
         row_label(ui, "Bandwidth");
         let occ = get_int(ch, "occupancy").unwrap_or(3).to_string();
-        let allowed: Vec<(&str, &str)> =
-            OCCUPANCIES.iter().copied().filter(|(v, _)| !matches!(mode.as_str(), "C" | "D") || matches!(*v, "3" | "5")).collect();
+        let allowed: Vec<(&str, &str)> = OCCUPANCIES
+            .iter()
+            .copied()
+            .filter(|(v, _)| match mode.as_str() {
+                "C" | "D" => matches!(*v, "3" | "5"),
+                // Mode E is defined at occupancy 0 only (100 kHz, the DRM+ raster).
+                "E" => *v == "0",
+                _ => true,
+            })
+            .collect();
         if let Some(v) = combo(ui, "tx_occupancy", &occ, &allowed, 280.0) {
             set(ch, "occupancy", v.parse::<i64>().unwrap_or(3));
             changed = true;
@@ -1163,6 +1212,7 @@ fn channel_layout(doc: &DocumentMut) -> Option<ChannelLayout> {
         "b" => RobustnessMode::B,
         "c" => RobustnessMode::C,
         "d" => RobustnessMode::D,
+        "e" | "drm+" => RobustnessMode::E,
         _ => return None,
     };
     let occupancy = u8::try_from(ch.and_then(|ch| get_int(ch, "occupancy")).unwrap_or(3)).ok()?;
@@ -1533,6 +1583,69 @@ fn relative(base: &Path, p: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mode_e_is_recognised_in_the_form() {
+        // The form's own mode parser must know E, or a mode E document reads as invalid.
+        let doc: DocumentMut = "[channel]\nmode = \"E\"\noccupancy = 0\n".parse().unwrap();
+        let l = channel_layout(&doc).expect("mode E with occupancy 0 is a valid layout");
+        assert_eq!((l.mode, l.occupancy), (RobustnessMode::E, SpectrumOccupancy::SO_0));
+
+        // `canon` strips "-", "_" and spaces but NOT "+", so "DRM+" canonises to "drm+".
+        assert_eq!(canon("E"), "e");
+        assert_eq!(canon("DRM+"), "drm+");
+    }
+
+    #[test]
+    fn mode_e_is_offered_only_when_the_rate_allows_it() {
+        // The rule the mode selector applies: mode E is filtered out below 100 kHz.
+        let offered = |khz: i64| -> Vec<&'static str> {
+            MODES
+                .iter()
+                .copied()
+                .filter(|(v, _)| *v != "E" || khz * 1000 >= 100_000)
+                .map(|(v, _)| v)
+                .collect()
+        };
+        for khz in [48, 96] {
+            assert!(!offered(khz).contains(&"E"), "{khz} kHz must not offer mode E");
+        }
+        for khz in [120, 192] {
+            assert!(offered(khz).contains(&"E"), "{khz} kHz must offer mode E");
+        }
+        // Every mode is always offered, rate or not.
+        assert!(offered(48).contains(&"A") && offered(48).contains(&"D"));
+
+        // The rate selector lists exactly the four rates decdrm-core supports.
+        let rates: Vec<&str> = RATES.iter().map(|(v, _)| *v).collect();
+        assert_eq!(rates, ["48", "96", "120", "192"]);
+        for (v, _) in RATES {
+            let hz = v.parse::<u32>().unwrap() * 1000;
+            assert!(WorkingRate::new(hz).is_some(), "{v} kHz must be a supported rate");
+        }
+    }
+
+    #[test]
+    fn mode_e_restricts_the_bandwidth_to_100_khz() {
+        // Mode E exists at occupancy 0 only; the bandwidth selector must offer just that.
+        let allowed = |mode: &str| -> Vec<&str> {
+            OCCUPANCIES
+                .iter()
+                .copied()
+                .filter(|(v, _)| match mode {
+                    "C" | "D" => matches!(*v, "3" | "5"),
+                    "E" => *v == "0",
+                    _ => true,
+                })
+                .map(|(v, _)| v)
+                .collect()
+        };
+        assert_eq!(allowed("E"), ["0"]);
+        assert_eq!(allowed("C"), ["3", "5"]);
+        assert_eq!(allowed("D"), ["3", "5"]);
+        assert_eq!(allowed("A").len(), 6);
+        assert_eq!(allowed("B").len(), 6);
+    }
 
     #[test]
     fn names_match_like_the_station_does() {

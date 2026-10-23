@@ -14,7 +14,7 @@ use crate::fec::mlc::{MlcDecoder, MlcParams, MscProtection};
 use crate::fec::qam::EqCell;
 use super::mscdec::MscDecoder;
 use crate::params::{FRAMES_PER_SUPERFRAME, RobustnessMode, SAMPLE_RATE, SpectrumOccupancy};
-use crate::tables::NUM_FAC_CELLS;
+use crate::tables::num_fac_cells;
 use crate::{Cplx, Real};
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -129,6 +129,8 @@ pub struct MscConfig {
 }
 
 pub(super) struct SymbolChain {
+    /// The robustness mode being received (its frame geometry and FAC size).
+    mode: RobustnessMode,
     map: Arc<CellMap>,
     ofdm: OfdmDemod,
     frame: FrameSync,
@@ -197,12 +199,13 @@ impl SymbolChain {
     pub fn new(mode: RobustnessMode, so: SpectrumOccupancy, cfg: &ReceiverConfig) -> Option<Self> {
         let map = Arc::new(CellMap::new(mode, so)?);
         let last_fac_symbol = crate::tables::fac_positions(mode).iter().map(|&(s, _)| s as usize).max().unwrap_or(0);
-        let mut fac_dec = MlcDecoder::new(MlcParams::fac(), 0);
+        let mut fac_dec = MlcDecoder::new(MlcParams::fac_for(mode), 0);
         fac_dec.metric = cfg.metric;
         let sdc_mode = SdcMode::Qam16;
         let mut sdc_dec = MlcDecoder::new(MlcParams::sdc(sdc_mode.mapping(), map.sdc_cells_per_superframe), 1);
         sdc_dec.metric = cfg.metric;
         Some(Self {
+            mode,
             ofdm: OfdmDemod::new(&map),
             frame: FrameSync::new(&map),
             chanest: ChannelEstimator::new(Arc::clone(&map)),
@@ -216,7 +219,7 @@ impl SymbolChain {
             seek_sdc: false,
             sdc_found: false,
             sdc_misses: 0,
-            fac_cells: Vec::with_capacity(NUM_FAC_CELLS),
+            fac_cells: Vec::with_capacity(num_fac_cells(mode)),
             last_fac_symbol,
             fac_dec,
             sdc_mode,
@@ -443,7 +446,7 @@ impl SymbolChain {
         for &c in map.msc_carriers(sf_sym) {
             self.vis_msc.push_back(cells[c as usize].sig);
         }
-        keep_last(&mut self.vis_fac, NUM_FAC_CELLS);
+        keep_last(&mut self.vis_fac, num_fac_cells(self.mode));
         keep_last(&mut self.vis_sdc, map.sdc_cells_per_superframe);
         keep_last(&mut self.vis_msc, map.msc_cells_per_frame);
         let mut row = if self.chan_rows.len() >= CHAN_ROWS {
@@ -497,7 +500,7 @@ impl SymbolChain {
             self.fac_cells.push(cells[c as usize]);
         }
         if s == self.last_fac_symbol {
-            if self.fac_cells.len() == NUM_FAC_CELLS {
+            if self.fac_cells.len() == num_fac_cells(self.mode) {
                 let mut bits = Vec::new();
                 self.fac_dec.decode(&self.fac_cells, &mut bits);
                 match Fac::parse(&bits) {

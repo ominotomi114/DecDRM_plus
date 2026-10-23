@@ -24,6 +24,11 @@ fn params(mode: RobustnessMode) -> (usize, Real) {
         RobustnessMode::B => (7, 2.7 / 2.0),
         RobustnessMode::C => (9, 5.7 / 2.0),
         RobustnessMode::D => (9, 4.5 / 2.0),
+        // Mode E (DRM+) reception is not implemented yet: it needs the higher working rate
+        // and its own pilot geometry. These are the most conservative (widest) DRM30 values,
+        // so that if the mode is ever reached the estimator degrades rather than misbehaves.
+        // Replace with spec-derived values when mode E reception lands.
+        RobustnessMode::E => (9, 5.7 / 2.0),
     }
 }
 

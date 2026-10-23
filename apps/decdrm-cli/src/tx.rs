@@ -1,7 +1,7 @@
 //! `decdrm tx` — run the DRM transmitter described by a station configuration file.
 
 use anyhow::{Context, Result, bail};
-use decdrm_station::{Station, StationConfig, StationStatus, StopHandle};
+use decdrm_station::{Mode, RateSetting, Station, StationConfig, StationStatus, StopHandle, WorkingRate};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -32,10 +32,36 @@ pub struct TxArgs {
     /// channel model 1 (AWGN) unless one is set.
     #[arg(long, value_name = "DB", allow_negative_numbers = true)]
     snr: Option<f64>,
+    /// Working sample rate of the transmit chain, kHz: 48 (default), 96, 120 or 192,
+    /// overriding the file's `[channel] working_sample_rate`. Robustness mode E (DRM+)
+    /// needs 120 or 192, because its carriers reach ±47.11 kHz.
+    #[arg(long, value_name = "KHZ")]
+    sample_rate: Option<u32>,
+    /// Robustness mode (A-E), overriding the file's `[channel] mode`. Mode E is DRM+ and
+    /// is refused below 100 kHz.
+    #[arg(long, value_name = "MODE")]
+    mode: Option<String>,
 }
 
 pub fn run(a: TxArgs) -> Result<()> {
     let mut cfg = StationConfig::load(&a.config)?;
+    if let Some(khz) = a.sample_rate {
+        let hz = khz.checked_mul(1000).filter(|hz| WorkingRate::new(*hz).is_some());
+        let Some(rate) = hz.and_then(WorkingRate::new) else {
+            bail!("--sample-rate must be 48, 96, 120 or 192 (kHz)");
+        };
+        cfg.channel.working_sample_rate = RateSetting(rate);
+    }
+    if let Some(m) = &a.mode {
+        let mode: Mode = m
+            .parse()
+            .map_err(|e: String| anyhow::anyhow!("--mode: {e}"))?;
+        cfg.channel.mode = mode;
+        // Mode E is defined at occupancy 0 (the 100 kHz DRM+ raster) only.
+        if mode.0.is_drm_plus() {
+            cfg.channel.occupancy = 0;
+        }
+    }
     if let Some(out) = &a.output {
         // Relative to the current directory, not to the configuration file.
         cfg.output.file = Some(std::path::absolute(out).with_context(|| format!("output path {}", out.display()))?);

@@ -4,7 +4,7 @@
 use crate::bits::{BitReader, BitWriter};
 use crate::fec::crc::Crc;
 use crate::fec::qam::Mapping;
-use crate::params::SpectrumOccupancy;
+use crate::params::{RobustnessMode, SpectrumOccupancy};
 
 /// Interleaver depth of the MSC (§7.6).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -243,6 +243,30 @@ impl Fac {
 
     /// Serialise to 72 bits including the CRC (transmitter side).
     pub fn to_bits(&self) -> Vec<u8> {
+        self.to_bits_for(RobustnessMode::A)
+    }
+
+    /// Serialise this FAC for `mode` (§6.3, §7.2.1.2, §7.5.3).
+    ///
+    /// Modes A–D produce **72** bits: the channel parameters plus one service parameter set.
+    /// Robustness mode E produces **116** bits: the same channel parameters plus **two**
+    /// service parameter sets — which is what §6.3 means by "for robustness mode E, two sets
+    /// of service parameters shall be transmitted". (20 + 2×44 + 8 CRC = 116.)
+    ///
+    /// This transmitter carries one service, so mode E sends that service's parameters twice,
+    /// which is the single-service case of the two-set structure.
+    pub fn to_bits_for(&self, mode: RobustnessMode) -> Vec<u8> {
+        let mut bits = self.channel_and_service_bits();
+        if mode.is_drm_plus() {
+            bits.extend_from_slice(&self.service_bits());
+        }
+        append_crc8(&mut bits);
+        bits
+    }
+
+    /// The channel parameters (20 bits) followed by one service parameter set (44 bits):
+    /// 64 bits, no CRC. Every mode sends at least this.
+    fn channel_and_service_bits(&self) -> Vec<u8> {
         let c = &self.channel;
         let s = &self.service;
         let mut w = BitWriter::new();
@@ -266,6 +290,17 @@ impl Fac {
         w.write(u32::from(c.reconfiguration_index), 3);
         w.write(u32::from(c.toggle), 1);
         w.write(0, 1);
+        let _ = s;
+        let mut bits = w.into_bits();
+        // The first service parameter set is present in every mode.
+        bits.extend_from_slice(&self.service_bits());
+        bits
+    }
+
+    /// One service parameter set: 44 bits (§6.3).
+    fn service_bits(&self) -> Vec<u8> {
+        let s = &self.service;
+        let mut w = BitWriter::new();
         w.write(s.service_id & 0xFF_FFFF, 24);
         w.write(u32::from(s.short_id), 2);
         w.write(u32::from(s.audio_ca), 1);
@@ -274,16 +309,19 @@ impl Fac {
         w.write(u32::from(s.descriptor), 5);
         w.write(u32::from(s.data_ca), 1);
         w.write(0, 6);
-        let mut bits = w.into_bits();
-        let mut crc = Crc::crc8();
-        for &b in &bits {
-            crc.add_bit(b == 1);
-        }
-        let v = crc.value();
-        for i in (0..8).rev() {
-            bits.push(((v >> i) & 1) as u8);
-        }
-        bits
+        w.into_bits()
+    }
+}
+
+/// Append the 8-bit FAC CRC to `bits` (§6, `Crc::crc8`).
+fn append_crc8(bits: &mut Vec<u8>) {
+    let mut crc = Crc::crc8();
+    for &b in bits.iter() {
+        crc.add_bit(b == 1);
+    }
+    let v = crc.value();
+    for i in (0..8).rev() {
+        bits.push(((v >> i) & 1) as u8);
     }
 }
 

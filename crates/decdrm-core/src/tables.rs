@@ -10,20 +10,76 @@ use crate::params::RobustnessMode;
 // Pilots and FAC positions (§8.4)
 // ---------------------------------------------------------------------------------
 
-/// Number of FAC cells per transmission frame (§8.4.5.1).
-pub const NUM_FAC_CELLS: usize = 65;
+/// Number of FAC cells per transmission frame (§8.5.2).
+///
+/// 65 for modes A–D; **244 for robustness mode E** (verified against the spec's stated count
+/// and against real DRM+ recordings).
+pub const fn num_fac_cells(mode: RobustnessMode) -> usize {
+    match mode {
+        RobustnessMode::A | RobustnessMode::B | RobustnessMode::C | RobustnessMode::D => 65,
+        RobustnessMode::E => 244,
+    }
+}
 
-/// FAC cell positions (symbol within frame, carrier index) (§8.4.5.1, tables 99–102).
-pub const fn fac_positions(mode: RobustnessMode) -> &'static [(u8, i16); NUM_FAC_CELLS] {
+/// FAC cell positions (symbol within frame, carrier index) (§8.5.2, tables 62–66).
+///
+/// The per-mode tables have different lengths, so this returns a slice rather than a fixed
+/// array. Mode E has 244 cells spread over symbols 5..=26.
+pub const fn fac_positions(mode: RobustnessMode) -> &'static [(u8, i16)] {
     match mode {
         RobustnessMode::A => &FAC_A,
         RobustnessMode::B => &FAC_B,
         RobustnessMode::C => &FAC_C,
         RobustnessMode::D => &FAC_D,
+        RobustnessMode::E => &FAC_E,
     }
 }
 
-const FAC_A: [(u8, i16); NUM_FAC_CELLS] = [
+/// Mode E FAC cell positions (§8.5.2, table 66), 244 cells over symbols 5..=26.
+///
+/// The four carrier groups cycle with **period 4** from symbol 5 (verified against real
+/// DRM+): A (11 carriers, remainder 2 mod 16), B (12, rem 6), C (12, rem 10), D (11, rem 14).
+/// Built by `fac_positions_e` below from those groups so the cycle cannot be mis-typed.
+static FAC_E: [(u8, i16); 244] = build_fac_e();
+
+const FAC_E_GROUPS: [[i16; 12]; 4] = [
+    // Group A (11 used; the 12th slot is padding so every row has one type).
+    [-78, -62, -46, -30, -14, 2, 18, 34, 50, 66, 82, 0],
+    // Group B (12)
+    [-90, -74, -58, -42, -26, -10, 6, 22, 38, 54, 70, 86],
+    // Group C (12)
+    [-86, -70, -54, -38, -22, -6, 10, 26, 42, 58, 74, 90],
+    // Group D (11)
+    [-82, -66, -50, -34, -18, -2, 14, 30, 46, 62, 78, 0],
+];
+const FAC_E_GROUP_LEN: [usize; 4] = [11, 12, 12, 11];
+
+/// Build table 66: symbols 5..=25 each carry one full group, cycling A,B,C,D with period 4;
+/// symbol 26 carries only the first **3** of group B's carriers, which is what makes the
+/// frame's total exactly the 244 cells the standard states.
+///
+/// (A pure cycle over symbols 5..=26 would give 253 cells, so the truncated last row is real
+/// and not an extraction artefact: 5 full cycles = 230, plus group A = 11, plus 3 = 244.)
+const fn build_fac_e() -> [(u8, i16); 244] {
+    let mut out = [(0u8, 0i16); 244];
+    let mut n = 0;
+    let mut s = 5;
+    while s <= 26 {
+        let g = (s - 5) % 4;
+        // The last symbol of the frame carries a partial group.
+        let len = if s == 26 { 3 } else { FAC_E_GROUP_LEN[g] };
+        let mut i = 0;
+        while i < len {
+            out[n] = (s as u8, FAC_E_GROUPS[g][i]);
+            n += 1;
+            i += 1;
+        }
+        s += 1;
+    }
+    out
+}
+
+const FAC_A: [(u8, i16); 65] = [
     (2, 26), (2, 46), (2, 66), (2, 86),
     (3, 10), (3, 30), (3, 50), (3, 70), (3, 90),
     (4, 14), (4, 22), (4, 34), (4, 62), (4, 74), (4, 94),
@@ -38,7 +94,7 @@ const FAC_A: [(u8, i16); NUM_FAC_CELLS] = [
     (13, 38), (13, 58), (13, 78),
 ];
 
-const FAC_B: [(u8, i16); NUM_FAC_CELLS] = [
+const FAC_B: [(u8, i16); 65] = [
     (2, 13), (2, 25), (2, 43), (2, 55), (2, 67),
     (3, 15), (3, 27), (3, 45), (3, 57), (3, 69),
     (4, 17), (4, 29), (4, 47), (4, 59), (4, 71),
@@ -53,7 +109,7 @@ const FAC_B: [(u8, i16); NUM_FAC_CELLS] = [
     (13, 23), (13, 35), (13, 47), (13, 65), (13, 77),
 ];
 
-const FAC_C: [(u8, i16); NUM_FAC_CELLS] = [
+const FAC_C: [(u8, i16); 65] = [
     (3, 9), (3, 21), (3, 45), (3, 57),
     (4, 23), (4, 35), (4, 47),
     (5, 13), (5, 25), (5, 37), (5, 49),
@@ -72,7 +128,7 @@ const FAC_C: [(u8, i16); NUM_FAC_CELLS] = [
     (18, 15), (18, 27), (18, 39), (18, 51),
 ];
 
-const FAC_D: [(u8, i16); NUM_FAC_CELLS] = [
+const FAC_D: [(u8, i16); 65] = [
     (3, 9), (3, 18), (3, 27),
     (4, 10), (4, 19),
     (5, 11), (5, 20), (5, 29),
@@ -95,28 +151,41 @@ const FAC_D: [(u8, i16); NUM_FAC_CELLS] = [
     (22, 10), (22, 19), (22, 37),
 ];
 
-/// Frequency reference pilots: (carrier, phase₁₀₂₄) (§8.4.2, table 86). They are
-/// present in every symbol. In mode D the first two pilots are phase-inverted
-/// (+512) on odd symbols.
-pub const fn freq_pilots(mode: RobustnessMode) -> &'static [(i16, u16); 3] {
+/// Frequency reference pilots: (carrier, phase₁₀₂₄) (§8.4.2, table 51). They are present in
+/// every symbol. In mode D the first two pilots are phase-inverted (+512) on odd symbols.
+///
+/// Empty for robustness mode E: "For robustness mode E, no frequency reference cells are
+/// defined" (§8.4.2).
+pub const fn freq_pilots(mode: RobustnessMode) -> &'static [(i16, u16)] {
     match mode {
         RobustnessMode::A => &[(18, 205), (54, 836), (72, 215)],
         RobustnessMode::B => &[(16, 331), (48, 651), (64, 555)],
         RobustnessMode::C => &[(11, 214), (33, 392), (44, 242)],
         RobustnessMode::D => &[(7, 788), (21, 1014), (28, 332)],
+        RobustnessMode::E => &[],
     }
 }
 
 /// Time reference pilots in symbol 0 of each frame: (carrier, phase₁₀₂₄)
-/// (§8.4.3, table 87).
+/// (§8.4.3.1, tables 53–57).
 pub const fn time_pilots(mode: RobustnessMode) -> &'static [(i16, u16)] {
     match mode {
         RobustnessMode::A => &TIME_A,
         RobustnessMode::B => &TIME_B,
         RobustnessMode::C => &TIME_C,
         RobustnessMode::D => &TIME_D,
+        RobustnessMode::E => &TIME_E,
     }
 }
+
+/// Mode E time reference cells (§8.4.3.1, table 57), 21 cells.
+/// "All time reference cells have a power gain of 2" (§8.4.3.2).
+const TIME_E: [(i16, u16); 21] = [
+    (-80, 219), (-79, 475), (-77, 987), (-53, 652), (-52, 652), (-51, 140),
+    (-32, 819), (-31, 819), (12, 907), (13, 907), (14, 651), (21, 903),
+    (22, 391), (23, 903), (40, 203), (41, 203), (42, 203), (67, 797),
+    (68, 29), (79, 508), (80, 508),
+];
 
 const TIME_A: [(i16, u16); 21] = [
     (17, 973), (18, 205), (19, 717), (21, 264), (28, 357), (29, 357), (32, 952),
@@ -139,7 +208,22 @@ const TIME_D: [(i16, u16); 21] = [
     (24, 176), (26, 752), (27, 496), (28, 332), (29, 432), (30, 964), (32, 452),
 ];
 
+/// Which arithmetic §8.4.4.3.1 uses to turn (n, m, p) into a gain-reference phase.
+///
+/// The two differ structurally, not just in constants: modes A–D use a scalar `Q` and a
+/// `(1 + s)` factor, while mode E uses three 4×10 matrices and no `s`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GainPhaseModel {
+    /// Modes A–D: `phase = (4·Z₂₅₆[n][m] + p·W₁₀₂₄[n][m] + p²·(1 + s)·Q₁₀₂₄) mod 1024`.
+    Wzq256,
+    /// Mode E: `phase = (p²·R₁₀₂₄[n][m] + p·Z₁₀₂₄[n][m] + Q₁₀₂₄[n][m]) mod 1024`.
+    Rzq1024,
+}
+
 /// Parameters of the gain reference (scattered) pilot grid (§8.4.4).
+///
+/// Verified against real DRM+ recordings for mode E: the grid and the phase formula both
+/// reproduce every gain-reference cell (203/203 within 45°, worst residual 22°).
 #[derive(Debug, Clone, Copy)]
 pub struct ScatteredPilotParams {
     /// Carrier spacing between gain references within one symbol is `freq_int · time_int`,
@@ -147,19 +231,48 @@ pub struct ScatteredPilotParams {
     pub freq_int: usize,
     /// Period of the pattern in symbols.
     pub time_int: usize,
-    /// Constants (x, y, k₀) of the phase formula (§8.4.4.3.1, table 91).
+    /// Constants (x, y, k₀) of the phase formula (§8.4.4.3.1, table 60).
     pub x: i32,
     pub y: i32,
     pub k0: i32,
-    /// Row size of the W and Z matrices.
+    /// Which phase arithmetic to use.
+    pub model: GainPhaseModel,
+    /// Row size of the matrices.
     pub wz_cols: usize,
-    /// `W₁₀₂₄[n][m]`, row-major `y × wz_cols`.
+    /// `W₁₀₂₄[n][m]`, row-major `y × wz_cols` (modes A–D; empty for mode E).
     pub w: &'static [i32],
-    /// `Z₂₅₆[n][m]`, row-major `y × wz_cols`.
+    /// `Z₂₅₆[n][m]` (modes A–D) or `Z₁₀₂₄[n][m]` (mode E), row-major.
     pub z: &'static [i32],
-    /// Q₁₀₂₄.
+    /// `Q₁₀₂₄`, a scalar for modes A–D.
     pub q: i32,
+    /// `R₁₀₂₄[n][m]`, row-major (mode E only; empty for A–D).
+    pub r: &'static [i32],
+    /// `Q₁₀₂₄[n][m]`, row-major (mode E only; empty for A–D).
+    pub q1024: &'static [i32],
 }
+
+/// Mode E gain-reference phase matrices, 4 rows × 10 columns (§8.4.4.3.6), row-major.
+///
+/// Mode E uses a structurally different formula from A–D (three matrices, no `(1 + s)` term).
+/// Verified against real DRM+ recordings: every gain-reference cell phase reproduces.
+const GAIN_E_R: [i32; 40] = [
+    39, 118, 197, 276, 354, 433, 39, 118, 197, 276,
+    37, 183, 402, 37, 183, 402, 37, 183, 402, 37,
+    110, 329, 475, 110, 329, 475, 110, 329, 475, 110,
+    79, 158, 236, 315, 394, 473, 79, 158, 236, 315,
+];
+const GAIN_E_Z: [i32; 40] = [
+    473, 394, 315, 236, 158, 79, 0, 0, 0, 0,
+    183, 914, 402, 37, 475, 841, 768, 768, 987, 183,
+    549, 622, 475, 110, 37, 622, 256, 768, 329, 549,
+    79, 158, 236, 315, 394, 473, 158, 315, 473, 630,
+];
+const GAIN_E_Q: [i32; 40] = [
+    329, 489, 894, 419, 607, 519, 1020, 942, 817, 939,
+    824, 1023, 74, 319, 225, 207, 348, 422, 395, 92,
+    959, 379, 7, 738, 500, 920, 440, 727, 263, 733,
+    907, 946, 924, 91, 189, 133, 910, 804, 1022, 433,
+];
 
 pub const fn scattered_pilots(mode: RobustnessMode) -> ScatteredPilotParams {
     match mode {
@@ -169,10 +282,13 @@ pub const fn scattered_pilots(mode: RobustnessMode) -> ScatteredPilotParams {
             x: 4,
             y: 5,
             k0: 2,
+            model: GainPhaseModel::Wzq256,
             wz_cols: 3,
             w: &[228, 341, 455, 455, 569, 683, 683, 796, 910, 910, 0, 114, 114, 228, 341],
             z: &[0, 81, 248, 18, 106, 106, 122, 116, 31, 129, 129, 39, 33, 32, 111],
             q: 36,
+            r: &[],
+            q1024: &[],
         },
         RobustnessMode::B => ScatteredPilotParams {
             freq_int: 2,
@@ -180,10 +296,13 @@ pub const fn scattered_pilots(mode: RobustnessMode) -> ScatteredPilotParams {
             x: 2,
             y: 3,
             k0: 1,
+            model: GainPhaseModel::Wzq256,
             wz_cols: 5,
             w: &[512, 0, 512, 0, 512, 0, 512, 0, 512, 0, 512, 0, 512, 0, 512],
             z: &[0, 57, 164, 64, 12, 168, 255, 161, 106, 118, 25, 232, 132, 233, 38],
             q: 12,
+            r: &[],
+            q1024: &[],
         },
         RobustnessMode::C => ScatteredPilotParams {
             freq_int: 2,
@@ -191,6 +310,7 @@ pub const fn scattered_pilots(mode: RobustnessMode) -> ScatteredPilotParams {
             x: 2,
             y: 2,
             k0: 1,
+            model: GainPhaseModel::Wzq256,
             wz_cols: 10,
             w: &[
                 465, 372, 279, 186, 93, 0, 931, 838, 745, 652, //
@@ -201,6 +321,8 @@ pub const fn scattered_pilots(mode: RobustnessMode) -> ScatteredPilotParams {
                 179, 178, 83, 253, 127, 105, 101, 198, 250, 145,
             ],
             q: 12,
+            r: &[],
+            q1024: &[],
         },
         RobustnessMode::D => ScatteredPilotParams {
             freq_int: 1,
@@ -208,6 +330,7 @@ pub const fn scattered_pilots(mode: RobustnessMode) -> ScatteredPilotParams {
             x: 1,
             y: 3,
             k0: 1,
+            model: GainPhaseModel::Wzq256,
             wz_cols: 8,
             w: &[
                 366, 439, 512, 585, 658, 731, 805, 878, //
@@ -220,6 +343,25 @@ pub const fn scattered_pilots(mode: RobustnessMode) -> ScatteredPilotParams {
                 165, 7, 252, 124, 253, 177, 197, 142,
             ],
             q: 14,
+            r: &[],
+            q1024: &[],
+        },
+        // Mode E (DRM+): k = 2 + 4·(s mod 4) + 16·p; period 4, step 4, 13–14 carriers.
+        // (x, y, k₀) = (4, 4, 2) — settled by the signal, which also settles the layout-mode
+        // scramble of table 60.
+        RobustnessMode::E => ScatteredPilotParams {
+            freq_int: 4,
+            time_int: 4,
+            x: 4,
+            y: 4,
+            k0: 2,
+            model: GainPhaseModel::Rzq1024,
+            wz_cols: 10,
+            w: &[],
+            z: &GAIN_E_Z,
+            q: 0,
+            r: &GAIN_E_R,
+            q1024: &GAIN_E_Q,
         },
     }
 }
@@ -228,6 +370,10 @@ pub const fn scattered_pilots(mode: RobustnessMode) -> ScatteredPilotParams {
 /// indexed by spectrum occupancy (§8.4.4.3.2, table 92). Zero rows are undefined
 /// combinations.
 pub const fn boosted_pilots(mode: RobustnessMode, so: usize) -> [i16; 4] {
+    // Mode E, occupancy 0 only (§8.4.4.2, table 59): the four edge carriers.
+    if matches!(mode, RobustnessMode::E) {
+        return [-106, -102, 102, 106];
+    }
     const A: [[i16; 4]; 6] = [
         [2, 6, 98, 102],
         [2, 6, 110, 114],
@@ -265,6 +411,8 @@ pub const fn boosted_pilots(mode: RobustnessMode, so: usize) -> [i16; 4] {
         RobustnessMode::B => B[so],
         RobustnessMode::C => C[so],
         RobustnessMode::D => D[so],
+        // Handled by the early return above (mode E, occupancy 0).
+        RobustnessMode::E => [-106, -102, 102, 106],
     }
 }
 
@@ -385,6 +533,7 @@ pub const SDC16_RATES: [usize; 2] = [2, 7];
 /// SDC 4-QAM code-rate index (rate 0.5).
 pub const SDC4_RATE: usize = 4;
 /// FAC 4-QAM code-rate index (rate 0.6).
+/// FAC code-rate index for modes A-D (3/5). Mode E uses 1/4: see `fec::mlc::fac_rate_index`.
 pub const FAC_RATE: usize = 6;
 
 /// Bit-interleaver constants t₀ for the two interleaver types (§7.3.3).

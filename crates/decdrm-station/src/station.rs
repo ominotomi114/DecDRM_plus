@@ -311,14 +311,19 @@ impl Station {
 
         // A modulator's MDI input (paced by the sound card if there is one).
         let modulator = match &cfg.mdi {
-            Some(m) => Some(Box::new(crate::modulator::Modulator::new(m, cfg.base_dir.as_deref(), cfg.output.device.is_some())?)),
+            Some(m) => Some(Box::new(crate::modulator::Modulator::new(
+                m,
+                cfg.base_dir.as_deref(),
+                cfg.output.device.is_some(),
+                cfg.channel.working_sample_rate.0,
+            )?)),
             None => None,
         };
 
         // The outputs last, so that a configuration error leaves no empty file behind.
         let channels = output.channels();
         let file = crate::output::open_file(&cfg, channels)?;
-        let device = DeviceSink::open(&cfg.output, channels)?;
+        let device = DeviceSink::open(&cfg.output, channels, cfg.channel.working_sample_rate.0.hz())?;
 
         let output_file = cfg.output.file.as_ref().map(|f| cfg.resolve(f));
         let simulator = cfg.simulate.as_ref().and_then(|s| s.channel_config()).map(|c| {
@@ -511,12 +516,12 @@ impl Station {
                     let layout = decdrm_core::params::ChannelLayout::new(config.mode, config.occupancy)
                         .ok_or_else(|| StationError::Mdi("an undefined mode/bandwidth combination".into()))?;
                     self.tx = Transmitter::new(config)?;
-                    self.output = OutputStage::new(layout, crate::plan::output_config(&self.cfg.output, Some(layout)))?;
+                    self.output = OutputStage::new(layout, crate::plan::output_config(&self.cfg.output, Some(layout), self.cfg.channel.working_sample_rate.0))?;
                     self.plan.tx = config;
                     self.plan.layout = layout;
                     self.plan.capacity = self.tx.msc_capacity();
                     self.plan.sdc_capacity = self.tx.sdc_capacity_bytes();
-                    self.plan.output = crate::plan::output_config(&self.cfg.output, Some(layout));
+                    self.plan.output = crate::plan::output_config(&self.cfg.output, Some(layout), self.cfg.channel.working_sample_rate.0);
                 }
                 let sdc = sdc.map(|mut d| {
                     d.truncate(self.tx.sdc_capacity_bytes());

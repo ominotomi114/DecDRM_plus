@@ -391,7 +391,7 @@ fn every_problem_is_reported() {
     "#;
     let p = problems(text);
     for needle in [
-        "only defined with occupancy 3 or 5",
+        "is not defined with occupancy 2 (mode E uses 0; modes C and D use 3 or 5)",
         "set `file` and/or `device`",
         "not an ISO 8601 time",
         "longer than 16 characters",

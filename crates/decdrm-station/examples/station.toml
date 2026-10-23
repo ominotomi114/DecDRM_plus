@@ -8,8 +8,12 @@
 
 # --- Transmission parameters (FAC channel parameters, MSC protection) --------------
 [channel]
-mode = "B"                   # robustness mode A (good channels) .. D (severe Doppler/delay)
-occupancy = 3                # 0..5 = 4.5, 5, 9, 10, 18, 20 kHz; modes C and D only 3 or 5
+mode = "B"                   # robustness mode A (good channels) .. D (severe Doppler/delay),
+                             # or E (DRM+, the VHF mode: needs occupancy 0 and 120/192 kHz)
+occupancy = 3                # 0..5 = 4.5, 5, 9, 10, 18, 20 kHz; modes C and D only 3 or 5;
+                             # mode E only 0 (100 kHz, the DRM+ raster)
+working_sample_rate = "48"   # 48 (modes A-D), 96, 120 or 192 kHz. Mode E needs 120 or 192:
+                             # its 213 carriers reach +-47.11 kHz, so 48/96 kHz are refused
 msc_mode = "64-QAM"          # "16-QAM", "64-QAM", "HMsym" or "HMmix" (hierarchical 64-QAM)
 sdc_mode = "16-QAM"          # "16-QAM" or "4-QAM" (robust, about half the SDC capacity)
 interleaving = "long"        # "long" (2 s, robust against fading) or "short" (400 ms)
@@ -20,7 +24,8 @@ protection_hierarchical = 0  # HMsym/HMmix: protection of the hierarchical strea
 
 # --- Output --------------------------------------------------------------------------
 [output]
-file = "drm_station.wav"     # WAV or FLAC, 48 kHz; the CLI's --output FILE replaces this
+file = "drm_station.wav"     # WAV or FLAC at the working sample rate (48 kHz unless set
+                             # above); the CLI's --output FILE replaces this
 sample_format = "int16"      # "int16", "int24" or "float32" (WAV only)
 # device = "CABLE-A Input"   # sound card (name or unique part of it; "default" = system default)
 # device_buffer_ms = 400     # audio queued ahead on the sound card

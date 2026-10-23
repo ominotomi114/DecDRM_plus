@@ -148,9 +148,22 @@ impl CellMap {
                     let nn = (s % y) as usize;
                     let m = (s / y) as usize;
                     let p = (k - sp.k0 - x * (s % y)) / (x * y);
-                    let w = sp.w[nn * sp.wz_cols + m];
-                    let z = sp.z[nn * sp.wz_cols + m];
-                    let phase = (4 * z + p * w + p * p * (1 + s) * sp.q).rem_euclid(1024);
+                    // The two phase models differ structurally (§8.4.4.3.1): A–D use a
+                    // scalar Q and a (1 + s) factor over W₁₀₂₄/Z₂₅₆, mode E uses three
+                    // matrices and no s. Both index as [n][m] over `wz_cols` columns.
+                    let phase = match sp.model {
+                        tables::GainPhaseModel::Wzq256 => {
+                            let w = sp.w[nn * sp.wz_cols + m];
+                            let z = sp.z[nn * sp.wz_cols + m];
+                            (4 * z + p * w + p * p * (1 + s) * sp.q).rem_euclid(1024)
+                        }
+                        tables::GainPhaseModel::Rzq1024 => {
+                            let r = sp.r[nn * sp.wz_cols + m];
+                            let z = sp.z[nn * sp.wz_cols + m];
+                            let q = sp.q1024[nn * sp.wz_cols + m];
+                            (p * p * r + p * z + q).rem_euclid(1024)
+                        }
+                    };
                     let is_boosted = boosted.iter().any(|&b| i32::from(b) == k);
                     let power = if is_boosted {
                         ty |= CellType::BOOSTED;
@@ -185,7 +198,10 @@ impl CellMap {
                 }
 
                 // Unused carriers (overrides pilots, e.g. mode D gain refs at k = 0).
-                if k == 0 || (mode == RobustnessMode::A && (k == -1 || k == 1)) {
+                // Mode E leaves none unused (§8.3.1, table 50), so this must not fire there.
+                if !mode.is_drm_plus()
+                    && (k == 0 || (mode == RobustnessMode::A && (k == -1 || k == 1)))
+                {
                     ty = CellType::DC;
                     pilots[idx] = Cplx::new(0.0, 0.0);
                 }
@@ -317,7 +333,7 @@ fn polar_1024(amp: Real, phase: i32) -> Cplx {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tables::NUM_FAC_CELLS;
+    use crate::tables::num_fac_cells;
 
     fn all_layouts() -> Vec<CellMap> {
         let mut v = Vec::new();
@@ -338,7 +354,7 @@ mod tests {
                 let n: usize = (0..map.symbols_per_frame)
                     .map(|s| map.fac_carriers(f * map.symbols_per_frame + s).len())
                     .sum();
-                assert_eq!(n, NUM_FAC_CELLS, "{}", map.layout);
+                assert_eq!(n, num_fac_cells(map.layout.mode), "{}", map.layout);
             }
         }
     }

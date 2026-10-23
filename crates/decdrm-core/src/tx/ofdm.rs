@@ -26,11 +26,17 @@ pub struct OfdmModulator {
 
 impl OfdmModulator {
     pub fn new(map: &CellMap) -> Self {
-        let n = map.mode().fft_size();
+        Self::new_at(map, crate::params::WorkingRate::R48)
+    }
+
+    /// [`Self::new`] at an explicit working sample rate: the FFT size and guard interval are
+    /// the mode's geometry at that rate, which is what makes mode E (DRM+) possible.
+    pub fn new_at(map: &CellMap, rate: crate::params::WorkingRate) -> Self {
+        let n = map.mode().fft_size_at(rate);
         Self {
             fft: Fft::new(n),
             n,
-            guard: map.mode().guard_len(),
+            guard: map.mode().guard_len_at(rate),
             kmin: map.kmin,
             num_carriers: map.num_carriers,
             work: vec![Cplx::new(0.0, 0.0); n],

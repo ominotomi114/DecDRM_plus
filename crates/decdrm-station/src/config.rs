@@ -18,7 +18,7 @@
 use crate::afs::AfsSettings;
 use crate::error::{Result, StationError};
 use decdrm_core::fac::{Interleaving, LANGUAGES, MscMode, PROGRAMME_TYPES, SdcMode};
-use decdrm_core::params::{RobustnessMode, SpectrumOccupancy};
+use decdrm_core::params::{RobustnessMode, SpectrumOccupancy, WorkingRate};
 use serde::de::{self, Visitor};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt;
@@ -142,7 +142,8 @@ pub(crate) fn line_column(text: &str, offset: usize) -> (usize, usize) {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct ChannelSettings {
-    /// Robustness mode A–D (ES 201 980 §8.1).
+    /// Robustness mode A–E (ES 201 980 §8.1). Mode E is DRM+ (VHF, 100 kHz raster) and
+    /// needs a working sample rate of at least 100 kHz: it is rejected at 48 and 96 kHz.
     pub mode: Mode,
     /// Spectrum occupancy 0–5: 4.5, 5, 9, 10, 18 or 20 kHz. Modes C and D only exist
     /// with 3 and 5.
@@ -162,6 +163,15 @@ pub struct ChannelSettings {
     pub protection_b: u8,
     /// Protection level of the hierarchical stream (HMsym/HMmix only), 0–3.
     pub protection_hierarchical: u8,
+    /// Working sample rate of the transmit chain: 48 (default), 96, 120 or 192 kHz. Modes
+    /// A–D run at 48 kHz; robustness mode E (DRM+) needs 120 or 192 kHz, because its
+    /// carriers reach ±47.11 kHz.
+    ///
+    /// Named `working_sample_rate` rather than `sample_rate` to keep it distinct from the
+    /// *audio* codec's `[audio] sample_rate`, which is a different thing (the rate the
+    /// encoder runs at). Omitted from the file when it is the 48 kHz default.
+    #[serde(skip_serializing_if = "RateSetting::is_default")]
+    pub working_sample_rate: RateSetting,
 }
 
 impl Default for ChannelSettings {
@@ -175,6 +185,7 @@ impl Default for ChannelSettings {
             protection_a: 0,
             protection_b: 1,
             protection_hierarchical: 0,
+            working_sample_rate: RateSetting(WorkingRate::R48),
         }
     }
 }
@@ -819,9 +830,40 @@ string_setting!(
         "b" => Ok(Mode(RobustnessMode::B)),
         "c" => Ok(Mode(RobustnessMode::C)),
         "d" => Ok(Mode(RobustnessMode::D)),
-        _ => Err(format!("unknown robustness mode \"{s}\" (use A, B, C or D)")),
+        "e" | "drm" | "drmplus" => Ok(Mode(RobustnessMode::E)),
+        _ => Err(format!("unknown robustness mode \"{s}\" (use A, B, C, D or E)")),
     },
     |m: Mode| m.0.to_string()
+);
+
+/// Working sample rate of the transmit chain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct RateSetting(pub WorkingRate);
+
+impl RateSetting {
+    /// The default (48 kHz), which is not written to the file.
+    pub fn is_default(&self) -> bool {
+        self.0 == WorkingRate::R48
+    }
+}
+
+string_setting!(
+    RateSetting,
+    |s: &str| {
+        let n: u32 = norm(s)
+            .trim_end_matches("khz")
+            .trim_end_matches("hz")
+            .trim()
+            .parse()
+            .map_err(|_| format!("unknown sample rate \"{s}\" (use 48, 96, 120 or 192 kHz)"))?;
+        // Accept both kHz (48) and Hz (48000) spellings.
+        let hz = if n < 1000 { n * 1000 } else { n };
+        WorkingRate::new(hz)
+            .map(RateSetting)
+            .ok_or_else(|| format!("unsupported sample rate {hz} Hz (use 48000, 96000, 120000 or 192000)"))
+    },
+    |r: RateSetting| format!("{}kHz", r.0.hz() / 1000)
 );
 
 /// MSC constellation.
@@ -1229,6 +1271,60 @@ code_setting_serde!(ProgrammeType, "programme type");
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mode_e_and_the_working_rate_round_trip() {
+        // Both spellings of the rate are accepted, in kHz and Hz.
+        assert_eq!("120".parse::<RateSetting>().unwrap().0, WorkingRate::R120);
+        assert_eq!("120kHz".parse::<RateSetting>().unwrap().0, WorkingRate::R120);
+        assert_eq!("192000".parse::<RateSetting>().unwrap().0, WorkingRate::R192);
+        assert_eq!("48".parse::<RateSetting>().unwrap().0, WorkingRate::R48);
+        assert!("100".parse::<RateSetting>().unwrap_err().contains("48000"), "the message lists the options");
+
+        // Mode E, and its spellings.
+        assert_eq!("e".parse::<Mode>().unwrap().0, RobustnessMode::E);
+        // `norm` strips punctuation, so the file spelling is "drmplus" or a bare "e" — and also
+        // "drm" ("DRM+" with the "+" stripped), which the station accepts.
+        assert_eq!("drmplus".parse::<Mode>().unwrap().0, RobustnessMode::E);
+        assert_eq!("DRM+".parse::<Mode>().unwrap().0, RobustnessMode::E);
+        // The mode error now names E too.
+        assert!("z".parse::<Mode>().unwrap_err().contains("E"));
+
+        // A default station is 48 kHz and writes no rate (it is the default), but a mode E
+        // station writes the one it needs.
+        let plain = ChannelSettings::default();
+        assert_eq!(plain.working_sample_rate.0, WorkingRate::R48);
+        assert!(RateSetting(WorkingRate::R48).is_default());
+        assert!(!RateSetting(WorkingRate::R192).is_default());
+    }
+
+    #[test]
+    fn mode_e_at_48_khz_is_rejected_with_a_reason() {
+        // The configuration check must refuse mode E at 48 kHz, and say why and what to do.
+        let text = "[channel]
+mode = \"E\"
+occupancy = 0
+";
+        let cfg = StationConfig::from_toml_str(text).unwrap();
+        assert_eq!(cfg.channel.working_sample_rate.0, WorkingRate::R48, "the rate defaults");
+        let e = cfg.validate().unwrap_err();
+        let msg = e.to_string();
+        assert!(msg.contains("100 kHz"), "{msg}");
+        assert!(msg.contains("mode E") || msg.contains("mode E (DRM+)"), "{msg}");
+
+        // At 192 kHz the same station is accepted.
+        let text = "[channel]
+mode = \"E\"
+occupancy = 0
+working_sample_rate = \"192\"
+";
+        let cfg = StationConfig::from_toml_str(text).unwrap();
+        assert_eq!(cfg.channel.working_sample_rate.0, WorkingRate::R192);
+        // (Whatever else it complains about, it must not be the rate.)
+        if let Err(e) = cfg.validate() {
+            assert!(!e.to_string().contains("100 kHz"), "{e}");
+        }
+    }
 
     #[test]
     fn parse_errors_have_a_location() {

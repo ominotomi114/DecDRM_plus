@@ -11,13 +11,29 @@ use super::qam::{EqCell, Mapping, MetricKind};
 use super::viterbi::ViterbiDecoder;
 use super::BitMetric;
 use crate::Cplx;
+use crate::params::RobustnessMode;
 use crate::tables::{
-    BIT_INTERLEAVER_T0, CODE_RATES, FAC_RATE, MSC16_SM, MSC64_HMMIX, MSC64_HMSYM, MSC64_SM,
-    NUM_FAC_CELLS, PunctureMask, SDC4_RATE, SDC16_RATES,
+    BIT_INTERLEAVER_T0, CODE_RATES, MSC16_SM, MSC64_HMMIX, MSC64_HMSYM, MSC64_SM,
+    num_fac_cells, PunctureMask, SDC4_RATE, SDC16_RATES,
 };
 
-/// Number of FAC information bits per frame (incl. CRC) (§7.5.3).
-pub const FAC_BITS: usize = 72;
+/// Number of FAC information bits per frame (incl. CRC) (§7.2.1.2): 72 for robustness
+/// modes A–D, **116 for mode E**.
+pub const fn fac_bits(mode: RobustnessMode) -> usize {
+    match mode {
+        RobustnessMode::A | RobustnessMode::B | RobustnessMode::C | RobustnessMode::D => 72,
+        RobustnessMode::E => 116,
+    }
+}
+
+/// FAC code rate index into [`CODE_RATES`] (§7.5.3): 3/5 (index 6) for modes A–D, **1/4
+/// (index 0) for mode E**.
+pub const fn fac_rate_index(mode: RobustnessMode) -> usize {
+    match mode {
+        RobustnessMode::A | RobustnessMode::B | RobustnessMode::C | RobustnessMode::D => 6,
+        RobustnessMode::E => 0,
+    }
+}
 
 /// Protection levels of the MSC (from the SDC multiplex description, §6.4.3.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -76,22 +92,25 @@ fn floor_bits(idx: usize, coded: i64) -> usize {
 }
 
 impl MlcParams {
-    /// FAC: 4-QAM, R = 0.6, 72 bits in 65 cells.
-    pub fn fac() -> Self {
+    /// FAC: 4-QAM; code rate 3/5 and 72 bits in 65 cells for modes A–D, or code rate 1/4
+    /// and 116 bits in 244 cells for robustness mode E (§7.5.3, §7.2.1.2, §8.5.2).
+    pub fn fac_for(mode: RobustnessMode) -> Self {
+        let cells = num_fac_cells(mode);
+        let bits = fac_bits(mode);
         Self {
             mapping: Mapping::Qam4,
-            cells: NUM_FAC_CELLS,
+            cells,
             n1: 0,
-            n2: NUM_FAC_CELLS,
+            n2: cells,
             levels: vec![LevelParams {
                 bits_a: 0,
-                bits_b: FAC_BITS,
+                bits_b: bits,
                 rate_a: 0,
-                rate_b: FAC_RATE,
+                rate_b: fac_rate_index(mode),
                 interleaver: Some(1),
             }],
             bits_hpp: 0,
-            bits_lpp: FAC_BITS,
+            bits_lpp: bits,
             bits_vspp: 0,
             tail_rule: TailRule::Standard,
             is_fac: true,
@@ -503,7 +522,7 @@ mod tests {
 
     #[test]
     fn fac_roundtrip() {
-        roundtrip(MlcParams::fac(), 0);
+        roundtrip(MlcParams::fac_for(RobustnessMode::A), 0);
     }
 
     #[test]

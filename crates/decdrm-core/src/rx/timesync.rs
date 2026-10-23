@@ -290,7 +290,9 @@ impl TimeSync {
     }
 
     fn evaluate(&mut self, events: &mut Vec<TimeSyncEvent>) {
-        let geoms: [Geom; 4] = RobustnessMode::ALL.map(geom);
+        // The receiver runs at 48 kHz, where only modes A-D have geometry; mode E
+        // (DRM+) needs a higher rate and is not auto-detected here.
+        let geoms: [Geom; 4] = RobustnessMode::DRM30.map(geom);
         let span = geoms.iter().map(|g| g.g + g.nu).max().unwrap_or(0);
         let sel = self.mode.index();
         let dec_end = self.dec_base + self.dec.len() as i64;

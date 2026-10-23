@@ -23,7 +23,7 @@ use decdrm_core::fec::mlc::MscProtection;
 use decdrm_core::mux::msc::{MscGeometry, multiplex};
 use decdrm_core::mux::sdc::{MultiplexDescription, StreamDescription};
 use decdrm_core::mux::service::{AudioCodec, AudioMode, Ensemble};
-use decdrm_core::params::RobustnessMode;
+use decdrm_core::params::{RobustnessMode, WorkingRate};
 use decdrm_core::tx::{Transmitter, TxConfig};
 use decdrm_mdi::source::{MdiInput, MdiOrigin, MdiRead};
 use decdrm_mdi::{DcpStats, MdiFrame};
@@ -111,12 +111,19 @@ pub(crate) struct Modulator {
     ensemble: Ensemble,
     pub status: ModulatorStatus,
     log: Vec<String>,
+    /// Working sample rate of the station's transmit chain (mode E needs 120 or 192 kHz).
+    working_rate: WorkingRate,
 }
 
 impl Modulator {
     /// Start reading the MDI of `settings` (relative recording paths against
     /// `base_dir`). `realtime`: a sound card paces the transmission.
-    pub fn new(settings: &MdiSettings, base_dir: Option<&Path>, realtime: bool) -> Result<Self, StationError> {
+    pub fn new(
+        settings: &MdiSettings,
+        base_dir: Option<&Path>,
+        realtime: bool,
+        working_rate: WorkingRate,
+    ) -> Result<Self, StationError> {
         let origin = origin(settings, base_dir).map_err(StationError::Mdi)?;
         let input = MdiInput::open(origin.clone(), false).map_err(|e| StationError::Mdi(format!("{}: {e}", origin.describe())))?;
         let is_file = input.is_file();
@@ -146,6 +153,7 @@ impl Modulator {
             next_dlfc: None,
             ensemble: Ensemble::new(),
             status: ModulatorStatus { input: what.clone(), waiting: true, ..ModulatorStatus::default() },
+            working_rate,
             log: vec![format!("modulator: MDI from {what}")],
         })
     }
@@ -360,6 +368,9 @@ impl Modulator {
             },
             part_a_bytes,
             afs_index,
+            // Modes A-D run at 48 kHz; mode E (DRM+) would need 120/192 kHz and its own
+            // configuration plumbed through (not yet offered by the station config).
+            working_rate: self.working_rate,
         };
         let geometry = match self.current {
             Some((c, g)) if c == config => g,
