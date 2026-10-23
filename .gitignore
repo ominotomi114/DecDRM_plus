@@ -7,6 +7,7 @@
 # Local-only material (large or third-party docs, not redistributed)
 /samples/
 /reference/
+/refs/
 /out/
 # Neural codec weights (DAC), fetched with `decdrm models download dac`
 /models/

@@ -151,6 +151,9 @@ pub struct RxSession {
     /// The SBR band smoothing last asked of the engine: for which service (DRM service
     /// ID), on or off (see [`Self::sync_smooth_sbr`]).
     smooth_sent: Option<(u32, bool)>,
+    /// The dropout concealment switch last sent to the engine (see
+    /// [`Self::sync_conceal_dropouts`]).
+    conceal_sent: Option<bool>,
     epoch: Instant,
 }
 
@@ -178,6 +181,7 @@ impl Default for RxSession {
             rci_tunable: false,
             live: false,
             smooth_sent: None,
+            conceal_sent: None,
             epoch: Instant::now(),
         }
     }
@@ -215,6 +219,7 @@ impl RxSession {
         self.log.push(format!("── start: {label}"));
         self.source_label = label;
         self.smooth_sent = None;
+        self.conceal_sent = None;
         self.engine = Some(Engine::start(cfg));
     }
 
@@ -337,6 +342,17 @@ impl RxSession {
         {
             e.command(Command::SetSmoothSbr(wanted.1));
             self.smooth_sent = Some(wanted);
+        }
+    }
+
+    /// Dropout concealment: tell the engine when the switch changes (see
+    /// [`Command::SetConcealDropouts`]).
+    pub fn sync_conceal_dropouts(&mut self, on: bool) {
+        if self.conceal_sent != Some(on)
+            && let Some(e) = &self.engine
+        {
+            e.command(Command::SetConcealDropouts(on));
+            self.conceal_sent = Some(on);
         }
     }
 

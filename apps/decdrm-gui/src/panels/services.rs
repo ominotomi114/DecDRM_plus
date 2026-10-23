@@ -352,6 +352,7 @@ pub fn show(
     volume: &mut f32,
     record_dir: &mut Option<PathBuf>,
     smooth: &mut Vec<u32>,
+    conceal: &mut bool,
 ) -> Option<u8> {
     heading(ui, "Services");
     let mut clicked = None;
@@ -420,7 +421,7 @@ pub fn show(
             ui.end_row();
         });
     volume_slider(ui, volume);
-    record_row(ui, rx, record_dir, smooth);
+    record_row(ui, rx, record_dir, smooth, conceal);
     clicked
 }
 
@@ -431,15 +432,42 @@ const RECORD_HELP: &str = "Record the audio you hear to a WAV file (or FLAC: sma
      Stop: as decoded, at the station's sample rate and channels, whatever the volume. If the audio format changes \
      (another service), the recording carries on in a new file, name-2.wav.";
 
-/// The audio's buttons: record, the RF monitor and the SBR band smoothing.
-fn record_row(ui: &mut Ui, rx: &RxSession, record_dir: &mut Option<PathBuf>, smooth: &mut Vec<u32>) {
+/// The audio's buttons: record, the RF monitor, the SBR band smoothing and dropout
+/// concealment.
+fn record_row(
+    ui: &mut Ui,
+    rx: &RxSession,
+    record_dir: &mut Option<PathBuf>,
+    smooth: &mut Vec<u32>,
+    conceal: &mut bool,
+) {
     let running = rx.is_running() && !rx.is_stopping();
     let rec = rx.snap.audio.recording.as_ref();
     ui.horizontal_wrapped(|ui| {
         record_button(ui, rx, rec, running, record_dir);
         monitor_toggle(ui, rx, running);
         smooth_toggle(ui, rx, running, smooth);
+        conceal_toggle(ui, running, conceal);
     });
+}
+
+/// Mask audio dropouts (`conceal`; `RxSession::sync_conceal_dropouts` tells the engine):
+/// while the audio is lost, the last clean audio is repeated at a falling level.
+fn conceal_toggle(ui: &mut Ui, running: bool, conceal: &mut bool) {
+    let on = *conceal;
+    let button = egui::Button::new("\u{2934}  Conceal dropouts").selected(on);
+    let response = ui
+        .add_enabled(running, button)
+        .on_hover_text(
+            "While the audio is lost (synchronisation, lost multiplex frames, or a codec's own concealment), \
+             repeat the last clean audio at a falling level until it fades to silence, so a brief dropout is \
+             heard as a dip instead of a cut and an abrupt return. It only fills gaps that are already there, \
+             and never invents audio where there was signal.",
+        )
+        .on_disabled_hover_text("Start receiving first");
+    if response.clicked() {
+        *conceal = !on;
+    }
 }
 
 /// SBR band smoothing for the station being decoded, remembered per station (`smooth`:

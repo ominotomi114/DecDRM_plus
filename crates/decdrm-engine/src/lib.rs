@@ -73,6 +73,10 @@ pub struct EngineConfig {
     pub monitor: bool,
     /// Start with the SBR band smoother on (see [`Command::SetSmoothSbr`]).
     pub smooth_sbr: bool,
+    /// Start with dropout concealment on (see [`Session::set_conceal_dropouts`]). On by
+    /// default: it only fills gaps the receiver already has, so it never invents audio where
+    /// there was signal, and it is what makes a brief dropout a dip rather than a cut.
+    pub conceal_dropouts: bool,
 }
 
 impl Default for EngineConfig {
@@ -91,6 +95,7 @@ impl Default for EngineConfig {
             rci_listen: None,
             monitor: false,
             smooth_sbr: false,
+            conceal_dropouts: true,
         }
     }
 }
@@ -131,6 +136,11 @@ pub enum Command {
     /// HE-AAC and xHE-AAC with SBR only; adds about 100 ms of delay. See
     /// [`Session::set_smooth_sbr`]; [`AudioStatus::smooth_sbr`] shows it.
     SetSmoothSbr(bool),
+    /// Mask audio dropouts (`true`) or let them cut the audio: while the audio is lost the
+    /// last clean audio is repeated at a falling level, so a brief gap is a dip rather than
+    /// a cut to silence and back. See [`Session::set_conceal_dropouts`];
+    /// [`AudioStatus::conceal_dropouts`] shows it.
+    SetConcealDropouts(bool),
     Stop,
 }
 
@@ -257,6 +267,7 @@ fn worker(
     audio.set_monitor(cfg.monitor);
     audio.set_volume(cfg.volume);
     session.set_smooth_sbr(cfg.smooth_sbr);
+    session.set_conceal_dropouts(cfg.conceal_dropouts);
     let mut saver = cfg.data_dir.clone().map(data_store::DataStore::new);
     let mut logger = cfg.log.as_ref().map(logger::Logger::create).transpose()?;
     let log = |line: String, snap: &mut Snapshot| {
@@ -275,6 +286,9 @@ fn worker(
     }
     if cfg.smooth_sbr {
         log("SBR band smoothing on".into(), &mut snap);
+    }
+    if cfg.conceal_dropouts {
+        log("dropout concealment on".into(), &mut snap);
     }
 
     // Remote control: RCI commands become engine commands.
@@ -352,6 +366,12 @@ fn worker(
                     snap.selected_service = session.selected_service();
                     // An RSCI receiver decodes the service too (its audio status).
                     source.send_rci(&[decdrm_mdi::RciCommand::Service(id)]);
+                }
+                Command::SetConcealDropouts(on) => {
+                    if on != session.conceal_dropouts() {
+                        session.set_conceal_dropouts(on);
+                        log(if on { "dropout concealment on".into() } else { "dropout concealment off".into() }, &mut snap);
+                    }
                 }
                 Command::SetVolume(gain) => audio.set_volume(gain),
                 Command::SetMonitor(on) => {
@@ -572,6 +592,7 @@ fn publish(
     snap.audio.recording = audio.recording();
     snap.audio.monitor = audio.monitoring();
     snap.audio.smooth_sbr = session.smooth_sbr();
+    snap.audio.conceal_dropouts = session.conceal_dropouts();
     snap.audio.sbr_crossover_hz = session.sbr_crossover_hz();
     if let Some((buffered, ppm)) = audio.status() {
         snap.audio.buffer_ms = buffered.as_secs_f32() * 1000.0;

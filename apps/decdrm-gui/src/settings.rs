@@ -402,6 +402,9 @@ pub struct Settings {
     /// Stations whose SBR band is smoothed (the Audio panel's *Smooth SBR*), by DRM
     /// service ID.
     pub smooth_sbr_services: Vec<u32>,
+    /// Mask audio dropouts (the Audio panel's *Conceal dropouts*): the last clean audio is
+    /// repeated at a falling level while the audio is lost. On by default.
+    pub conceal_dropouts: bool,
     /// Save received data objects (slides, website files, programme guides) below this
     /// directory (the engine's `data_dir`); `None` saves nothing but the website files
     /// the browser needs (see `website`).
@@ -452,6 +455,7 @@ impl Default for Settings {
             volume: 100.0,
             record_dir: None,
             smooth_sbr_services: Vec::new(),
+            conceal_dropouts: true,
             data_dir: None,
             theme: ThemeChoice::System,
             plot_tab: PlotTab::Overview,
@@ -722,6 +726,7 @@ mod tests {
             volume: 35.0,
             record_dir: Some(PathBuf::from("recordings")),
             smooth_sbr_services: vec![1, 0xD0D003],
+            conceal_dropouts: false,
             data_dir: Some(PathBuf::from("received")),
             theme: ThemeChoice::Light,
             plot_tab: PlotTab::History,
@@ -760,6 +765,7 @@ mod tests {
         assert!(text.contains("plot_tab = \"history\""), "{text}");
         assert!(text.contains("volume = 35.0"), "{text}");
         assert!(text.contains("smooth_sbr_services = ["), "{text}");
+        assert!(text.contains("conceal_dropouts = false"), "{text}");
         assert!(text.contains("[schedule]"), "{text}");
         assert_eq!(parse(&text).unwrap(), s);
         let partial = parse("[schedule]\nfreq = \"6140\"\n").unwrap();

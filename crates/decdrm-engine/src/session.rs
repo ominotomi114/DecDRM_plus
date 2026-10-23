@@ -15,7 +15,7 @@
 //! RSCI receiver's status items stand in for the receiver's status and plots.
 
 use decdrm_codecs::{DrmAudioCoding, DrmAudioDecoder, PcmFrame, open_decoder};
-use decdrm_io::HighBandSmoother;
+use decdrm_io::{DropoutConcealer, HighBandSmoother};
 use decdrm_core::fac::{Fac, LANGUAGES, PROGRAMME_TYPES};
 use decdrm_core::params::RobustnessMode;
 use decdrm_core::mux::audio::AudioDeframer;
@@ -79,12 +79,33 @@ struct AudioPipeline {
     text: TextMessageDecoder,
     /// The SBR band smoother while it is on (see [`Session::set_smooth_sbr`]).
     smoother: Option<HighBandSmoother>,
+    /// Masks dropouts with a decaying repeat of the last good audio, while it is on (see
+    /// [`Session::set_conceal_dropouts`]). Runs last, on the audio that leaves the pipeline.
+    concealer: Option<DropoutConcealer>,
 }
 
 impl AudioPipeline {
     /// Decoded audio on its way out: through the SBR band smoother when `smooth` is on and
-    /// the stream has SBR (made anew when the audio format changes).
-    fn post(&mut self, mut pcm: PcmFrame, smooth: bool) -> PcmFrame {
+    /// the stream has SBR, then through the dropout concealer when `conceal` is on (both
+    /// made anew when the audio format changes). Rebuilt the same way for concealed frames,
+    /// so a gap that starts before the format is known is still concealed consistently.
+    fn post(&mut self, mut pcm: PcmFrame, smooth: bool, conceal: bool) -> PcmFrame {
+        if conceal {
+            let ch = usize::from(pcm.channels);
+            if self
+                .concealer
+                .as_ref()
+                .is_none_or(|c| c.sample_rate() != pcm.sample_rate || c.channels() != ch)
+            {
+                self.concealer = Some(DropoutConcealer::new(pcm.sample_rate, ch));
+            }
+            if let Some(c) = self.concealer.as_mut() {
+                pcm.samples = c.process(&pcm.samples, pcm.concealed);
+            }
+        } else {
+            self.concealer = None;
+        }
+
         let crossover = self.params.sbr_crossover_hz().filter(|_| smooth);
         let Some(crossover) = crossover else {
             self.smoother = None;
@@ -301,6 +322,8 @@ pub struct Session {
     pub msc_stats: MscStats,
     /// See [`Session::set_smooth_sbr`].
     smooth_sbr: bool,
+    /// See [`Session::set_conceal_dropouts`].
+    conceal_dropouts: bool,
     text: Option<String>,
     samples_in: u64,
     /// `samples_in` when the last multiplex frame was decoded.
@@ -340,6 +363,7 @@ impl Session {
             evs: Vec::new(),
             audio_stats: AudioStats::default(),
             smooth_sbr: false,
+            conceal_dropouts: false,
             msc_stats: MscStats::default(),
             text: None,
             samples_in: 0,
@@ -504,6 +528,22 @@ impl Session {
     /// The SBR band smoother is switched on (see [`Self::set_smooth_sbr`]).
     pub fn smooth_sbr(&self) -> bool {
         self.smooth_sbr
+    }
+
+    /// Mask audio dropouts: while the audio is lost (synchronisation, lost multiplex frames,
+    /// or a codec's own concealment), the last clean audio is repeated at a falling level, so
+    /// a short gap is heard as a dip instead of a cut to silence and back. On by default, as
+    /// it only fills gaps the receiver already has; see [`decdrm_io::dropout_conceal`].
+    pub fn set_conceal_dropouts(&mut self, on: bool) {
+        self.conceal_dropouts = on;
+        if !on && let Some(a) = self.audio.as_mut() {
+            a.concealer = None;
+        }
+    }
+
+    /// Dropout concealment is switched on (see [`Self::set_conceal_dropouts`]).
+    pub fn conceal_dropouts(&self) -> bool {
+        self.conceal_dropouts
     }
 
     /// Where the SBR band of the current audio starts, Hz; `None` without SBR (nothing to
@@ -787,7 +827,7 @@ impl Session {
                     for _ in 0..sf.nominal_frames.unwrap_or(0) {
                         if let Ok(pcm) = a.decoder.conceal() {
                             self.audio_stats.frames_concealed += 1;
-                            out.push(SessionEvent::Audio(a.post(pcm, self.smooth_sbr)));
+                            out.push(SessionEvent::Audio(a.post(pcm, self.smooth_sbr, self.conceal_dropouts)));
                         }
                     }
                 }
@@ -810,13 +850,13 @@ impl Session {
                                 good += 1;
                                 self.audio_stats.frames_ok += 1;
                             }
-                            out.push(SessionEvent::Audio(a.post(pcm, self.smooth_sbr)));
+                            out.push(SessionEvent::Audio(a.post(pcm, self.smooth_sbr, self.conceal_dropouts)));
                         }
                         Err(_) => {
                             bad += 1;
                             self.audio_stats.frames_concealed += 1;
                             if let Ok(pcm) = a.decoder.conceal() {
-                                out.push(SessionEvent::Audio(a.post(pcm, self.smooth_sbr)));
+                                out.push(SessionEvent::Audio(a.post(pcm, self.smooth_sbr, self.conceal_dropouts)));
                             }
                         }
                     }
@@ -1039,6 +1079,7 @@ fn build_audio(short_id: u8, params: &AudioParams, stream: StreamLengths) -> Res
         decoder,
         text: TextMessageDecoder::new(),
         smoother: None,
+        concealer: None,
     })
 }
 

@@ -198,6 +198,8 @@ pub struct AudioStatus {
     /// The SBR band smoother is switched on (see `Command::SetSmoothSbr`); it acts on audio
     /// with SBR only.
     pub smooth_sbr: bool,
+    /// Dropout concealment is switched on (see `Command::SetConcealDropouts`).
+    pub conceal_dropouts: bool,
     /// Where the SBR band of the current audio starts, Hz (`None`: no SBR, nothing to
     /// smooth).
     pub sbr_crossover_hz: Option<f64>,

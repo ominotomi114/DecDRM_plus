@@ -98,6 +98,11 @@ struct RxArgs {
     /// delay; played and written audio alike).
     #[arg(long)]
     smooth_sbr: bool,
+    /// Let audio dropouts cut to silence instead of being masked. On by default the last
+    /// clean audio is repeated at a falling level while the audio is lost, so a brief gap is
+    /// heard as a dip rather than a cut (played and written audio alike).
+    #[arg(long)]
+    no_conceal_dropouts: bool,
     /// Write the decoded audio to a WAV/FLAC file (as decoded, 16-bit; a change of the
     /// audio format carries on in FILE-2.wav, …).
     #[arg(long, value_name = "FILE")]
@@ -223,6 +228,7 @@ fn rx(a: RxArgs) -> Result<()> {
         record_audio: a.out.clone(),
         data_dir: a.data_dir.clone(),
         smooth_sbr: a.smooth_sbr,
+        conceal_dropouts: !a.no_conceal_dropouts,
         log: a.log.clone().map(|p| LogConfig { interval_s: a.log_interval, ..LogConfig::new(p) }),
         ..EngineConfig::default()
     });

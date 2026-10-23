@@ -47,6 +47,7 @@
 
 pub mod channels;
 mod device;
+pub mod dropout_conceal;
 mod error;
 mod file_reader;
 mod file_writer;
@@ -67,6 +68,7 @@ pub use file_reader::FileReader;
 pub use file_writer::{Container, Encoding, FileWriter};
 pub use player::{AudioPlayer, PlayerOptions, PlayerStatus};
 pub use resample::{resample, Resampler, ResamplerQuality, To48k};
+pub use dropout_conceal::{ConcealState, DropoutConcealer};
 pub use sbr_smooth::HighBandSmoother;
 pub use stream::{
     InputOptions, InputStats, InputStream, OutputOptions, OutputState, OutputStats, OutputStream,
