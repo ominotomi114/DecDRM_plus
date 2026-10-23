@@ -81,6 +81,11 @@ fn run(rate: WorkingRate, seconds: Real) -> (usize, usize, usize) {
         interleaving: cfg.interleaving,
     }));
 
+    // Pin the mode and skip acquisition: the frequency search in `freqacq.rs` is still
+    // built for 48 kHz geometry (fixed FFT length and pilot bins), so it cannot find a
+    // mode E signal unaided. This test is about demodulation, not acquisition.
+    rx.set_mode(RobustnessMode::E, SpectrumOccupancy::SO_0);
+
     let cap = tx.msc_capacity();
     let frames = (seconds / 0.1).ceil() as usize;
     // A plain counter stands in for the MSC payload; the test only needs the container.
@@ -96,7 +101,6 @@ fn run(rate: WorkingRate, seconds: Real) -> (usize, usize, usize) {
         pcm.clear();
         out.process(&baseband, &mut pcm);
         for ev in rx.push(&pcm) {
-            eprintln!("ev: {ev:?}");
             match ev {
                 ReceiverEvent::Fac(_) => fac_ok += 1,
                 ReceiverEvent::Sdc(s) if s.crc_ok => sdc_ok += 1,

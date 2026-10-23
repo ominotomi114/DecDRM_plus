@@ -188,19 +188,30 @@ pub const PROGRAMME_TYPES: [&str; 32] = [
 ];
 
 impl Fac {
-    /// Parse a decoded FAC block (72 bits, one bit per byte). Returns `None` if the
-    /// CRC fails or a field is invalid.
+    /// Parse a decoded FAC block, one bit per byte. Returns `None` if the CRC fails or a
+    /// field is invalid.
+    ///
+    /// Two widths exist (§7.2.1.2): **72 bits** for robustness modes A–D (20 channel bits
+    /// + one 44-bit service parameter set + 8 CRC) and **116 bits** for mode E (the same
+    /// channel bits + **two** service parameter sets + 8 CRC — §6.3's "two sets of service
+    /// parameters"), the CRC covering everything before it. The width is taken from the
+    /// slice, so a caller that knows the mode does not have to say so.
     pub fn parse(bits: &[u8]) -> Option<Self> {
-        if bits.len() < 72 {
+        // 64 + 8 for A–D, 108 + 8 for mode E.
+        let (payload, crc_at) = if bits.len() >= 116 {
+            (108, 108)
+        } else if bits.len() >= 72 {
+            (64, 64)
+        } else {
             return None;
-        }
+        };
         let mut crc = Crc::crc8();
-        for &b in &bits[..64] {
+        for &b in &bits[..payload] {
             crc.add_bit(b & 1 == 1);
         }
         let mut r = BitReader::from_bits(bits);
         let rx_crc = {
-            let mut t = BitReader::from_bits(&bits[64..72]);
+            let mut t = BitReader::from_bits(&bits[crc_at..crc_at + 8]);
             t.read(8)
         };
         if crc.value() != rx_crc {
@@ -239,6 +250,12 @@ impl Fac {
             },
             service: ServiceParams { service_id, short_id, audio_ca, language, is_data, descriptor, data_ca },
         })
+    }
+
+    /// The number of service parameter sets a FAC block of `len` bits carries (§6.3):
+    /// one for modes A–D (72 bits), two for mode E (116 bits).
+    pub fn service_sets(len: usize) -> usize {
+        if len >= 116 { 2 } else { 1 }
     }
 
     /// Serialise to 72 bits including the CRC (transmitter side).

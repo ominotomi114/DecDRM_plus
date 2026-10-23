@@ -145,7 +145,12 @@ fn main() {
                                  f.service.short_id, f.service.short_id);
                     }
                 }
-                ReceiverEvent::FacError => fac_bad += 1,
+                ReceiverEvent::FacError => {
+                    fac_bad += 1;
+                    if fac_bad <= 4 {
+                        println!("{t:7.2}s FAC ERROR ({})", fac_bad);
+                    }
+                }
                 ReceiverEvent::Sdc(b) => {
                     if b.crc_ok {
                         sdc_ok += 1;

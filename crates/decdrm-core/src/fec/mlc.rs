@@ -522,7 +522,11 @@ mod tests {
 
     #[test]
     fn fac_roundtrip() {
-        roundtrip(MlcParams::fac_for(RobustnessMode::A), 0);
+        // Every mode's FAC coding must round-trip: A-D at rate 3/5 over 65 cells, mode E at
+        // rate 1/4 over 244 (116 information bits, two service parameter sets).
+        for m in RobustnessMode::ALL {
+            roundtrip(MlcParams::fac_for(m), 0);
+        }
     }
 
     #[test]

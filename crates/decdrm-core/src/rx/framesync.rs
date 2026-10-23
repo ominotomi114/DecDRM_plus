@@ -71,6 +71,8 @@ pub struct FrameSync {
     // Frequency tracking.
     pub track_freq: bool,
     freq_pil: [usize; 3],
+    /// Whether this mode defines frequency reference cells at all (mode E defines none).
+    have_freq_pil: bool,
     old_pil: [Cplx; 3],
     have_old: bool,
     freq_vec: Cplx,
@@ -115,6 +117,8 @@ impl FrameSync {
                 cnt += 1;
             }
         }
+        // Mode E has no frequency reference cells at all (8.4.2), so `cnt` stays 0.
+        let have_freq_pil = cnt == 3;
         let ts = map.mode().symbol_len_at(rate) as Real;
         Self {
             ns,
@@ -134,6 +138,7 @@ impl FrameSync {
             state: FrameSyncState::Searching,
             track_freq: false,
             freq_pil,
+            have_freq_pil,
             old_pil: [Cplx::new(0.0, 0.0); 3],
             have_old: false,
             freq_vec: Cplx::new(0.0, 0.0),
@@ -216,10 +221,12 @@ impl FrameSync {
         let symbol = self.sym_counter;
         self.sym_counter = (self.sym_counter + 1) % self.ns;
 
-        // Frequency tracking from the continuous pilots.
+        // Frequency tracking from the continuous pilots. Robustness mode E defines no
+        // frequency reference cells (8.4.2), so there is nothing to track from: skip it
+        // entirely rather than reading carrier 0 three times as if it were a pilot.
         let mut freq_delta_hz = 0.0;
         let mut sro_estimate = None;
-        if self.track_freq {
+        if self.track_freq && self.have_freq_pil {
             let mut est = Cplx::new(0.0, 0.0);
             let mut prods = [Cplx::new(0.0, 0.0); 3];
             for i in 0..3 {
