@@ -30,11 +30,14 @@
 //!   the sound card simply runs dry: this concealer has nothing to act on. Covering that case
 //!   needs a hold-and-fade at the player (on its underrun counter), which is a different
 //!   change again.
-//! * **No pitch detection.** The loop repeats a fixed [`LOOP_PERIOD_MS`], which is one or two
-//!   periods of a low-pitched voice but not of most music, so a long gap can sound buzzy. That
-//!   is deliberate for now — the decay makes the gap much shorter than the point where it
-//!   becomes objectionable — and the natural improvement is to estimate the pitch period and
-//!   loop that instead.
+//! * **No pitch detection, and that is the thing to fix next.** The loop repeats a fixed
+//!   [`LOOP_PERIOD_MS`], which is not a whole number of periods of most signals, so the wrap
+//!   splices the waveform out of phase (a 300 Hz tone at 24 kHz: 12 ms is 3.6 periods, so the
+//!   seam is 216° off). Measured while trying a "reverb" fix: that is what a fixed-length loop
+//!   cannot avoid, and a longer loop only moves the error. Detecting the signal's own period and
+//!   setting the loop to a whole number of it removes the seam entirely — measured at the ideal
+//!   step, with no crossfade needed — which is the real improvement here rather than more taps.
+//!   The crossfade below is what keeps the seam from clicking in the meantime.
 
 use std::collections::VecDeque;
 
