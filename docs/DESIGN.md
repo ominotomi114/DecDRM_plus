@@ -8,7 +8,7 @@ and the milestone plan. Keep the milestone checklist current.
 
 | Topic | Decision |
 |---|---|
-| Standard scope | DRM30 robustness modes **A, B, C, D**; all spectrum occupancies (0–5, 4.5–20 kHz); 4/16/64-QAM; SM, HMsym, HMmix; short & long interleaving; all protection levels. No DRM+ (mode E), no analog AM/SSB/FM, no AMSS. |
+| Standard scope | DRM30 robustness modes **A, B, C, D**; all spectrum occupancies (0–5, 4.5–20 kHz); 4/16/64-QAM; SM, HMsym, HMmix; short & long interleaving; all protection levels. **DRM+ (mode E)** added 2026-10-23: transmit works, receive is partial — see the milestone at the end of this document. No analog AM/SSB/FM, no AMSS. |
 | Purpose | Personal / hobby. |
 | Relationship to Dream | Spec-first idiomatic Rust, freely translating Dream's proven algorithms (sync, Wiener channel estimation, MLC decoding). Licence therefore **GPL-2.0-or-later**. Reference: Dream `branches/dream-mjf` r1548. |
 | Receiver performance | Match or beat Dream on weak/fading signals (Wiener channel estimation, soft-decision Viterbi, iterative MLC, sample-rate-offset tracking). |
@@ -648,6 +648,61 @@ symbol lengths are 1152/1024/704/448 samples for modes A/B/C/D.
       loopback through the receiver; live through the virtual cable: 80 s, 0 underruns,
       titles received. Not verified: real Icecast/SHOUTCAST servers and real encoders'
       streams (no internet in development).
+
+- [ ] **DRM+ / robustness mode E** (started 2026-10-23) — mode E is the VHF DRM+ mode:
+  213 carriers at a 444 4/9 Hz spacing reaching ±47.11 kHz, on the 100 kHz raster, with
+  **100 ms** transmission frames of 40 OFDM symbols, 244 FAC cells over symbols 5..=26,
+  no unused carriers, no frequency reference cells, and a two-service 116-bit FAC at code
+  rate 0.25. It needs a **120 or 192 kHz** working sample rate, which is why `WorkingRate`
+  now exists and is carried by the transmitter and receiver.
+
+  *Transmit: works.* A station with `mode = "E"`, `occupancy = 0` and
+  `working_sample_rate = "192"` validates and transmits, and the signal it writes measures
+  as real DRM+ (Tu 432 samples, Tg 48, span ±47.29 kHz) by the same analysis used on the
+  reference recordings. Mode E at 48 or 96 kHz is refused by `check_mode_rate`.
+  `tests/mode_e_tx.rs` asserts the signal against those measurements.
+
+  *Receive: partial, and this is the open work.* The mode E loopback at 192 kHz decodes end
+  to end (FAC, SDC and multiplex frames) — `tests/mode_e_rx.rs`. Two bugs had to be found
+  for that: the MSC interleaver depth is **D = 6** for mode E (§7.6), not the 5 the code
+  hardcoded, and the channel estimator's timing rotation must use the FFT size *at the
+  working rate* (it used the 48 kHz one, 4× too small at 192 kHz). A third, in the PDS
+  tracker's `ir_per_sample`, was the same class of mistake.
+
+  Still failing, in decreasing order of how well it is understood:
+
+  1. **Real DRM+ recordings do not decode** (`refs/`; FAC 0/681) although every in-memory
+     path passes. `examples/modee_real.rs` demodulates a recording with perfect timing and
+     shows the geometry, the 244 FAC cells and the 116 decoded bits are all correct, and
+     that the FAC cells land evenly on all four 4-QAM phases (worst error 16.6°) — so the
+     demodulation is right and the symbol-to-bit stage is not. Note this tool has **no
+     equaliser**, so it cannot decode a real recording at all; it bounds the demodulation
+     only, and its failure is not evidence about the receiver.
+  2. **The file round trip is unexplained.** DecDRM's own mode E signal written to a WAV and
+     read back with `examples/rxfiled` gives FAC 0 with `band_limit = true` and FAC 2-3 with
+     it false — reproducibly. In memory, and through a manual int16 quantisation, **both
+     settings decode**, so the filter is not the cause (measured: within 0.2 dB of unfiltered
+     up to 47.4 kHz, and its 1.8 ms group delay is doubly ruled out because the passing
+     in-memory path also band-limits). `tests/mode_e_rx.rs` asserts the in-memory truth so
+     band limiting is not mis-blamed again. The file path differs from the in-memory path in
+     some way not yet found.
+  3. **120 kHz fails at the SDC step** (FAC 32, SDC 0) while 192 kHz passes. Not equaliser
+     tuning: a 25-combination sweep of the `TimeWiener` placeholders changed nothing.
+  4. `freqacq.rs` cannot find a mode E signal unaided — its detector hunts for the three
+     DRM30 frequency-reference pilots at 750/2250/3000 Hz, and mode E defines none. So
+     decoding a mode E file needs `Receiver::set_mode` to pin the mode. A plateau/bandwidth
+     detector is the replacement. The file is also still 48 kHz-calibrated (fixed
+     6144-point FFT, `HOP`, `NUM_AVERAGE`).
+
+  The `TimeWiener` `params(E)` filter length/Doppler pair and `freq_wiener_len(E)` are
+  **placeholders** copied from mode C, marked as such in the code. The 120 kHz sweep suggests
+  they are not the blocker, but they are unverified.
+
+  Open at the time of writing: the transmit side underruns badly at 192 kHz (4× the samples
+  of 48 kHz); the UI's rate/spectrum labels need checking at the higher rates; the
+  sample-rate value is written to the TOML as a number where `RateSetting` needs a string
+  (`apps/decdrm-gui/src/panels/tx_form.rs`); the multiplex bar computes kbit/s with a
+  hardcoded 400 ms frame, so mode E shows 4× too low.
 
 ## Conventions
 
