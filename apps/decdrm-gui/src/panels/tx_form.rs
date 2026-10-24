@@ -1695,7 +1695,6 @@ mod tests {
         assert_ne!(canon("16-QAM"), canon("64-QAM"));
     }
 
-    #[test]
     /// The sample rate is written as a **string** and must survive a round trip through the
     /// station parser. Writing an integer (which this form did) produced a file the parser then
     /// rejected, so the value silently did not apply.
@@ -1745,6 +1744,7 @@ mod tests {
         assert_eq!(RobustnessMode::B.frame_ms(), 400);
     }
 
+    #[test]
     fn edits_keep_comments_and_other_content() {
         let mut doc: DocumentMut = "[channel]\nmode = \"B\"   # robustness mode\n\n[[afs.multiplex]]\nkhz = [5990]\n".parse().unwrap();
         set(section(&mut doc, "channel"), "mode", "A");
