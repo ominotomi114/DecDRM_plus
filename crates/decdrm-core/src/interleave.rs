@@ -1,14 +1,37 @@
 //! MSC cell interleaving (ES 201 980 §7.6): a pseudo-random permutation within each
-//! multiplex frame (t₀ = 5), optionally spread over D = 5 frames (long
-//! interleaving) where cell i is delayed by i mod D frames at the transmitter.
-//! Port of Dream's `CSymbInterleaver` / `CSymbDeinterleaver`.
+//! multiplex frame (t₀ = 5), optionally spread over D frames (long interleaving) where
+//! cell i is delayed by i mod D frames at the transmitter. Port of Dream's
+//! `CSymbInterleaver` / `CSymbDeinterleaver`.
 
 use crate::Cplx;
+use crate::fac::Interleaving;
 use crate::fec::interleaver::permutation;
 use crate::fec::qam::EqCell;
+use crate::params::RobustnessMode;
 
 /// t₀ of the MSC cell interleaver.
 pub const CELL_INTERLEAVER_T0: usize = 5;
+
+/// Interleaver depth D in multiplex frames for `mode` and `interleaving` (7.6).
+///
+/// "As a good trade-off between performance and processing delay a value of **D = 5 for
+/// robustness modes A, B, C and D and D = 6 for robustness mode E** has been chosen." Short
+/// interleaving is D = 1, and mode E has **only** long interleaving: "For robustness mode E
+/// only one interleaver depth is available which corresponds to the algorithm for high
+/// interleaver depth" (so a mode E FAC claiming short interleaving still gets D = 6).
+///
+/// Both the transmitter's cell interleaver and the receiver's deinterleaver use this, so the
+/// two cannot disagree.
+pub const fn interleaver_depth(mode: RobustnessMode, interleaving: Interleaving) -> usize {
+    match mode {
+        // Mode E's long-interleaving depth, which is also its only depth.
+        RobustnessMode::E => 6,
+        _ => match interleaving {
+            Interleaving::Long => 5,
+            Interleaving::Short => 1,
+        },
+    }
+}
 
 /// Transmitter-side cell interleaver.
 #[derive(Debug, Clone)]

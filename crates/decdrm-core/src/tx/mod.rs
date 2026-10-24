@@ -210,10 +210,7 @@ impl Transmitter {
             check_params(params).map_err(TxError::Mlc)?;
         }
 
-        let depth = match cfg.interleaving {
-            Interleaving::Long => 5,
-            Interleaving::Short => 1,
-        };
+        let depth = crate::interleave::interleaver_depth(cfg.mode, cfg.interleaving);
         let msc_enc = MlcEncoder::new(msc_params);
         let mut interleaver = CellInterleaver::new(map.msc_cells_per_frame, depth);
         // Prime the interleaver memory with an encoded all-zero multiplex frame.

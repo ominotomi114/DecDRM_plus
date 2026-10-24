@@ -39,7 +39,7 @@ use super::chain::{MscConfig, MscFrame};
 use super::mscdec::MscDecoder;
 use super::{Receiver, ReceiverConfig, ReceiverEvent};
 use crate::fec::qam::{EqCell, Mapping, MetricKind};
-use crate::params::{SAMPLE_RATE, SAMPLES_PER_FRAME};
+use crate::params::{RobustnessMode, SAMPLE_RATE, SAMPLES_PER_FRAME};
 use crate::{Cplx, Real};
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
@@ -149,6 +149,9 @@ struct Ready {
 
 /// The pairing, combining and decoding of two branches' frames.
 pub(crate) struct Combiner {
+    /// Robustness mode being combined: its interleaver depth drives the deinterleaver
+    /// (§7.6, D = 5 for A–D and 6 for mode E).
+    mode: RobustnessMode,
     config: Option<MscConfig>,
     iterations: usize,
     metric: MetricKind,
@@ -184,8 +187,11 @@ pub(crate) struct Combiner {
 }
 
 impl Combiner {
-    pub fn new(iterations: usize, metric: MetricKind) -> Self {
+    /// `mode` sets the MSC interleaver depth (§7.6); diversity reception follows the
+    /// branch's detected mode, which the caller passes here.
+    pub fn new(iterations: usize, metric: MetricKind, mode: RobustnessMode) -> Self {
         Self {
+            mode,
             config: None,
             iterations,
             metric,
@@ -219,7 +225,7 @@ impl Combiner {
     pub fn reset(&mut self) {
         let (config, iterations, metric, stats) = (self.config, self.iterations, self.metric, self.stats);
         let (mix, mix_seq) = (std::mem::take(&mut self.mix), self.mix_seq);
-        *self = Self::new(iterations, metric);
+        *self = Self::new(iterations, metric, self.mode);
         self.config = config;
         self.stats = DiversityStats { lead_frames: None, agreement: None, share: None, ..stats };
         (self.mix, self.mix_seq) = (mix, mix_seq);
@@ -477,7 +483,7 @@ impl Combiner {
         let cfg = self.config?;
         let mut gap = r.gap;
         if self.decoder.as_ref().is_none_or(|d| d.config() != cfg || d.cells() != r.cells.len()) {
-            self.decoder = Some(MscDecoder::new(cfg, r.cells.len(), self.iterations, self.metric));
+            self.decoder = Some(MscDecoder::new(cfg, self.mode, r.cells.len(), self.iterations, self.metric));
             gap = true;
         }
         self.decoder.as_mut()?.decode(&r.cells, gap)
@@ -625,7 +631,9 @@ impl DiversityReceiver {
     pub fn new(cfg: [ReceiverConfig; 2]) -> Self {
         let (iterations, metric) = (cfg[0].msc_iterations, cfg[0].metric);
         let branches = cfg.map(|c| Receiver::new(ReceiverConfig { diversity_branch: true, ..c }));
-        Self { branches, combiner: Combiner::new(iterations, metric) }
+        // Diversity reception is DRM30-only here (the combiner's frame timing is 48 kHz); its
+        // interleaver depth is therefore the A–D one. Mode E reception is a single branch.
+        Self { branches, combiner: Combiner::new(iterations, metric, RobustnessMode::B) }
     }
 
     /// Feed branch `branch` (0 or 1) interleaved 48 kHz frames. Returns its events
@@ -726,7 +734,7 @@ mod tests {
     }
 
     fn combiner() -> Combiner {
-        Combiner::new(1, MetricKind::default())
+        Combiner::new(1, MetricKind::default(), RobustnessMode::B)
     }
 
     fn feed(c: &mut Combiner, b: usize, f: MscCells) -> Vec<Ready> {

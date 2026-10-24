@@ -137,7 +137,7 @@ impl ChannelEstimator {
         } else {
             None
         };
-        let tw = TimeWiener::new(&map);
+        let tw = TimeWiener::new_at(&map, rate);
         let delay = tw.delay;
         let track = PdsTracker::new(&map, num_pil, delay + 1);
         let fw_len = freq_wiener_len(map.mode());

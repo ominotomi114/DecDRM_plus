@@ -345,7 +345,7 @@ impl SymbolChain {
                 // A diversity branch only needs the mapping (for its MER); the
                 // combiner decodes.
                 self.msc = (!self.cells_out)
-                    .then(|| MscDecoder::new(c, self.map.msc_cells_per_frame, self.msc_iterations, metric));
+                    .then(|| MscDecoder::new(c, self.mode, self.map.msc_cells_per_frame, self.msc_iterations, metric));
             }
         }
     }

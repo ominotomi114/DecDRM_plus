@@ -115,12 +115,11 @@ fn run(rate: WorkingRate, seconds: Real) -> (usize, usize, usize) {
 /// At 192 kHz: the receiver locks on, decodes the FAC and the SDC, and recovers multiplex
 /// frames from DecDRM's own mode E signal.
 ///
-/// KNOWN FAILING: mode E reception is not finished. Acquisition and symbol sync work — the
-/// receiver finds the signal and its own detector identifies the mode — but the demodulated
-/// cells are wrong, so every FAC CRC fails. Run with `--ignored` to see the progress:
-/// `cargo test -p decdrm-core --test mode_e_rx -- --ignored --nocapture`
+/// This passes as of the interleaver-depth (D = 6 for mode E, §7.6) and TimeWiener
+/// working-rate fixes. It is a DecDRM-to-DecDRM loopback, so it cannot catch a misreading
+/// shared by this transmitter and receiver — for that, decode a real recording with
+/// `--example modee_real` or `--example rxfiled` (see the mode E notes).
 #[test]
-#[ignore = "mode E reception incomplete: cells demodulate wrong, FAC CRC fails"]
 fn mode_e_loopback_at_192k() {
     let (fac, sdc, msc) = run(WorkingRate::R192, 8.0);
     assert!(fac > 0, "no FAC decoded");
@@ -132,8 +131,14 @@ fn mode_e_loopback_at_192k() {
 }
 
 /// The same at 120 kHz, the other rate mode E runs at.
+///
+/// KNOWN FAILING at the SDC step: the FAC decodes (32 of 80 frames) but no SDC block passes
+/// its CRC, so no multiplex frame comes out. 192 kHz works, 120 kHz does not, and the
+/// difference is not yet understood — a sweep of the TimeWiener filter-length/Doppler
+/// placeholders (25 combinations) made no difference, so it is not equaliser tuning. Run with
+/// `--ignored` to see it.
 #[test]
-#[ignore = "mode E reception incomplete: see mode_e_loopback_at_192k"]
+#[ignore = "mode E at 120 kHz: FAC decodes but the SDC CRC fails; 192 kHz passes"]
 fn mode_e_loopback_at_120k() {
     let (fac, sdc, msc) = run(WorkingRate::R120, 8.0);
     assert!(fac > 0, "no FAC decoded");

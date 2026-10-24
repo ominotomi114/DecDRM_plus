@@ -6,7 +6,7 @@
 
 use crate::cellmap::CellMap;
 use crate::dsp::{iir1_c, iir1_lambda, levinson, linear_regression_slope};
-use crate::params::{RobustnessMode, SAMPLE_RATE};
+use crate::params::RobustnessMode;
 use crate::{Cplx, Real};
 use std::collections::VecDeque;
 use std::f64::consts::PI;
@@ -64,15 +64,27 @@ pub struct TimeWiener {
     ns: usize,
     /// First frame symbol with a gain reference on carrier offset 0.
     s0: usize,
+    /// FFT size at the working rate: the denominator of the timing-shift phase rotation.
+    fft_size: usize,
 }
 
 impl TimeWiener {
     pub fn new(map: &CellMap) -> Self {
+        Self::new_at(map, crate::params::WorkingRate::R48)
+    }
+
+    /// [`Self::new`] at an explicit working sample rate (mode E, DRM+, needs 120 or 192 kHz).
+    ///
+    /// The rate matters because a timing shift (`dshift`, in working-rate samples) is turned
+    /// into a per-carrier phase rotation with the **FFT size at that rate** as the
+    /// denominator: using the 48 kHz size at 192 kHz rotates every estimate 4x too far.
+    pub fn new_at(map: &CellMap, rate: crate::params::WorkingRate) -> Self {
         let mode = map.mode();
         let (len, sigma_max) = params(mode);
         let t = map.scattered.time_int;
         let delay = ((len * t - t + 1) as Real / 2.0).ceil() as usize + t / 2 - 1;
-        let ts = mode.symbol_len() as Real / Real::from(SAMPLE_RATE);
+        let ts = mode.symbol_len_at(rate) as Real / Real::from(rate.hz());
+        let fft_size = mode.fft_size_at(rate);
         let grid_len = (map.num_carriers - 1) / map.scattered.freq_int + 1;
         let s0 = (0..map.symbols_per_frame).find(|&s| map.cell(s, 0).is_scattered()).unwrap_or(0);
         let num_pil_one_sym = grid_len.div_ceil(t);
@@ -83,6 +95,7 @@ impl TimeWiener {
             t,
             delay,
             ts,
+            fft_size,
             sigma_max,
             sigma: sigma_max,
             hist: vec![VecDeque::from(vec![init; len]); grid_len],
@@ -146,7 +159,9 @@ impl TimeWiener {
         out: &mut [Cplx],
     ) -> Real {
         let x = map.scattered.freq_int;
-        let n = map.mode().fft_size() as Real;
+        // The timing shift is in working-rate samples, so the rotation denominator is the
+        // FFT size at that rate (NOT the mode's 48 kHz size).
+        let n = self.fft_size as Real;
         let cells = map.symbol_cells(s);
         let pilots = map.symbol_pilots(s);
         let rot = |h: Cplx, c: usize, dshift: i64| -> Cplx {
