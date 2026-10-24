@@ -8,7 +8,7 @@
 use super::meter::{MeterKind, meter_with_text};
 use super::source::DeviceLists;
 use decdrm_core::fac::{LANGUAGES, PROGRAMME_TYPES};
-use decdrm_core::params::{ChannelLayout, RobustnessMode, SpectrumOccupancy, WorkingRate};
+use decdrm_core::params::{ChannelLayout, RobustnessMode, SpectrumOccupancy};
 use decdrm_core::tx::output::{OutputFormat, recommended_if_range_hz, suggested_if_hz};
 use eframe::egui::{self, Color32, RichText, Ui};
 use std::path::Path;
@@ -28,8 +28,12 @@ pub struct FormCtx<'a> {
 /// The multiplex as a bar: MSC capacity and the streams that fill it.
 #[derive(Debug, Clone, Default)]
 pub struct PlanBar {
-    /// MSC bytes per 400 ms frame.
+    /// MSC bytes per transmission frame.
     pub capacity: usize,
+    /// Duration of one transmission frame, ms: 400 for modes A-D, **100 for mode E**. The
+    /// bit rate is `capacity * 8 / frame_ms`, so using a constant 400 for mode E reports a
+    /// quarter of the real rate.
+    pub frame_ms: u32,
     pub segments: Vec<Segment>,
 }
 
@@ -48,6 +52,7 @@ pub struct Segment {
 impl PlanBar {
     /// The bar of a checked configuration.
     pub fn of(cfg: &decdrm_station::StationConfig, plan: &decdrm_station::MultiplexPlan) -> Self {
+        let frame_ms = cfg.channel.mode.0.frame_ms();
         let c = &plan.capacity;
         let capacity = (c.vspp_bits + c.hpp_bits + c.lpp_bits) / 8;
         let label_of = |service: usize| cfg.services.get(service).map_or_else(|| format!("service {service}"), |s| s.label.clone());
@@ -72,13 +77,15 @@ impl PlanBar {
                 }
             })
             .collect();
-        Self { capacity, segments }
+        Self { capacity, frame_ms, segments }
     }
 
     /// Bit rate of the audio stream of service `service` (position), kbit/s.
     pub fn audio_kbps(&self, service: usize) -> Option<f64> {
-        // Bytes per 400 ms frame: × 8 bits / 400 ms.
-        self.segments.iter().find(|s| s.service == Some(service)).map(|s| s.bytes as f64 * 8.0 / 400.0)
+        // Bytes per transmission frame: * 8 bits / frame duration (400 ms for modes A-D,
+        // 100 ms for mode E).
+        let ms = f64::from(self.frame_ms.max(1));
+        self.segments.iter().find(|s| s.service == Some(service)).map(|s| s.bytes as f64 * 8.0 / ms)
     }
 }
 
@@ -186,6 +193,26 @@ fn get_int(t: &dyn TableLike, k: &str) -> Option<i64> {
     t.get(k)?.as_integer()
 }
 
+/// The working sample rate in kHz from the channel section, defaulting to 48.
+///
+/// The field is a **string** ("192kHz"), because `decdrm_station`'s `RateSetting` parses and
+/// writes it in its own spelling; an integer in the file is rejected by the station parser. This
+/// accepts both spellings so a hand-written `120` still reads, and both a string and an integer
+/// so a file written by the older form does not panic.
+fn sample_rate_khz(ch: &dyn TableLike) -> i64 {
+    let Some(item) = ch.get("working_sample_rate") else {
+        return 48;
+    };
+    if let Some(s) = item.as_str() {
+        let digits: String = s.chars().take_while(char::is_ascii_digit).collect();
+        // "192kHz" and "192" are kHz; a bare "192000" is Hz.
+        let n: i64 = digits.parse().unwrap_or(48);
+        return if n >= 1000 { n / 1000 } else { n };
+    }
+    // An integer written by an older build of this form is in kHz.
+    item.as_integer().unwrap_or(48)
+}
+
 fn get_num(t: &dyn TableLike, k: &str) -> Option<f64> {
     let item = t.get(k)?;
     item.as_float().or_else(|| item.as_integer().map(|i| i as f64))
@@ -279,9 +306,13 @@ fn channel(ui: &mut Ui, doc: &mut DocumentMut) -> bool {
     let hierarchical = canon(&msc).starts_with("hm");
     grid(ui, "tx_form_channel", |ui| {
         row_label(ui, "Sample rate");
-        let rate = get_int(ch, "working_sample_rate").unwrap_or(48).to_string();
+        // The value is a **string** in the file ("192kHz"), because `RateSetting` parses it
+        // through its own spelling rules ("120", "120kHz" and "192000" all work). Reading it as
+        // an integer and writing one back - which this did - produced a file the station parser
+        // then rejected.
+        let rate = sample_rate_khz(ch).to_string();
         if let Some(v) = combo(ui, "tx_rate", &rate, RATES, 280.0) {
-            set(ch, "working_sample_rate", v.parse::<i64>().unwrap_or(48));
+            set(ch, "working_sample_rate", format!("{v}kHz"));
             // Dropping below 100 kHz makes mode E impossible, so fall back to B for the user
             // rather than leave a configuration that cannot validate.
             let hz = v.parse::<i64>().unwrap_or(48) * 1000;
@@ -293,7 +324,7 @@ fn channel(ui: &mut Ui, doc: &mut DocumentMut) -> bool {
         ui.end_row();
         row_label(ui, "Robustness mode");
         // Mode E is offered only when the working rate can carry it.
-        let rate_hz = get_int(ch, "working_sample_rate").unwrap_or(48) * 1000;
+        let rate_hz = sample_rate_khz(ch) * 1000;
         let modes: Vec<(&str, &str)> = MODES
             .iter()
             .copied()
@@ -319,22 +350,27 @@ fn channel(ui: &mut Ui, doc: &mut DocumentMut) -> bool {
         }
         ui.end_row();
         row_label(ui, "Bandwidth");
-        let occ = get_int(ch, "occupancy").unwrap_or(3).to_string();
-        let allowed: Vec<(&str, &str)> = OCCUPANCIES
-            .iter()
-            .copied()
-            .filter(|(v, _)| match mode.as_str() {
-                "C" | "D" => matches!(*v, "3" | "5"),
-                // Mode E is defined at occupancy 0 only (100 kHz, the DRM+ raster).
-                "E" => *v == "0",
-                _ => true,
-            })
-            .collect();
-        if let Some(v) = combo(ui, "tx_occupancy", &occ, &allowed, 280.0) {
-            set(ch, "occupancy", v.parse::<i64>().unwrap_or(3));
-            changed = true;
+        // Mode E exists at occupancy 0 only (100 kHz, the DRM+ raster), so a selector holding one
+        // entry would be noise: show the fixed value instead.
+        if mode == "E" {
+            set(ch, "occupancy", 0i64);
+            ui.label(RichText::new("100 kHz (fixed for DRM+)").weak()).on_hover_text(
+                "Robustness mode E is defined at spectrum occupancy 0 only",
+            );
+            ui.end_row();
+        } else {
+            let occ = get_int(ch, "occupancy").unwrap_or(3).to_string();
+            let allowed: Vec<(&str, &str)> = OCCUPANCIES
+                .iter()
+                .copied()
+                .filter(|(v, _)| !matches!(mode.as_str(), "C" | "D") || matches!(*v, "3" | "5"))
+                .collect();
+            if let Some(v) = combo(ui, "tx_occupancy", &occ, &allowed, 280.0) {
+                set(ch, "occupancy", v.parse::<i64>().unwrap_or(3));
+                changed = true;
+            }
+            ui.end_row();
         }
-        ui.end_row();
         row_label(ui, "MSC modulation");
         if let Some(v) = combo(ui, "tx_msc", &msc, MSC_MODES, 280.0) {
             set(ch, "msc_mode", v);
@@ -1523,7 +1559,9 @@ fn clock(ui: &mut Ui, doc: &mut DocumentMut) -> bool {
 /// The multiplex as a bar: one segment per stream, sized by its bytes.
 pub fn capacity_bar(ui: &mut Ui, bar: &PlanBar) {
     let used: usize = bar.segments.iter().map(|s| s.bytes).sum();
-    let kbps = |bytes: usize| bytes as f64 * 8.0 / 400.0;
+    // Per transmission frame, whose duration is the mode's (400 ms for A-D, 100 ms for E).
+    let ms = f64::from(bar.frame_ms.max(1));
+    let kbps = |bytes: usize| bytes as f64 * 8.0 / ms;
     ui.horizontal_wrapped(|ui| {
         ui.label(RichText::new("Multiplex").strong());
         ui.label(RichText::new(format!("{:.2} kbit/s MSC capacity, {:.0} % used", kbps(bar.capacity), 100.0 * used as f64 / bar.capacity.max(1) as f64)).weak());
@@ -1621,30 +1659,32 @@ mod tests {
         assert_eq!(rates, ["48", "96", "120", "192"]);
         for (v, _) in RATES {
             let hz = v.parse::<u32>().unwrap() * 1000;
-            assert!(WorkingRate::new(hz).is_some(), "{v} kHz must be a supported rate");
+            assert!(decdrm_core::params::WorkingRate::new(hz).is_some(), "{v} kHz must be a supported rate");
         }
     }
 
     #[test]
-    fn mode_e_restricts_the_bandwidth_to_100_khz() {
-        // Mode E exists at occupancy 0 only; the bandwidth selector must offer just that.
+    fn mode_e_has_a_fixed_bandwidth_and_cd_are_restricted() {
+        // Mode E's row shows a label (occupancy is pinned to 0), so it never uses the selector.
+        // C and D are restricted to 10 and 20 kHz; A and B keep all six.
         let allowed = |mode: &str| -> Vec<&str> {
             OCCUPANCIES
                 .iter()
                 .copied()
-                .filter(|(v, _)| match mode {
-                    "C" | "D" => matches!(*v, "3" | "5"),
-                    "E" => *v == "0",
-                    _ => true,
-                })
+                .filter(|(v, _)| !matches!(mode, "C" | "D") || matches!(*v, "3" | "5"))
                 .map(|(v, _)| v)
                 .collect()
         };
-        assert_eq!(allowed("E"), ["0"]);
         assert_eq!(allowed("C"), ["3", "5"]);
         assert_eq!(allowed("D"), ["3", "5"]);
         assert_eq!(allowed("A").len(), 6);
         assert_eq!(allowed("B").len(), 6);
+        // Mode E is defined at occupancy 0 only, which is what its row pins.
+        let (kmin, kmax) = decdrm_core::params::carrier_range(
+            RobustnessMode::E, decdrm_core::params::SpectrumOccupancy::SO_0).unwrap();
+        assert_eq!((kmin, kmax), (-106, 106));
+        assert!(decdrm_core::params::carrier_range(
+            RobustnessMode::E, decdrm_core::params::SpectrumOccupancy::SO_3).is_none());
     }
 
     #[test]
@@ -1656,6 +1696,55 @@ mod tests {
     }
 
     #[test]
+    /// The sample rate is written as a **string** and must survive a round trip through the
+    /// station parser. Writing an integer (which this form did) produced a file the parser then
+    /// rejected, so the value silently did not apply.
+    #[test]
+    fn the_sample_rate_is_written_as_the_station_parses_it() {
+        use decdrm_station::config::RateSetting;
+        for khz in [48i64, 96, 120, 192] {
+            // Read: every spelling the station writes or accepts must come back as kHz.
+            for text in [format!("{khz}kHz"), format!("{khz}"), format!("{}", khz * 1000)] {
+                let mut doc: DocumentMut = "[channel]
+".parse().unwrap();
+                set(section(&mut doc, "channel"), "working_sample_rate", text.as_str());
+                let mut doc = doc;
+                let ch = section(&mut doc, "channel");
+                assert_eq!(sample_rate_khz(ch), khz, "reading {text:?}");
+            }
+            // Write: what the form writes must parse back through the station's own parser.
+            let mut doc: DocumentMut = "[channel]
+".parse().unwrap();
+            set(section(&mut doc, "channel"), "working_sample_rate", format!("{khz}kHz"));
+            let written = doc.to_string();
+            let cfg = decdrm_station::StationConfig::from_toml_str(&written)
+                .unwrap_or_else(|e| panic!("the form's output must parse for {khz} kHz: {e}"));
+            assert_eq!(cfg.channel.working_sample_rate.0.hz(), (khz * 1000) as u32);
+            assert_eq!(format!("{khz}kHz").parse::<RateSetting>().unwrap().0.hz(), (khz * 1000) as u32);
+        }
+    }
+
+    /// The bit rate must use the mode's own frame duration. Mode E's frame is 100 ms, so a
+    /// constant 400 reported a quarter of the real rate: a mode E station's 2488 bytes per frame
+    /// came out as ~50 kbit/s instead of ~199.
+    #[test]
+    fn the_multiplex_bit_rate_uses_the_modes_frame_duration() {
+        let seg = |bytes: usize| Segment {
+            label: "x".into(),
+            bytes,
+            audio: true,
+            part_a: false,
+            service: Some(0),
+        };
+        let e = PlanBar { capacity: 2488, frame_ms: 100, segments: vec![seg(2488)] };
+        assert!((e.audio_kbps(0).unwrap() - 199.04).abs() < 0.1, "{:?}", e.audio_kbps(0));
+        let b = PlanBar { capacity: 1228, frame_ms: 400, segments: vec![seg(1228)] };
+        assert!((b.audio_kbps(0).unwrap() - 24.56).abs() < 0.1, "{:?}", b.audio_kbps(0));
+        // The duration comes from the mode.
+        assert_eq!(RobustnessMode::E.frame_ms(), 100);
+        assert_eq!(RobustnessMode::B.frame_ms(), 400);
+    }
+
     fn edits_keep_comments_and_other_content() {
         let mut doc: DocumentMut = "[channel]\nmode = \"B\"   # robustness mode\n\n[[afs.multiplex]]\nkhz = [5990]\n".parse().unwrap();
         set(section(&mut doc, "channel"), "mode", "A");
