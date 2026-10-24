@@ -719,11 +719,26 @@ symbol lengths are 1152/1024/704/448 samples for modes A/B/C/D.
   **placeholders** copied from mode C, marked as such in the code. The 120 kHz sweep suggests
   they are not the blocker, but they are unverified.
 
-  Open at the time of writing: the transmit side underruns badly at 192 kHz (4× the samples
-  of 48 kHz); the UI's rate/spectrum labels need checking at the higher rates; the
-  sample-rate value is written to the TOML as a number where `RateSetting` needs a string
-  (`apps/decdrm-gui/src/panels/tx_form.rs`); the multiplex bar computes kbit/s with a
-  hardcoded 400 ms frame, so mode E shows 4× too low.
+  *Fixed in the form since the list above was written:* the sample-rate value was written to
+  the TOML as a number where `RateSetting` needs a string (the saved file could not be read
+  back, so the choice silently did not apply); the multiplex bar computed kbit/s with a
+  hardcoded 400 ms frame, so mode E showed 4× too low; mode E showed a one-item bandwidth
+  selector instead of the fixed 100 kHz it is defined at. The channel rows now also follow the
+  mode's own rules — MSC 16-QAM only in DecDRM's DRM+, SDC 4-QAM, long interleaving, no
+  hierarchical layer — greying out what the mode removes and repairing a document that holds
+  one, since the station's own validation accepts those. See "What robustness mode E changes
+  in the rest of the form" in `tx_form.rs`.
+
+  Still open: the transmit side underruns badly at 192 kHz (4× the samples of 48 kHz); the
+  UI's rate/spectrum labels need checking at the higher rates.
+
+  **The receive side has no rate selector yet.** `ReceiverConfig::working_rate` exists and the
+  core honours it (`tests/mode_e_rx.rs` runs at 192 kHz), but the engine's `Source` resamples
+  *everything* to 48 kHz through `To48k` before the receiver sees it, so nothing in the GUI,
+  CLI or engine can reach a mode E signal: the resampler would fold its ±47.11 kHz carriers.
+  A GUI selector alone would be inert. The change needs the engine to carry the working rate
+  into the source's resampler target (and `WORKING_RATE` in `decdrm-io` to stop being the
+  single fixed constant), which is why it is a separate piece of work from the form.
 
 ## Conventions
 
