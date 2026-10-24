@@ -696,6 +696,14 @@ symbol lengths are 1152/1024/704/448 samples for modes A/B/C/D.
      the receiver's tolerance for a fractional-symbol lead-in: it should resolve a sub-symbol
      offset at the start of a signal, and does not. (Or `OutputStage` should not emit the
      filter's warm-up: it reports `delay()` but nothing consumes it.)
+     Where the lead-in should be fixed, and a constraint on doing it: `OutputStage::process`
+     deliberately returns input + 2·`latency()` samples and the tail is drained at the end by
+     `OutputStage::flush` - so the filter's **warm-up at the start** is handled symmetrically
+     nowhere, and the station writes it into the file as silence. Two of `output.rs`'s own tests
+     pin that length (they skip `2 * latency()` by hand), so dropping the lead-in inside
+     `process` would break a deliberate invariant. The fix belongs either in the station (drop
+     the first `latency()` samples of the first frame it emits) or in the receiver (tolerate a
+     sub-symbol lead-in) - the first is smaller and symmetric with the existing tail handling.
      *Also:* the test added for the `set_mode` fix does **not** guard it (reverting the line
      still passes), so the file measurement is the evidence, not the test.
 

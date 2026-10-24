@@ -132,12 +132,23 @@ fn run_with_band_limit(rate: WorkingRate, seconds: Real, band_limit: bool) -> (u
 /// (shifted by the transmit filter's group delay) is not. Measured on a written-then-read mode
 /// E file: forcing `Tracking` gave FAC 3, staying in `Acquisition` gives FAC 7.
 ///
-/// HONEST LIMIT: this test does **not** reproduce the file condition - verified by reverting
-/// `set_mode` to forcing `Tracking`, after which it still passes. A leading pad of silence
-/// in memory is not the same as the transmit filter's group delay on a written file, so the
-/// test guards that a pinned mode with an offset still decodes at all, not that the
-/// `Acquisition`-vs-`Tracking` choice is what makes it work. The evidence for that choice is
-/// the measured file pair (FAC 3 -> 7), not this test.
+/// HONEST LIMIT: this test does **not** guard the `set_mode` fix - reverting that line still
+/// passes it. A leading pad of silence in memory is not the same as a written file's delay.
+///
+/// It does, however, characterise the **real remaining bug**, which it exposed: the receiver
+/// tolerates a lead-in of zero samples and of large ones (5000 -> FAC 58) but **not small
+/// ones**, where it restarts and never recovers. Measured (`DECDRM_LEAD` sweeps the pad,
+/// mode E, 192 kHz, Ts = 480 samples):
+///     0 -> FAC 3    100 -> 0    240 -> 55    412 -> 0    1000 -> 0    5000 -> 58
+/// Deterministic at 412 (three runs), and erratic across values - the outcome depends on where
+/// the offset falls relative to the receiver's internal window, which is the substance of the
+/// bug. So: a signal that starts a fraction of a symbol late is not acquired. The band-limited
+/// file has exactly this (412 zero samples of transmit-filter warm-up), which is why stripping
+/// them gives FAC 72/FAC bad 0.
+///
+/// Fixing it means either the receiver resolving a sub-symbol lead-in at the start of a
+/// signal, or `OutputStage` not emitting the filter's warm-up (it reports `delay()` for
+/// exactly this and nothing consumes it). The latter is the smaller change.
 #[test]
 fn a_pinned_mode_e_signal_is_aligned_from_the_signal_itself() {
     let rate = WorkingRate::R192;
@@ -165,8 +176,10 @@ fn a_pinned_mode_e_signal_is_aligned_from_the_signal_itself() {
     let mut fac_ok = 0;
     let mut pcm: Vec<f32> = Vec::new();
     // A leading pad of silence shifts the frame boundary away from where the receiver starts
-    // counting, standing in for the transmit filter's group delay on a file.
-    let pad = vec![0.0f32; 4000 * 2];
+    // counting, standing in for the transmit filter's group delay on a file. 412 samples is the
+    // measured real value; the env var lets it be swept.
+    let lead: usize = std::env::var("DECDRM_LEAD").ok().and_then(|v| v.parse().ok()).unwrap_or(412);
+    let pad = vec![0.0f32; lead * 2];
     for ev in rx.push(&pad) {
         let _ = ev;
     }
@@ -176,12 +189,22 @@ fn a_pinned_mode_e_signal_is_aligned_from_the_signal_itself() {
         pcm.clear();
         out.process(&baseband, &mut pcm);
         for ev in rx.push(&pcm) {
-            if let ReceiverEvent::Fac(_) = ev {
-                fac_ok += 1;
+            match ev {
+                ReceiverEvent::Fac(_) => fac_ok += 1,
+                ReceiverEvent::Restarted => eprintln!("[lead {lead}] RESTARTED"),
+                ReceiverEvent::Resynchronising => eprintln!("[lead {lead}] RESYNC"),
+                ReceiverEvent::ModeDetected(m) => eprintln!("[lead {lead}] mode {m}"),
+                _ => {}
             }
         }
     }
-    assert!(fac_ok > 0, "a pinned mode must align itself (got FAC {fac_ok})");
+    // KNOWN BUG, asserted so it cannot get worse unnoticed: a small lead-in is not acquired
+    // (see the comment above). A zero lead does decode, so the failure is specifically the
+    // fractional offset, not pinning itself.
+    assert_eq!(
+        fac_ok, 0,
+        "a small lead-in now decodes (FAC {fac_ok}) - good news: the bug described above is gone,          so replace this with an assertion that it decodes"
+    );
 }
 
 /// At 192 kHz: the receiver locks on, decodes the FAC and the SDC, and recovers multiplex
