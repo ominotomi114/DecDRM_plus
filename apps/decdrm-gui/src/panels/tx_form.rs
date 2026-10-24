@@ -1365,6 +1365,9 @@ fn keep_part_a_stronger(ch: &mut dyn TableLike) {
 /// Returns whether anything changed.
 fn repair_channel_for_mode(doc: &mut DocumentMut) -> bool {
     let mut changed = false;
+    // Read what the clamping below needs from the whole document first: `ch` borrows `doc`
+    // mutably, and `uses_part_a` needs to read the services.
+    let part_a = uses_part_a(doc);
     let ch = section(doc, "channel");
     let mode = get_str(ch, "mode").unwrap_or_else(|| "B".into());
     // The comparisons are against the *effective* value (the key, or the default when it is
@@ -1384,11 +1387,18 @@ fn repair_channel_for_mode(doc: &mut DocumentMut) -> bool {
         set(ch, "occupancy", if mode == "E" { 0i64 } else { 3 });
         changed = true;
     }
-    // Protection levels above what the constellation defines (§7.5.1 tables 29-32).
+    // Protection levels above what the constellation defines (§7.5.1 tables 29-32). Only the
+    // levels the station actually uses are clamped, as its own validation does: `protection_b`
+    // always, `protection_a` only when a stream is in part A, `protection_hierarchical` only
+    // when the constellation has a hierarchical layer. A stale value in an unused field is
+    // harmless, and rewriting it would change a document the station accepts.
     let msc = get_str(ch, "msc_mode").unwrap_or_else(|| "64-QAM".into());
     let max = protection_levels(&mode, &msc).len() as i64 - 1;
-    for key in ["protection_a", "protection_b", "protection_hierarchical"] {
-        if get_int(ch, key).unwrap_or(0) > max {
+    let mut used = vec![("protection_b", true)];
+    used.push(("protection_a", part_a));
+    used.push(("protection_hierarchical", canon(&msc).starts_with("hm")));
+    for (key, used) in used {
+        if used && get_int(ch, key).unwrap_or(0) > max {
             set(ch, key, max);
             changed = true;
         }
@@ -2039,6 +2049,23 @@ hierarchical = true
         let mut doc: DocumentMut = text.parse().unwrap();
         assert!(!repair_channel_for_mode(&mut doc), "an equivalent spelling is already correct");
         assert_eq!(doc.to_string(), text, "the text must not change");
+    }
+
+    /// A protection level the station does not use is not rewritten: the station itself only
+    /// checks `protection_a` when a stream is in part A and `protection_hierarchical` when the
+    /// constellation is hierarchical, so a stale value there is harmless. Changing it would
+    /// dirty a document the station accepts, for nothing.
+    #[test]
+    fn unused_protection_levels_are_left_alone() {
+        // 16-QAM has levels 0-1, so protection_b = 3 is out of range and must be clamped; the
+        // part A and hierarchical levels are unused here and keep their values.
+        let text = "[channel]\nmode = \"B\"\nmsc_mode = \"16-QAM\"\nprotection_a = 3\nprotection_b = 3\nprotection_hierarchical = 3\n";
+        let mut doc: DocumentMut = text.parse().unwrap();
+        assert!(repair_channel_for_mode(&mut doc));
+        let ch = section(&mut doc, "channel");
+        assert_eq!(get_int(ch, "protection_b"), Some(1), "the used level is clamped");
+        assert_eq!(get_int(ch, "protection_a"), Some(3), "part A is unused: left alone");
+        assert_eq!(get_int(ch, "protection_hierarchical"), Some(3), "no hierarchical layer: left alone");
     }
 
     /// The protection levels a selector offers follow the constellation (§7.5.1 tables 29-32).
