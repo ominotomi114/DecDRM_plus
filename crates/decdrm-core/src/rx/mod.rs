@@ -462,7 +462,15 @@ impl Receiver {
         self.conj = false;
         self.dc_hz = 0.0;
         self.track_hz = 0.0;
-        self.state = RxState::Tracking;
+        // Stay in `Acquisition`, NOT `Tracking`: pinning says where the signal is, not where
+        // the frame boundary is. The receiver still has to find symbol 0 of the frame (FrameSync
+        // and the time-reference pilots do that), and `Acquisition` is the state that keeps
+        // trying and, after `MAX_SYMBOLS_WITHOUT_FAC`, resynchronises if it cannot. Forcing
+        // `Tracking` skipped both, so a pinned mode E file never aligned and never recovered -
+        // which is why the same signal decoded in memory and not through a file (measured: the
+        // file is the same signal, shifted by the transmit filter's group delay).
+        self.state = RxState::Acquisition;
+        self.symbols_without_fac = 0;
     }
 
     /// The pinned mode and occupancy, if any (see [`Self::set_mode`]).

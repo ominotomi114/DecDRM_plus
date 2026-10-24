@@ -124,6 +124,66 @@ fn run_with_band_limit(rate: WorkingRate, seconds: Real, band_limit: bool) -> (u
     (fac_ok, sdc_ok, msc_ok)
 }
 
+/// A **pinned** mode must still establish the frame boundary itself.
+///
+/// `Receiver::set_mode` used to force `state = Tracking`, which skipped the frame-sync
+/// attempts and the no-FAC resync entirely - so a pinned signal was only ever decoded if it
+/// happened to be aligned already, which a signal generated in the same process is and a file
+/// (shifted by the transmit filter's group delay) is not. Measured on a written-then-read mode
+/// E file: forcing `Tracking` gave FAC 3, staying in `Acquisition` gives FAC 7.
+///
+/// HONEST LIMIT: this test does **not** reproduce the file condition - verified by reverting
+/// `set_mode` to forcing `Tracking`, after which it still passes. A leading pad of silence
+/// in memory is not the same as the transmit filter's group delay on a written file, so the
+/// test guards that a pinned mode with an offset still decodes at all, not that the
+/// `Acquisition`-vs-`Tracking` choice is what makes it work. The evidence for that choice is
+/// the measured file pair (FAC 3 -> 7), not this test.
+#[test]
+fn a_pinned_mode_e_signal_is_aligned_from_the_signal_itself() {
+    let rate = WorkingRate::R192;
+    let cfg = tx_config(rate);
+    let mut tx = Transmitter::new(cfg).expect("transmitter");
+    tx.set_fixed_fac_identity(Some(3));
+    let layout = tx.layout();
+    let mut out = OutputStage::new(layout, OutputConfig::iq_at(0.0, rate)).expect("output stage");
+    let mut rx = Receiver::new(ReceiverConfig {
+        input: InputFormat::Iq { swap: false },
+        channels: 2,
+        working_rate: rate,
+        ..Default::default()
+    });
+    rx.set_msc_config(Some(MscConfig {
+        mode: cfg.msc_mode,
+        protection: cfg.protection,
+        part_a_bytes: 0,
+        interleaving: cfg.interleaving,
+    }));
+    rx.set_mode(RobustnessMode::E, SpectrumOccupancy::SO_0);
+
+    let cap = tx.msc_capacity();
+    let msc = vec![0u8; cap.total_bits()];
+    let mut fac_ok = 0;
+    let mut pcm: Vec<f32> = Vec::new();
+    // A leading pad of silence shifts the frame boundary away from where the receiver starts
+    // counting, standing in for the transmit filter's group delay on a file.
+    let pad = vec![0.0f32; 4000 * 2];
+    for ev in rx.push(&pad) {
+        let _ = ev;
+    }
+    for _ in 0..60 {
+        let sdc = (tx.frame_index() == 0).then(|| vec![0u8; tx.sdc_capacity_bytes()]);
+        let baseband = tx.transmit_frame(&test_fac(), &msc, sdc.as_deref()).expect("transmit");
+        pcm.clear();
+        out.process(&baseband, &mut pcm);
+        for ev in rx.push(&pcm) {
+            if let ReceiverEvent::Fac(_) = ev {
+                fac_ok += 1;
+            }
+        }
+    }
+    assert!(fac_ok > 0, "a pinned mode must align itself (got FAC {fac_ok})");
+}
+
 /// At 192 kHz: the receiver locks on, decodes the FAC and the SDC, and recovers multiplex
 /// frames from DecDRM's own mode E signal.
 ///
