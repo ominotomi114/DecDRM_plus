@@ -326,33 +326,39 @@ pub struct Session {
     conceal_dropouts: bool,
     text: Option<String>,
     samples_in: u64,
+    /// Working rate of the input frames, Hz: 48 kHz for modes A–D, more for mode E
+    /// (DRM+). The sample counts above are turned into seconds with it.
+    rate_hz: u32,
     /// `samples_in` when the last multiplex frame was decoded.
     last_msc_at: Option<u64>,
     last_channel: Option<decdrm_core::fac::ChannelParams>,
 }
 
 /// Diversity reception shows the combined cells of the last multiplex frame for this
-/// long (three frames), then, while none is decoded, the branch's cells as they come.
-const COMBINED_CELLS_SHOWN: u64 = 3 * 19_200;
+/// many seconds (three multiplex frames), then, while none is decoded, the branch's
+/// cells as they come. In samples, so it follows the working rate.
+const COMBINED_CELLS_S: f64 = 1.2;
 
 impl Session {
     pub fn new(cfg: ReceiverConfig) -> Self {
-        Self::with(Rx::Single(Box::new(Receiver::new(cfg))))
+        let rate_hz = cfg.working_rate.hz();
+        Self::with(Rx::Single(Box::new(Receiver::new(cfg))), rate_hz)
     }
 
     /// Diversity reception from two inputs (branches 0 and 1, see
     /// [`Self::push_branch`]).
     pub fn new_diversity(cfg: [ReceiverConfig; 2]) -> Self {
-        Self::with(Rx::Diversity(Box::new(DiversityReceiver::new(cfg))))
+        let rate_hz = cfg[0].working_rate.hz();
+        Self::with(Rx::Diversity(Box::new(DiversityReceiver::new(cfg))), rate_hz)
     }
 
     /// MDI or RSCI input: frames of the multiplex as decoded elsewhere (see
     /// [`Self::push_mdi`]).
     pub fn new_mdi() -> Self {
-        Self::with(Rx::Mdi(Box::default()))
+        Self::with(Rx::Mdi(Box::default()), 48_000)
     }
 
-    fn with(rx: Rx) -> Self {
+    fn with(rx: Rx, rate_hz: u32) -> Self {
         Self {
             rx,
             ens: Ensemble::new(),
@@ -367,6 +373,7 @@ impl Session {
             msc_stats: MscStats::default(),
             text: None,
             samples_in: 0,
+            rate_hz,
             last_msc_at: None,
             last_channel: None,
         }
@@ -383,7 +390,8 @@ impl Session {
     /// RSCI input the receiver's spectrum and impulse response.
     pub fn visuals(&mut self) -> Visuals {
         let shown = self.rx.shown();
-        let combined = self.last_msc_at.is_some_and(|t| self.samples_in.saturating_sub(t) <= COMBINED_CELLS_SHOWN);
+        let shown_s = COMBINED_CELLS_S * f64::from(self.rate_hz.max(1));
+        let combined = self.last_msc_at.is_some_and(|t| self.samples_in.saturating_sub(t) <= shown_s as u64);
         match &mut self.rx {
             Rx::Single(r) => r.visuals(),
             Rx::Mdi(m) => m.visuals.clone(),
@@ -478,17 +486,18 @@ impl Session {
         self.last_channel = None;
     }
 
-    /// Seconds of 48 kHz input processed.
+    /// Seconds of input processed, at the receiver's working rate.
     pub fn time_s(&self) -> f64 {
-        self.samples_in as f64 / 48_000.0
+        self.samples_in as f64 / f64::from(self.rate_hz.max(1))
     }
 
-    /// Feed interleaved 48 kHz frames (diversity reception: of branch 0).
+    /// Feed interleaved frames at the working rate (diversity reception: of branch 0).
     pub fn push(&mut self, frames: &[f32]) -> Vec<SessionEvent> {
         self.push_branch(0, frames)
     }
 
-    /// Feed interleaved 48 kHz frames of input `branch` (0 or 1; one receiver: 0).
+    /// Feed interleaved frames of input `branch` at the working rate (0 or 1; one
+    /// receiver: 0).
     pub fn push_branch(&mut self, branch: usize, frames: &[f32]) -> Vec<SessionEvent> {
         let ch = self.rx.channels(branch);
         if branch == 0 {

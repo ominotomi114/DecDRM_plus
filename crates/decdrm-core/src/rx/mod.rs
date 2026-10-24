@@ -107,6 +107,13 @@ pub struct ReceiverConfig {
     /// Modes A–D are received at 48 kHz (the default); robustness mode E (DRM+) needs
     /// [`WorkingRate::R120`] or more, because its 213 carriers reach ±47.11 kHz.
     pub working_rate: WorkingRate,
+    /// Decode this robustness mode instead of searching for one, at this spectrum
+    /// occupancy (see [`Receiver::set_mode`]). Needed for mode E (DRM+): the automatic
+    /// search cannot find it (the FAC's 2-bit mode field cannot express it and the
+    /// frequency scan is built for 48 kHz geometry), so a DRM+ signal must be pinned.
+    /// The signal must sit at DC when the receiver starts (the pinned receiver does not
+    /// search for a frequency); retuning restarts the search when this is `None`.
+    pub pinned: Option<(RobustnessMode, SpectrumOccupancy)>,
 }
 
 /// The default MSC soft metric: the Huber shape with Dream's amplitude weighting and a
@@ -130,6 +137,7 @@ impl Default for ReceiverConfig {
             metric: MSC_METRIC,
             diversity_branch: false,
             working_rate: WorkingRate::R48,
+            pinned: None,
         }
     }
 }
@@ -341,6 +349,16 @@ pub struct Receiver {
 
 impl Receiver {
     pub fn new(cfg: ReceiverConfig) -> Self {
+        let mut rx = Self::searching(cfg.clone());
+        // A configured pinned mode needs no frequency search and no mode detection.
+        if let Some((mode, occupancy)) = cfg.pinned {
+            rx.set_mode(mode, occupancy);
+        }
+        rx
+    }
+
+    /// A receiver that searches for a signal: frequency scan and mode detection armed.
+    fn searching(cfg: ReceiverConfig) -> Self {
         let input = InputConverter::new(cfg.input, cfg.channels, cfg.flip);
         let real = input.is_real();
         let mode = RobustnessMode::B;
@@ -479,15 +497,26 @@ impl Receiver {
     }
 
     pub fn restart(&mut self) {
-        let real = self.input.is_real();
-        self.acq = Some(FreqAcquisition::new(real, self.cfg.auto_flip));
+        // A pinned receiver was told where the signal is, and the frequency scan is built
+        // for 48 kHz geometry: re-arming it would lose a mode E signal at 120/192 kHz for
+        // good. Pinned, run at DC as `set_mode` left it. Unpinned, scan afresh.
+        if self.pinned.is_none() {
+            let real = self.input.is_real();
+            self.acq = Some(FreqAcquisition::new(real, self.cfg.auto_flip));
+            self.conj = false;
+            self.dc_hz = 0.0;
+        }
         self.acq_power = None;
         self.loud_samples = 0;
         self.pending.clear();
-        self.conj = false;
         self.track_hz = 0.0;
         self.mode = self.pinned.map_or(RobustnessMode::B, |(m, _)| m);
         self.timesync.restart(self.mode);
+        // The FAC's 2-bit mode field cannot express mode E, so a pinned receiver keeps
+        // believing what it was told instead of re-deriving the mode from the FAC.
+        if self.pinned.is_some() {
+            self.timesync.stop_mode_detection();
+        }
         self.chain = None;
         self.state = RxState::Acquisition;
         self.symbols_without_fac = 0;
@@ -513,8 +542,6 @@ impl Receiver {
         self.sro_hz = new_sro;
     }
 
-    /// Feed interleaved samples (any number of frames) at 48 kHz and return the
-    /// events produced.
     /// The working sample rate of the input, Hz: everything that converts between samples
     /// and seconds (frequencies, the SRO, the spectrum axis) uses this. 48 kHz for modes
     /// A–D; mode E (DRM+) is received at 120 or 192 kHz.
@@ -522,6 +549,8 @@ impl Receiver {
         self.cfg.working_rate.hz()
     }
 
+    /// Feed interleaved samples (any number of frames) at the working rate and return the
+    /// events produced.
     pub fn push(&mut self, interleaved: &[f32]) -> Vec<ReceiverEvent> {
         let ch = self.cfg.channels.max(1);
         // Small chunks keep the feedback loops responsive.

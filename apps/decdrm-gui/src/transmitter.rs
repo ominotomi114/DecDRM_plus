@@ -37,8 +37,12 @@ pub struct TxSnapshot {
     pub seq: u64,
     /// The station's own status (frames, levels, SDC, services).
     pub status: StationStatus,
-    /// Averaged spectrum of the output in dB, bins from −24 to +24 kHz.
+    /// Averaged spectrum of the output in dB, bins from −fs/2 to +fs/2.
     pub spectrum_db: Vec<f64>,
+    /// Working sample rate of the output, Hz: the span the bins above cover. It is
+    /// 48 kHz for modes A–D and 96/120/192 kHz for DRM+, so the plot's frequency axis
+    /// must come from the station rather than a constant.
+    pub output_rate_hz: f64,
     /// One output channel (real IF); else I/Q.
     pub real_output: bool,
     /// DC carrier and occupied band in that spectrum, Hz.
@@ -183,6 +187,7 @@ fn run(
     let plan = station.plan();
     let (dc, band) = signal_band(plan.layout, plan.output.format);
     let channels = station.output_channels();
+    snap.output_rate_hz = plan.output.working_rate.hz() as f64;
     snap.real_output = channels == 1;
     snap.dc_hz = Some(dc);
     snap.band_hz = Some(band);
@@ -376,7 +381,7 @@ impl TxSession {
                 self.spectrum = SpectrumPlot::new(
                     &snap.spectrum_db,
                     0.0,
-                    48_000.0,
+                    snap.output_rate_hz,
                     snap.real_output,
                     snap.dc_hz,
                     snap.band_hz,

@@ -442,7 +442,13 @@ impl RxSession {
             }
             self.plots = PlotData::from_snapshot(&snap);
             let v = &snap.visuals;
-            self.waterfall.push_rows(&v.waterfall_rows, v.spectrum_seq, v.real_input, v.spectrum_row_s);
+            self.waterfall.push_rows(
+                &v.waterfall_rows,
+                v.spectrum_seq,
+                v.real_input,
+                v.spectrum_row_s,
+                v.spectrum_span_hz,
+            );
             let chain = &v.chain;
             self.fading.push_rows(&chain.chan_rows, chain.chan_seq, chain.kmin, chain.spacing_hz, chain.symbol_s);
             self.history.push(&snap);

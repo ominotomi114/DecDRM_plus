@@ -9,6 +9,7 @@
 //! written by older versions still load after new fields are added (and unknown fields
 //! from newer versions are ignored).
 
+use decdrm_core::params::{RobustnessMode, SpectrumOccupancy, WorkingRate};
 use decdrm_engine::{EngineConfig, InputFormat, InputSpec, RealChannel, ReceiverConfig};
 use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
@@ -349,6 +350,41 @@ pub enum Page {
     Transmitter,
 }
 
+/// Which robustness mode the receiver decodes.
+///
+/// The automatic search covers the DRM30 modes A–D and reads their spectrum occupancy from
+/// the FAC. Mode E (DRM+) cannot be found: its FAC's 2-bit mode field cannot express it, and
+/// the frequency scan is built for 48 kHz geometry. So DRM+ must be chosen, and choosing it
+/// also means the signal must be tuned to the receiver's centre frequency.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ReceiverMode {
+    /// Search for a DRM30 signal (modes A–D, any occupancy).
+    #[default]
+    Auto,
+    /// Pin mode E (DRM+); its occupancy is always 0.
+    ModeE,
+}
+
+impl ReceiverMode {
+    pub const ALL: [ReceiverMode; 2] = [Self::Auto, Self::ModeE];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "Auto",
+            Self::ModeE => "Mode E (DRM+)",
+        }
+    }
+
+    /// The mode to pin, or `None` to search. Mode E's only occupancy is 0 (§8.1).
+    pub fn pinned(self) -> Option<(RobustnessMode, SpectrumOccupancy)> {
+        match self {
+            Self::Auto => None,
+            Self::ModeE => Some((RobustnessMode::E, SpectrumOccupancy::SO_0)),
+        }
+    }
+}
+
 /// Where the transmitter's signal goes, overriding the station file's `[output]`
 /// without editing it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -386,10 +422,19 @@ pub struct Settings {
     pub input_device: Option<String>,
     pub format: SignalFormat,
     pub real_channel: ChannelChoice,
+    /// Working sample rate of the receiver, Hz. Modes A–D are demodulated at 48 kHz;
+    /// robustness mode E (DRM+) needs 96/120/192 kHz, because its 213 carriers reach
+    /// ±47.11 kHz. The input is resampled to it (see [`Self::engine_config`]).
+    pub working_rate_hz: u32,
     /// Mirror the spectrum.
     pub flip: bool,
     /// Also accept spectrally inverted signals during acquisition.
     pub auto_flip: bool,
+    /// Decode this robustness mode instead of searching for one (see
+    /// [`ReceiverConfig::pinned`]). Mode E (DRM+) cannot be found by the automatic search,
+    /// so a DRM+ signal needs this. The other modes are found (and their occupancy read
+    /// from the FAC), so there is nothing to pin for them.
+    pub receiver_mode: ReceiverMode,
     /// Pace recordings to real time (otherwise decode as fast as possible).
     pub realtime: bool,
     pub play_audio: bool,
@@ -447,8 +492,10 @@ impl Default for Settings {
             input_device: None,
             format: SignalFormat::Real,
             real_channel: ChannelChoice::Mix,
+            working_rate_hz: WorkingRate::R48.hz(),
             flip: false,
             auto_flip: true,
+            receiver_mode: ReceiverMode::Auto,
             realtime: true,
             play_audio: true,
             output_device: None,
@@ -478,6 +525,13 @@ impl Default for Settings {
 }
 
 impl Settings {
+    /// The receiver's working rate: the rate it demodulates at, which the input is
+    /// resampled to. A file's own rate does not matter; this is what the OFDM chain runs
+    /// at, and robustness mode E (DRM+) needs more than 48 kHz.
+    pub fn working_rate(&self) -> WorkingRate {
+        WorkingRate::new(self.working_rate_hz).unwrap_or(WorkingRate::R48)
+    }
+
     /// The receiver's input format.
     pub fn input_format(&self) -> InputFormat {
         match self.format {
@@ -528,6 +582,14 @@ impl Settings {
                 input: self.input_format(),
                 flip: self.flip,
                 auto_flip: self.auto_flip,
+                // The rate the OFDM chain demodulates at. Modes A–D are fine at 48 kHz;
+                // mode E needs 120 kHz or more (see `WorkingRate`).
+                working_rate: self.working_rate(),
+                // A pinned mode needs its occupancy too. Mode E exists at occupancy 0 only
+                // (§8.1; its 213 carriers at 4.444 kHz spacing), which is why the picker
+                // offers no other mode to pin: A–D are expressed by the FAC and found by
+                // the search, so there is nothing to gain by pinning them.
+                pinned: self.receiver_mode.pinned(),
                 ..ReceiverConfig::default()
             },
             play_audio: self.play_audio,
@@ -718,8 +780,10 @@ mod tests {
             input_device: Some("CABLE-A Output".into()),
             format: SignalFormat::IqSwapped,
             real_channel: ChannelChoice::Diff,
+            working_rate_hz: 120_000,
             flip: true,
             auto_flip: false,
+            receiver_mode: ReceiverMode::ModeE,
             realtime: false,
             play_audio: false,
             output_device: Some("Speakers".into()),
@@ -794,6 +858,23 @@ mod tests {
         assert!(matches!(cfg.input, InputSpec::File { realtime: true, .. }));
         assert_eq!(cfg.receiver.input, InputFormat::Real(RealChannel::Mix));
         assert!(cfg.receiver.auto_flip && !cfg.receiver.flip);
+        // Modes A–D run at 48 kHz; the setting reaches the receiver, so DRM+ can be received.
+        assert_eq!(cfg.receiver.working_rate, WorkingRate::R48);
+        s.working_rate_hz = WorkingRate::R120.hz();
+        assert_eq!(s.engine_config().unwrap().receiver.working_rate, WorkingRate::R120);
+        s.working_rate_hz = 123_456; // not a rate DecDRM supports
+        assert_eq!(s.working_rate(), WorkingRate::R48, "an unknown rate falls back to 48 kHz");
+        s.working_rate_hz = WorkingRate::R48.hz();
+        // The automatic search leaves the receiver to find the mode and its occupancy.
+        assert_eq!(cfg.receiver.pinned, None);
+        // Pinning DRM+ is how a mode E signal becomes reachable: the search cannot find it.
+        // Its occupancy is always 0, so the GUI derives that rather than storing it.
+        s.receiver_mode = ReceiverMode::ModeE;
+        assert_eq!(
+            s.engine_config().unwrap().receiver.pinned,
+            Some((RobustnessMode::E, SpectrumOccupancy::SO_0))
+        );
+        s.receiver_mode = ReceiverMode::Auto;
         assert_eq!(cfg.data_dir, None);
         s.data_dir = Some("received".into());
         assert_eq!(

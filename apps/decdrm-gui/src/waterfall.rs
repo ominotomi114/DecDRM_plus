@@ -31,6 +31,10 @@ pub struct Waterfall {
     real: bool,
     /// Time a row covers, seconds.
     row_s: f64,
+    /// Frequency span a row covers, Hz: the working rate of the receiver that made it. The
+    /// frequency axis is derived from this, so a receiver running at 192 kHz (DRM+) draws
+    /// its bins where they belong instead of on a 48 kHz axis.
+    span_hz: f64,
     /// Number of the next FFT to add (see `Visuals::spectrum_seq`).
     next_seq: u64,
     /// Rows added since the history started, and a count of fresh starts.
@@ -47,14 +51,14 @@ impl Waterfall {
     /// `spectrum_seq`). For a real signal only the upper half is kept, as the Spectrum
     /// plot shows it. A change of the spectrum's shape (e.g. another input format)
     /// starts afresh; a receiver that counts afresh (restarted) is followed.
-    pub fn push_rows(&mut self, rows: &[Vec<f32>], seq: u64, real: bool, row_s: f64) {
+    pub fn push_rows(&mut self, rows: &[Vec<f32>], seq: u64, real: bool, row_s: f64, span_hz: f64) {
         let Some(last) = rows.last() else { return };
         let columns = display_row(last, real).len();
-        if columns == 0 || !row_s.is_finite() || row_s <= 0.0 {
+        if columns == 0 || !row_s.is_finite() || row_s <= 0.0 || !span_hz.is_finite() || span_hz <= 0.0 {
             return;
         }
-        if columns != self.columns || real != self.real || row_s != self.row_s {
-            *self = Self { epoch: self.epoch + 1, columns, real, row_s, ..Self::default() };
+        if columns != self.columns || real != self.real || row_s != self.row_s || span_hz != self.span_hz {
+            *self = Self { epoch: self.epoch + 1, columns, real, row_s, span_hz, ..Self::default() };
         }
         // Number of the first row given.
         let first = seq.saturating_sub(rows.len() as u64);
@@ -102,6 +106,22 @@ impl Waterfall {
     /// The rows cover a real signal's upper half (0 … fs/2) rather than −fs/2 … fs/2.
     pub fn real(&self) -> bool {
         self.real
+    }
+
+    /// The frequency span the rows cover, Hz, and its edges in kHz: `0 … fs/2` for a real
+    /// signal, `−fs/2 … fs/2` for I/Q. The frequency axis of the plot uses these.
+    pub fn span_hz(&self) -> f64 {
+        self.span_hz
+    }
+
+    /// The frequency edges of the image, kHz — what the plot's x axis spans.
+    pub fn span_khz(&self) -> (f64, f64) {
+        let half = self.span_hz() / 2e3;
+        if self.real() {
+            (0.0, half)
+        } else {
+            (-half, half)
+        }
     }
 
     /// Display range (low, high), dB: from a little below the noise floor to above the
@@ -195,6 +215,8 @@ mod tests {
 
     /// One FFT's time at 48 kHz.
     const ROW_S: f64 = 2048.0 / 48_000.0;
+    /// The working rate of the receiver that made the test rows.
+    const SPAN_HZ: f64 = 48_000.0;
 
     fn spectrum(n: usize, level: f32, peak_bin: usize) -> Vec<f32> {
         (0..n)
@@ -228,26 +250,26 @@ mod tests {
         for step in (0..(WATERFALL_ROWS + 50)).map(|i| 1 + i % 3) {
             seq += step as u64;
             let rows: Vec<Vec<f32>> = (0..seq.min(8)).map(|_| spectrum(2048, -90.0, 1500)).collect();
-            w.push_rows(&rows, seq, true, ROW_S);
+            w.push_rows(&rows, seq, true, ROW_S, SPAN_HZ);
         }
         assert_eq!((w.rows(), w.pushed()), (WATERFALL_ROWS, seq), "every FFT once");
         assert!((w.span_s() - WATERFALL_ROWS as f64 * ROW_S).abs() < 1e-9 && (w.filled_s() - w.span_s()).abs() < 1e-9);
         assert!(w.real());
         // The same snapshot again: no new row.
         let rows = vec![spectrum(2048, -90.0, 1500); 8];
-        w.push_rows(&rows, seq, true, ROW_S);
+        w.push_rows(&rows, seq, true, ROW_S, SPAN_HZ);
         assert_eq!(w.pushed(), seq);
         let e = w.epoch();
-        w.push_rows(&rows[..1], 1, false, ROW_S);
+        w.push_rows(&rows[..1], 1, false, ROW_S, SPAN_HZ);
         assert_eq!((w.rows(), w.pushed()), (1, 1), "I/Q after real: start afresh");
         assert!(w.epoch() > e);
-        w.push_rows(&[], 2, false, ROW_S);
+        w.push_rows(&[], 2, false, ROW_S, SPAN_HZ);
         assert_eq!(w.rows(), 1, "no spectrum, no row");
         // The next FFT: one more row.
-        w.push_rows(&rows[..2], 2, false, ROW_S);
+        w.push_rows(&rows[..2], 2, false, ROW_S, SPAN_HZ);
         assert_eq!(w.rows(), 2);
         // A restarted receiver counts afresh: followed.
-        w.push_rows(&rows[..1], 1, false, ROW_S);
+        w.push_rows(&rows[..1], 1, false, ROW_S, SPAN_HZ);
         assert_eq!(w.rows(), 3);
         w.clear();
         assert_eq!(w.rows(), 0);
@@ -262,14 +284,14 @@ mod tests {
             for v in &mut s[1500..1700] {
                 *v = -50.0; // a 200-bin signal: well above the 99.5th percentile
             }
-            w.push_rows(&[s], seq, true, ROW_S);
+            w.push_rows(&[s], seq, true, ROW_S, SPAN_HZ);
         }
         let (lo, hi) = w.levels();
         assert!((lo - -105.0).abs() < 0.5, "floor −100 dB, 5 dB below: {lo}");
         assert!((hi - -47.0).abs() < 0.5, "peaks −50 dB, 3 dB above: {hi}");
         // A flat spectrum still gets a 30 dB range.
         let mut flat = Waterfall::default();
-        flat.push_rows(&[vec![-80.0; 64]], 1, false, ROW_S);
+        flat.push_rows(&[vec![-80.0; 64]], 1, false, ROW_S, SPAN_HZ);
         let (lo, hi) = flat.levels();
         assert!(hi - lo >= MIN_RANGE_DB);
         // A step in level is followed with a time constant of about a second.
@@ -277,13 +299,34 @@ mod tests {
         let rows_per_s = (1.0 / ROW_S).round() as u64;
         for seq in 0..10 * rows_per_s {
             let level = if seq < 5 * rows_per_s { -100.0 } else { -80.0 };
-            w.push_rows(&[vec![level; 64]], seq + 1, false, ROW_S);
+            w.push_rows(&[vec![level; 64]], seq + 1, false, ROW_S, SPAN_HZ);
             if seq == 6 * rows_per_s {
                 // One time constant after the step: ~63 % of the way.
                 let moved = w.levels().0 + 5.0 + 100.0;
                 assert!((10.0..16.0).contains(&moved), "{moved} dB of 20");
             }
         }
+    }
+
+    /// The frequency axis comes from the receiver's working rate, not a 48 kHz constant:
+    /// a DRM+ receiver at 192 kHz spans ±96 kHz, and its 2048 bins are 93.75 Hz wide.
+    #[test]
+    fn the_axis_follows_the_working_rate() {
+        let mut w = Waterfall::default();
+        w.push_rows(&[spectrum(2048, -90.0, 1500)], 1, false, 2048.0 / 192_000.0, 192_000.0);
+        assert_eq!(w.span_hz(), 192_000.0);
+        assert_eq!(w.span_khz(), (-96.0, 96.0), "I/Q at 192 kHz");
+        // A real signal at 120 kHz shows its upper half, 0 … 60 kHz.
+        w.push_rows(&[spectrum(2048, -90.0, 1500)], 2, true, 2048.0 / 120_000.0, 120_000.0);
+        assert_eq!(w.span_khz(), (0.0, 60.0));
+        // A change of span starts the history afresh: the old rows' axis does not apply.
+        assert_eq!(w.rows(), 1, "only the row just given");
+        // A nonsensical span is ignored rather than drawn.
+        let before = w.epoch();
+        w.push_rows(&[spectrum(2048, -90.0, 1500)], 3, true, 2048.0 / 48_000.0, f64::NAN);
+        w.push_rows(&[spectrum(2048, -90.0, 1500)], 3, true, 2048.0 / 48_000.0, 0.0);
+        assert_eq!(w.rows(), 1);
+        assert_eq!(w.epoch(), before);
     }
 
     #[test]

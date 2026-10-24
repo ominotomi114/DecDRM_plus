@@ -236,12 +236,10 @@ fn waterfall_plot(
         );
         return;
     };
-    // The same span as `SpectrumPlot`: 0 … 24 kHz for a real signal, ±24 kHz for I/Q.
-    let (x0, x1) = if waterfall.real() {
-        (0.0, 24.0)
-    } else {
-        (-24.0, 24.0)
-    };
+    // The same span as `SpectrumPlot`: 0 … fs/2 for a real signal, ±fs/2 for I/Q, where fs is
+    // the receiver's working rate. It is 48 kHz for modes A–D and 192 kHz for DRM+, so the
+    // axis must come from the rows rather than a constant.
+    let (x0, x1) = waterfall.span_khz();
     let seconds = waterfall.span_s();
     // Shown: the whole band, or the DRM signal with a margin once one is found.
     let (v0, v1) = match data.spectrum.band_khz.filter(|_| *fit) {

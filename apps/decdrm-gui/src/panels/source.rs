@@ -2,7 +2,8 @@
 //! options, audio output and the Start / Stop / Restart buttons; the ⚙ menu holds the
 //! remote control (RCI).
 
-use crate::settings::{ChannelChoice, Settings, SignalFormat, SourceKind};
+use crate::settings::{ChannelChoice, ReceiverMode, Settings, SignalFormat, SourceKind};
+use decdrm_core::params::{RobustnessMode, WorkingRate};
 use eframe::egui::{self, ComboBox, RichText, Ui};
 use std::path::Path;
 
@@ -125,6 +126,8 @@ pub fn show(
                 ui.checkbox(&mut settings.flip, "Flip").on_hover_text("Mirror the spectrum (e.g. LSB reception).");
                 ui.checkbox(&mut settings.auto_flip, "Auto-flip")
                     .on_hover_text("Also accept spectrally inverted signals during acquisition.");
+                rate_picker(ui, settings);
+                mode_picker(ui, settings);
             }
             let mdi_recording = settings.source == SourceKind::Mdi
                 && decdrm_engine::decdrm_mdi::file::has_recording_extension(Path::new(settings.mdi.origin.trim()));
@@ -387,6 +390,63 @@ fn output_picker(ui: &mut Ui, settings: &mut Settings, devices: &mut DeviceLists
                 ui.selectable_value(&mut settings.output_device, Some(name.clone()), name);
             }
         });
+}
+
+/// The receiver's working sample rate. It is what the OFDM demodulation runs at, and the
+/// input is resampled to it; modes A–D live at 48 kHz, mode E (DRM+) needs 120 kHz or more.
+fn rate_picker(ui: &mut Ui, settings: &mut Settings) {
+    ComboBox::from_id_salt("working_rate")
+        .selected_text(format!("{} kHz", settings.working_rate_hz / 1000))
+        .show_ui(ui, |ui| {
+            // `WorkingRate`'s own Display writes "48 kHz", "120 kHz", …
+            for r in WorkingRate::ALL {
+                ui.selectable_value(&mut settings.working_rate_hz, r.hz(), r.to_string());
+            }
+        })
+        .response
+        .on_hover_text(
+            "Working sample rate of the receiver: what the OFDM chain demodulates at, and what the input is \
+             resampled to. Modes A–D are received at 48 kHz; robustness mode E (DRM+) carries 213 carriers \
+             reaching ±47.11 kHz and needs 120 kHz or more (96 kHz leaves only 0.89 kHz of Nyquist margin). \
+             A rate above 48 kHz does not by itself find DRM+: the automatic search cannot detect mode E, so \
+             a DRM+ signal also needs the mode chosen beside this.",
+        );
+}
+
+/// The robustness mode to decode: automatic search for DRM30, or mode E (DRM+) pinned.
+///
+/// Only mode E needs pinning. The automatic search covers modes A–D and reads their
+/// spectrum occupancy from the FAC; it cannot find mode E, whose 2-bit FAC field cannot
+/// express the mode and whose geometry is outside the scan's 48 kHz design. Pinning also
+/// tells the receiver the signal is at DC — it does not search for a frequency — so the
+/// input must already be tuned to the DRM+ carrier centre.
+fn mode_picker(ui: &mut Ui, settings: &mut Settings) {
+    ComboBox::from_id_salt("receiver_mode")
+        .selected_text(settings.receiver_mode.label())
+        .show_ui(ui, |ui| {
+            // The choice is taken here and applied once, so the rate can follow it.
+            let mut choice = settings.receiver_mode;
+            for m in ReceiverMode::ALL {
+                ui.selectable_value(&mut choice, m, m.label());
+            }
+            if choice != settings.receiver_mode {
+                settings.receiver_mode = choice;
+                // Mode E's carriers reach ±47.11 kHz, so 48 kHz cannot hold them: choosing
+                // DRM+ raises the rate to the lowest that fits (120 kHz) rather than leaving
+                // a receiver that could only decode noise. 192 kHz is also offered, with
+                // more margin around the 98 kHz signal.
+                if !settings.working_rate().allows(RobustnessMode::E) {
+                    settings.working_rate_hz = WorkingRate::R120.hz();
+                }
+            }
+        })
+        .response
+        .on_hover_text(
+            "Robustness mode. Auto searches for a DRM30 signal (modes A–D) and reads its spectrum \
+             occupancy from the FAC. Mode E (DRM+) cannot be found by that search and must be chosen \
+             here; its signal has to sit at the receiver's centre frequency (tune to the DRM+ carrier \
+             centre) and needs a working rate of 120 or 192 kHz.",
+        );
 }
 
 fn format_picker(ui: &mut Ui, settings: &mut Settings) {

@@ -128,7 +128,7 @@ pub fn show(ui: &mut Ui, rx: &RxSession) {
         value(ui, "Doppler", format!("{:.2} Hz", r.doppler_hz));
         value(ui, "Delay", format!("{:.2} ms", r.delay_ms));
         value(ui, "SRO", format!("{:+.2} Hz", r.sro_hz))
-            .on_hover_text("Sample-rate offset being corrected, at 48 kHz.");
+            .on_hover_text("Sample-rate offset being corrected, as a frequency at the receiver's working rate.");
         ui.separator();
         level_meter(ui, snap.input.level_dbfs.filter(|_| running));
         position(ui, snap);

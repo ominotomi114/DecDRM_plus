@@ -67,7 +67,7 @@ pub use error::{Error, Result};
 pub use file_reader::FileReader;
 pub use file_writer::{Container, Encoding, FileWriter};
 pub use player::{AudioPlayer, PlayerOptions, PlayerStatus};
-pub use resample::{resample, Resampler, ResamplerQuality, To48k};
+pub use resample::{resample, Resampler, ResamplerQuality, To48k, ToRate};
 pub use dropout_conceal::{ConcealState, DropoutConcealer};
 pub use sbr_smooth::HighBandSmoother;
 pub use stream::{

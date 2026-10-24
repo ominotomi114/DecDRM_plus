@@ -4,6 +4,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
 use decdrm_engine::{
     Command, Engine, EngineConfig, EngineEvent, InputFormat, InputSpec, LogConfig, RealChannel, ReceiverConfig,
+    RobustnessMode, SpectrumOccupancy, WorkingRate,
 };
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -77,6 +78,18 @@ struct RxArgs {
     /// Do not try spectrally inverted signals automatically.
     #[arg(long)]
     no_auto_flip: bool,
+    /// Working sample rate, kHz: the rate the OFDM chain demodulates at (the input is
+    /// resampled to it). Modes A–D are received at 48; robustness mode E (DRM+) needs 120
+    /// or 192, because its 213 carriers reach ±47.11 kHz.
+    #[arg(long, value_name = "KHZ", default_value_t = 48)]
+    sample_rate: u32,
+    /// Decode robustness mode E (DRM+) instead of searching for one. The automatic search
+    /// cannot find DRM+ (its FAC cannot express the mode and the frequency scan is built for
+    /// 48 kHz), so a DRM+ signal must be named; it also has to be tuned to the centre of the
+    /// input (a pinned receiver runs at DC, without a frequency search). Implies the rate
+    /// mode E needs if --sample-rate is left at its default.
+    #[arg(long)]
+    drm_plus: bool,
     /// Pace file decoding to real time.
     #[arg(long)]
     realtime: bool,
@@ -218,7 +231,29 @@ fn rx(a: RxArgs) -> Result<()> {
         Format::Iq => InputFormat::Iq { swap: false },
         Format::IqSwapped => InputFormat::Iq { swap: true },
     };
-    let receiver = ReceiverConfig { input: format, flip: a.flip, auto_flip: !a.no_auto_flip, ..Default::default() };
+    // Mode E needs 120 kHz or more; naming DRM+ without a rate raises the 48 kHz default
+    // rather than leaving a receiver whose carriers would fold.
+    let sample_rate = if a.drm_plus && a.sample_rate == 48 { 120 } else { a.sample_rate };
+    let working_rate = WorkingRate::new(sample_rate.saturating_mul(1000)).ok_or_else(|| {
+        anyhow::anyhow!(
+            "--sample-rate {} kHz is not one DecDRM supports (48, 96, 120 or 192)",
+            sample_rate
+        )
+    })?;
+    let pinned = a.drm_plus.then(|| (RobustnessMode::E, SpectrumOccupancy::SO_0));
+    if let Some((m, _)) = pinned
+        && !working_rate.allows(m)
+    {
+        anyhow::bail!("--drm-plus needs --sample-rate 120 or 192");
+    }
+    let receiver = ReceiverConfig {
+        input: format,
+        flip: a.flip,
+        auto_flip: !a.no_auto_flip,
+        working_rate,
+        pinned,
+        ..Default::default()
+    };
     let engine = Engine::start(EngineConfig {
         input,
         receiver,

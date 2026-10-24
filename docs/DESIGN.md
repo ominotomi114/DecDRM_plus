@@ -73,8 +73,10 @@ FAC/SDC updates, audio super-frames, data-stream frames, text messages). Stages 
 own buffers; timing/frequency corrections flow backwards through explicit feedback fields
 rather than shared global state (Dream's `CParameter` is split into typed per-stage state).
 
-Working sample rate is **48 kHz** (Dream's `SOUNDCRD_SAMPLE_RATE`), at which the useful
-symbol lengths are 1152/1024/704/448 samples for modes A/B/C/D.
+The working sample rate defaults to **48 kHz** (Dream's `SOUNDCRD_SAMPLE_RATE`), at which the
+useful symbol lengths are 1152/1024/704/448 samples for modes A/B/C/D. It is a setting
+(`WorkingRate`), because robustness mode E (DRM+) carries 213 carriers reaching ±47.11 kHz and
+needs 120 or 192 kHz; the input is resampled to whatever the receiver is configured with.
 
 ## Milestones
 
@@ -704,16 +706,33 @@ symbol lengths are 1152/1024/704/448 samples for modes A/B/C/D.
      `process` would break a deliberate invariant. The fix belongs either in the station (drop
      the first `latency()` samples of the first frame it emits) or in the receiver (tolerate a
      sub-symbol lead-in) - the first is smaller and symmetric with the existing tail handling.
-     *Also:* the test added for the `set_mode` fix does **not** guard it (reverting the line
-     still passes), so the file measurement is the evidence, not the test.
+     *The lead-in bug is fixed* (2026-10-25). The cause was in `Receiver::restart`: it re-armed
+     the 48 kHz frequency scan unconditionally, even for a receiver whose mode was pinned. A
+     pinned receiver runs at DC with no scan; after its first restart it began hunting for a
+     DRM30 signal it could never find and never came back to the signal at DC. `restart` now
+     leaves a pinned receiver at DC (and keeps mode detection off, since the FAC cannot
+     express mode E). Every lead-in value the test sweeps now decodes, where before only 0 and
+     5000 did. `mode_e_rx.rs`'s lead test asserts the fix instead of pinning the failure.
+     *Still open:* the receiver resolves a sub-symbol lead-in the slow way (one restart, then
+     re-acquire) rather than aligning first time; not emitting the transmit filter's warm-up
+     would avoid the restart, but the receiver now survives it.
 
   3. **120 kHz fails at the SDC step** (FAC 32, SDC 0) while 192 kHz passes. Not equaliser
      tuning: a 25-combination sweep of the `TimeWiener` placeholders changed nothing.
   4. `freqacq.rs` cannot find a mode E signal unaided — its detector hunts for the three
      DRM30 frequency-reference pilots at 750/2250/3000 Hz, and mode E defines none. So
-     decoding a mode E file needs `Receiver::set_mode` to pin the mode. A plateau/bandwidth
-     detector is the replacement. The file is also still 48 kHz-calibrated (fixed
-     6144-point FFT, `HOP`, `NUM_AVERAGE`).
+     decoding a mode E file needs the mode to be pinned. A plateau/bandwidth detector is the
+     replacement. The file is also still 48 kHz-calibrated (fixed 6144-point FFT, `HOP`,
+     `NUM_AVERAGE`).
+     *Reachable from the GUI and CLI now* (2026-10-25): `ReceiverConfig::pinned` carries a
+     mode/occupancy to decode instead of searching, so `Receiver::new` pins it without a
+     caller having to reach in with `set_mode`. The GUI's source bar has a **mode picker**
+     (Auto / Mode E (DRM+), which also raises the rate to 120 kHz if it is still 48); the CLI
+     has `--sample-rate` for the rate and `--drm-plus` to pin the mode (which raises the rate
+     itself if it is left at the default). Mode E's occupancy is always 0 (§8.1), so the
+     picker derives that rather than offering a choice. The automatic search still cannot
+     detect DRM+; a DRM+ signal must be tuned to the receiver's centre frequency (pinning
+     runs at DC, no frequency search).
 
   The `TimeWiener` `params(E)` filter length/Doppler pair and `freq_wiener_len(E)` are
   **placeholders** copied from mode C, marked as such in the code. The 120 kHz sweep suggests
@@ -729,16 +748,17 @@ symbol lengths are 1152/1024/704/448 samples for modes A/B/C/D.
   one, since the station's own validation accepts those. See "What robustness mode E changes
   in the rest of the form" in `tx_form.rs`.
 
-  Still open: the transmit side underruns badly at 192 kHz (4× the samples of 48 kHz); the
-  UI's rate/spectrum labels need checking at the higher rates.
+  Still open: the transmit side underruns badly at 192 kHz (4× the samples of 48 kHz).
 
-  **The receive side has no rate selector yet.** `ReceiverConfig::working_rate` exists and the
-  core honours it (`tests/mode_e_rx.rs` runs at 192 kHz), but the engine's `Source` resamples
-  *everything* to 48 kHz through `To48k` before the receiver sees it, so nothing in the GUI,
-  CLI or engine can reach a mode E signal: the resampler would fold its ±47.11 kHz carriers.
-  A GUI selector alone would be inert. The change needs the engine to carry the working rate
-  into the source's resampler target (and `WORKING_RATE` in `decdrm-io` to stop being the
-  single fixed constant), which is why it is a separate piece of work from the form.
+  **The receive side has a rate selector now** (2026-10-24). `ReceiverConfig::working_rate`
+  reaches the source: `Source::open_at(spec, rate_hz)` resamples the input to the receiver's
+  rate instead of a fixed 48 kHz (`decdrm_io::ToRate`, with `To48k` kept as its 48 kHz case),
+  and the GUI's source bar and the CLI's `--sample-rate` set it. The engine's monitor audio and
+  `Session`'s time/sample arithmetic follow the same rate. The spectrum plots no longer assume
+  48 kHz either: `Visuals::spectrum_span_hz` and the transmitter's `TxSnapshot::output_rate_hz`
+  carry the real span, and `Waterfall` derives its frequency axis from it — the bins of a
+  192 kHz DRM+ receiver are now drawn where they belong rather than on a 48 kHz axis. A rate
+  change restarts the waterfall's history (the axis and bin width change with it).
 
 ## Conventions
 

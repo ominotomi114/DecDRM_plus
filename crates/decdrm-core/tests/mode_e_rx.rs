@@ -135,20 +135,20 @@ fn run_with_band_limit(rate: WorkingRate, seconds: Real, band_limit: bool) -> (u
 /// HONEST LIMIT: this test does **not** guard the `set_mode` fix - reverting that line still
 /// passes it. A leading pad of silence in memory is not the same as a written file's delay.
 ///
-/// It does, however, characterise the **real remaining bug**, which it exposed: the receiver
-/// tolerates a lead-in of zero samples and of large ones (5000 -> FAC 58) but **not small
-/// ones**, where it restarts and never recovers. Measured (`DECDRM_LEAD` sweeps the pad,
-/// mode E, 192 kHz, Ts = 480 samples):
+/// It also exposed a real bug, since fixed: the receiver used to tolerate a lead-in of zero
+/// samples and of large ones (5000 -> FAC 58) but **not small ones**, where it restarted and
+/// never recovered. Before the fix (`DECDRM_LEAD` sweeps the pad, mode E, 192 kHz):
 ///     0 -> FAC 3    100 -> 0    240 -> 55    412 -> 0    1000 -> 0    5000 -> 58
-/// Deterministic at 412 (three runs), and erratic across values - the outcome depends on where
-/// the offset falls relative to the receiver's internal window, which is the substance of the
-/// bug. So: a signal that starts a fraction of a symbol late is not acquired. The band-limited
-/// file has exactly this (412 zero samples of transmit-filter warm-up), which is why stripping
-/// them gives FAC 72/FAC bad 0.
+/// The cause was `Receiver::restart`: it re-armed the 48 kHz frequency scan unconditionally,
+/// even for a receiver whose mode was pinned. A pinned receiver runs at DC without a scan, so
+/// after its first restart it started hunting for a DRM30 signal it could never find and never
+/// returned to the signal at DC. Pinned, it now stays at DC and recovers — every lead value
+/// above decodes. The band-limited file's 412 zero samples of transmit-filter warm-up are
+/// exactly this case, which is why stripping them used to matter so much.
 ///
-/// Fixing it means either the receiver resolving a sub-symbol lead-in at the start of a
-/// signal, or `OutputStage` not emitting the filter's warm-up (it reports `delay()` for
-/// exactly this and nothing consumes it). The latter is the smaller change.
+/// A sub-symbol lead-in is still resolved the slow way: the receiver restarts once and
+/// re-acquires, rather than aligning first time. Emitting no warm-up would avoid the restart
+/// altogether, but the receiver now survives it.
 #[test]
 fn a_pinned_mode_e_signal_is_aligned_from_the_signal_itself() {
     let rate = WorkingRate::R192;
@@ -198,13 +198,10 @@ fn a_pinned_mode_e_signal_is_aligned_from_the_signal_itself() {
             }
         }
     }
-    // KNOWN BUG, asserted so it cannot get worse unnoticed: a small lead-in is not acquired
-    // (see the comment above). A zero lead does decode, so the failure is specifically the
-    // fractional offset, not pinning itself.
-    assert_eq!(
-        fac_ok, 0,
-        "a small lead-in now decodes (FAC {fac_ok}) - good news: the bug described above is gone,          so replace this with an assertion that it decodes"
-    );
+    // The bug this test used to pin: a small lead-in restarted and never recovered. The
+    // restart now keeps a pinned receiver at DC, so the signal is re-acquired. A few FACs is
+    // enough — the point is that it decodes at all, not how fast.
+    assert!(fac_ok > 0, "a small lead-in must be re-acquired (FAC {fac_ok})");
 }
 
 /// At 192 kHz: the receiver locks on, decodes the FAC and the SDC, and recovers multiplex
@@ -400,4 +397,70 @@ fn mode_e_is_never_detected_below_its_rate() {
             }
         }
     }
+}
+
+/// A receiver configured with `ReceiverConfig::pinned` decodes mode E without a caller
+/// having to call `set_mode` — the path the GUI and engine take, since neither can reach a
+/// mode E signal through the automatic search.
+///
+/// This covers the configuration plumbing only; the demodulation itself is
+/// `mode_e_loopback_at_192k`'s. It also pins the restart behaviour a pinned receiver needs:
+/// a pinned receiver must not re-arm the 48 kHz frequency scan on restart, or a DRM+ signal
+/// would be lost for good the first time acquisition restarted.
+#[test]
+fn a_pinned_configuration_reaches_mode_e_without_set_mode() {
+    let rate = WorkingRate::R192;
+    let cfg = tx_config(rate);
+    let mut tx = Transmitter::new(cfg).expect("transmitter");
+    tx.set_fixed_fac_identity(Some(3));
+    let layout = tx.layout();
+    let mut out = OutputStage::new(layout, OutputConfig::iq_at(0.0, rate)).expect("output stage");
+    // No `set_mode` call: the configuration alone must pin the mode and skip the search.
+    let mut rx = Receiver::new(ReceiverConfig {
+        input: InputFormat::Iq { swap: false },
+        channels: 2,
+        working_rate: rate,
+        pinned: Some((RobustnessMode::E, SpectrumOccupancy::SO_0)),
+        ..Default::default()
+    });
+    assert_eq!(
+        rx.pinned_mode(),
+        Some((RobustnessMode::E, SpectrumOccupancy::SO_0)),
+        "the configured pin must reach the receiver"
+    );
+    rx.set_msc_config(Some(MscConfig {
+        mode: cfg.msc_mode,
+        protection: cfg.protection,
+        part_a_bytes: 0,
+        interleaving: cfg.interleaving,
+    }));
+
+    let cap = tx.msc_capacity();
+    let mut msc = vec![0u8; cap.total_bits()];
+    let mut pcm: Vec<f32> = Vec::new();
+    let mut fac_ok = 0;
+    for f in 0..80 {
+        for (i, b) in msc.iter_mut().enumerate() {
+            *b = (((f * 7 + i) >> 3) & 1) as u8;
+        }
+        let sdc = (tx.frame_index() == 0).then(|| vec![0u8; tx.sdc_capacity_bytes()]);
+        let baseband = tx.transmit_frame(&test_fac(), &msc, sdc.as_deref()).expect("transmit");
+        pcm.clear();
+        out.process(&baseband, &mut pcm);
+        for ev in rx.push(&pcm) {
+            if let ReceiverEvent::Fac(_) = ev {
+                fac_ok += 1;
+            }
+        }
+    }
+    assert!(fac_ok > 0, "a pinned configuration must decode (got FAC {fac_ok})");
+    // Acquisition may have restarted during the run (the lead-in case above restarts once and
+    // recovers), so the point is not that it never did: it is that the pin survived. A
+    // restart that dropped the pin would leave the receiver searching for a DRM30 signal at
+    // 48 kHz geometry and decoding nothing.
+    assert_eq!(
+        rx.pinned_mode(),
+        Some((RobustnessMode::E, SpectrumOccupancy::SO_0)),
+        "a restart must keep the pin, not fall back to searching"
+    );
 }

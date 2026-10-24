@@ -11,7 +11,9 @@ use decdrm_core::Cplx;
 use decdrm_core::dsp::fft::Fft;
 use decdrm_core::dsp::hamming;
 
-/// FFT length (23.4 Hz resolution at 48 kHz).
+/// FFT length: 23.4 Hz per bin at 48 kHz, 93.75 Hz at 192 kHz. The bin width follows the
+/// working sample rate of whatever produced the samples; the averager itself does not care
+/// which rate it is.
 pub const SPECTRUM_LEN: usize = 2048;
 
 pub struct SpectrumAverager {
@@ -42,7 +44,8 @@ impl SpectrumAverager {
     /// Feed interleaved samples of `channels` channels (1: real, 2: I then Q; more
     /// channels are ignored beyond the first two). Every complete block of
     /// [`SPECTRUM_LEN`] frames is analysed; a partial block at the end is skipped
-    /// (a 400 ms frame gives nine blocks, plenty for an average).
+    /// (a 400 ms frame at 48 kHz gives nine blocks, plenty for an average; a 100 ms
+    /// DRM+ frame at 192 kHz gives nine too).
     pub fn push(&mut self, samples: &[f32], channels: usize) {
         let ch = channels.max(1);
         let frames = samples.len() / ch;

@@ -15,6 +15,7 @@ pub mod session;
 pub mod snapshot;
 pub mod source;
 
+pub use decdrm_core::params::{RobustnessMode, SpectrumOccupancy, WorkingRate};
 pub use decdrm_core::rx::{InputFormat, RealChannel, ReceiverConfig};
 pub use decdrm_data;
 pub use decdrm_kiwi;
@@ -241,7 +242,10 @@ fn worker(
     ev_tx: &Sender<EngineEvent>,
     shared: &Arc<Mutex<Snapshot>>,
 ) -> Result<()> {
-    let mut source = Source::open(&cfg.input)?;
+    // The source converts its samples to the rate the receiver demodulates at: 48 kHz for
+    // modes A–D, 96/120/192 kHz for mode E (DRM+), whose carriers reach ±47.11 kHz.
+    let working_rate = cfg.receiver.working_rate;
+    let mut source = Source::open_at(&cfg.input, working_rate.hz())?;
     let info = source.info().clone();
     let realtime = cfg.input.is_realtime();
     // The receiver configuration of an input (the channels it has; a KiwiSDR is I/Q).
@@ -445,7 +449,7 @@ fn worker(
                     snap.input.level_dbfs = Some(20.0 * rms.max(1e-9).log10());
                 }
                 if let Some(frames) = branches.first().filter(|f| !f.is_empty())
-                    && let Err(e) = audio.push_monitor(frames, session.input_channels(0))
+                    && let Err(e) = audio.push_monitor(frames, working_rate.hz(), session.input_channels(0))
                 {
                     log(format!("audio output error: {e:#}"), &mut snap);
                 }

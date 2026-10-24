@@ -308,54 +308,62 @@ const PROTECTION_64: &[(&str, &str)] =
 // before this existed) can hold a combination the mode cannot express. Both cases go
 // through the functions below, so the form and its tests agree on the rules.
 
-/// MSC constellations offered for robustness mode E.
+/// The MSC constellations `mode` defines, in the order its selector lists them.
 ///
-/// ES 201 980 §7.5.1 allows "16-QAM or 4-QAM mapping in robustness mode E" (modes A–D get
-/// "64-QAM or 16-QAM"). Only **16-QAM** is offered here: `fec::mlc`'s MSC rate table has no
-/// 4-QAM entry (`Mapping::Qam4` panics in `MlcParams::msc`), so a 4-QAM MSC would abort the
-/// transmitter. The spec's 4-QAM MSC is real (table 29 gives its four code rates) and is
-/// worth adding, but not by offering it in a selector before the encoder exists.
-pub const MSC_MODES_E: &[(&str, &str)] = &[("16-QAM", "16-QAM — the only MSC mapping DecDRM encodes in DRM+")];
-
-/// Whether `msc` names a constellation the form offers for `mode`.
-pub fn msc_mode_allowed(mode: &str, msc: &str) -> bool {
-    let options = if mode == "E" { MSC_MODES_E } else { MSC_MODES };
-    options.iter().any(|(v, _)| canon(v) == canon(msc))
+/// ES 201 980 §7.5.1: "The MSC may use either 64-QAM or 16-QAM mapping in robustness modes
+/// A, B, C and D and 16-QAM or 4-QAM mapping in robustness mode E." A choice the mode does
+/// not define is **left out of the selector** rather than shown greyed: it is not a choice,
+/// and the list the user sees should be the list of real options.
+///
+/// Mode E lists only 16-QAM. The standard also allows 4-QAM there, but DecDRM cannot encode
+/// it: `fec::mlc`'s MSC tables are the DRM30 ones, and mode E's 4-QAM needs its own code
+/// rates (§7.5.1 table 29: 1/4, 1/3, **2/5**, 1/2 — and 2/5 is a rate `tables::CODE_RATES`
+/// does not carry at all, so the puncturing pattern would have to be added first). Until
+/// that exists, offering 4-QAM would only write a station the transmitter refuses.
+pub fn msc_modes_for(mode: &str) -> &'static [(&'static str, &'static str)] {
+    if mode == "E" {
+        &[("16-QAM", "16-QAM — the DRM+ workhorse")]
+    } else {
+        MSC_MODES
+    }
 }
 
-/// The constellation to use for `mode`: `msc` when the mode offers it, else the mode's
+/// Whether `msc` names a constellation `mode` defines (and the form can encode).
+pub fn msc_mode_allowed(mode: &str, msc: &str) -> bool {
+    msc_modes_for(mode).iter().any(|(v, _)| canon(v) == canon(msc))
+}
+
+/// The constellation to use for `mode`: `msc` when the mode defines it, else the mode's
 /// default — 16-QAM for mode E (what DRM+ transmissions use, §7.5.1), 64-QAM for modes A–D
 /// (the station default).
 pub fn msc_mode_for(mode: &str, msc: &str) -> &'static str {
-    let options = if mode == "E" { MSC_MODES_E } else { MSC_MODES };
-    match options.iter().find(|(v, _)| canon(v) == canon(msc)) {
+    match msc_modes_for(mode).iter().find(|(v, _)| canon(v) == canon(msc)) {
         Some((v, _)) => v,
         None if mode == "E" => "16-QAM",
         None => "64-QAM",
     }
 }
 
-/// SDC constellations offered for robustness mode E.
-///
-/// §7.5.2: "4-QAM mapping with code rate 0,5 or 0,25 for robustness mode E" — 16-QAM does
-/// not exist there. DecDRM's SDC code rate is fixed at 0.5 for every mode (`tables::SDC4_RATE`),
-/// so the 0.25 variant is not offered either; the label says so rather than implying a choice.
-pub const SDC_MODES_E: &[(&str, &str)] = &[("4-QAM", "4-QAM — the only SDC mapping DRM+ has")];
-
-/// Whether `sdc` names an SDC constellation the form offers for `mode`.
-pub fn sdc_mode_allowed(mode: &str, sdc: &str) -> bool {
+/// The SDC constellations `mode` defines. §7.5.2: 16-QAM or 4-QAM at code rate 0.5 for modes
+/// A–D, but **4-QAM only** for mode E (at 0.5 or 0.25; DecDRM fixes 0.5, `tables::SDC4_RATE`).
+/// Mode E therefore has no choice to offer, and its row is a label rather than a selector.
+pub fn sdc_modes_for(mode: &str) -> &'static [(&'static str, &'static str)] {
     if mode == "E" {
-        SDC_MODES_E.iter().any(|(v, _)| canon(v) == canon(sdc))
+        &[("4-QAM", "4-QAM — the only SDC mapping DRM+ has")]
     } else {
-        SDC_MODES.iter().any(|(v, _)| canon(v) == canon(sdc))
+        SDC_MODES
     }
 }
 
-/// The SDC constellation to use for `mode`: `sdc` when the mode offers it, else 4-QAM for
+/// Whether `sdc` names an SDC constellation `mode` defines.
+pub fn sdc_mode_allowed(mode: &str, sdc: &str) -> bool {
+    sdc_modes_for(mode).iter().any(|(v, _)| canon(v) == canon(sdc))
+}
+
+/// The SDC constellation to use for `mode`: `sdc` when the mode defines it, else 4-QAM for
 /// mode E (its only mapping) and 16-QAM for modes A–D.
 pub fn sdc_mode_for(mode: &str, sdc: &str) -> &'static str {
-    let options = if mode == "E" { SDC_MODES_E } else { SDC_MODES };
-    match options.iter().find(|(v, _)| canon(v) == canon(sdc)) {
+    match sdc_modes_for(mode).iter().find(|(v, _)| canon(v) == canon(sdc)) {
         Some((v, _)) => v,
         None if mode == "E" => "4-QAM",
         None => "16-QAM",
@@ -489,11 +497,9 @@ fn channel_grid(ui: &mut Ui, doc: &mut DocumentMut) -> bool {
             ui.end_row();
         }
         row_label(ui, "MSC modulation");
-        // The mode decides which constellations exist (§7.5.1): "The MSC may use either
-        // 64-QAM or 16-QAM mapping in robustness modes A, B, C and D and 16-QAM or 4-QAM
-        // mapping in robustness mode E." The full list stays visible so the choice the mode
-        // removes is explained rather than silently vanishing, but it is greyed out and a
-        // document holding one is repaired to the mode's default before the row is drawn.
+        // The selector lists only what the mode defines (§7.5.1) — a choice that is not an
+        // option is not shown — and a document holding one the mode cannot express is
+        // repaired to the mode's default as the row is drawn.
         let msc_now = msc_mode_for(&mode, &msc).to_string();
         if get_str(ch, "msc_mode").as_deref() != Some(msc_now.as_str()) {
             set(ch, "msc_mode", msc_now.as_str());
@@ -503,8 +509,13 @@ fn channel_grid(ui: &mut Ui, doc: &mut DocumentMut) -> bool {
             hierarchical = canon(&msc).starts_with("hm");
             changed = true;
         }
-        let msc_why = "DRM+ has no 64-QAM: ES 201 980 §7.5.1 gives modes A-D 64-QAM or 16-QAM and mode E 16-QAM or 4-QAM";
-        if let Some(v) = combo_where(ui, "tx_msc", &msc, MSC_MODES, 280.0, |v| msc_mode_allowed(&mode, v), msc_why) {
+        let msc_options = msc_modes_for(&mode);
+        if msc_options.len() == 1 {
+            // One constellation: a selector holding a single entry is noise, so the row shows
+            // the value — the same treatment the bandwidth row gets for mode E.
+            ui.label(RichText::new(msc_options[0].0).weak())
+                .on_hover_text("ES 201 980 §7.5.1 gives robustness mode E 16-QAM or 4-QAM; DecDRM encodes 16-QAM for DRM+");
+        } else if let Some(v) = combo(ui, "tx_msc", &msc, msc_options, 280.0) {
             set(ch, "msc_mode", v);
             msc = v.to_string();
             // 16-QAM has protection levels 0-1 only.
@@ -525,31 +536,35 @@ fn channel_grid(ui: &mut Ui, doc: &mut DocumentMut) -> bool {
         }
         ui.end_row();
         row_label(ui, "SDC modulation");
-        // §7.5.2: "The SDC may use either 16-QAM or 4-QAM mapping with code rate 0,5 for
-        // robustness modes A, B, C and D and 4-QAM mapping ... for robustness mode E." So
-        // 16-QAM is greyed in mode E, and a document holding it is repaired to 4-QAM.
+        // §7.5.2: modes A-D have 16-QAM or 4-QAM; mode E has 4-QAM only, at one code rate in
+        // DecDRM, so its row is the value rather than a selector holding one entry.
         let sdc = sdc_mode_for(&mode, &get_str(ch, "sdc_mode").unwrap_or_else(|| "16-QAM".into())).to_string();
         if get_str(ch, "sdc_mode").as_deref() != Some(sdc.as_str()) {
             set(ch, "sdc_mode", sdc.as_str());
             changed = true;
         }
-        let sdc_why = "DRM+ defines 4-QAM for the SDC only; 16-QAM is DRM30-only";
-        if let Some(v) = combo_where(ui, "tx_sdc", &sdc, SDC_MODES, 280.0, |v| sdc_mode_allowed(&mode, v), sdc_why) {
+        let sdc_options = sdc_modes_for(&mode);
+        if sdc_options.len() == 1 {
+            ui.label(RichText::new(sdc_options[0].0).weak())
+                .on_hover_text("Robustness mode E defines 4-QAM for the SDC only; 16-QAM is DRM30-only");
+        } else if let Some(v) = combo(ui, "tx_sdc", &sdc, sdc_options, 280.0) {
             set(ch, "sdc_mode", v);
             changed = true;
         }
         ui.end_row();
         row_label(ui, "Interleaving");
         // §7.6: "For robustness mode E only one interleaver depth is available which
-        // corresponds to the algorithm for high interleaver depth" — so short interleaving is
-        // greyed in mode E, and a document holding it is repaired to long.
+        // corresponds to the algorithm for high interleaver depth" — so mode E's row is the
+        // value too, and a document holding short interleaving is repaired to long.
         let il = interleaving_for(&mode, &get_str(ch, "interleaving").unwrap_or_else(|| "long".into())).to_string();
         if get_str(ch, "interleaving").as_deref() != Some(il.as_str()) {
             set(ch, "interleaving", il.as_str());
             changed = true;
         }
-        let il_why = "Robustness mode E has a single interleaver depth, the long algorithm's (600 ms)";
-        if let Some(v) = combo_where(ui, "tx_interleaving", &il, INTERLEAVING, 280.0, |v| mode != "E" || canon(v) == "long", il_why) {
+        if mode == "E" {
+            ui.label(RichText::new("Long").weak())
+                .on_hover_text("Robustness mode E has a single interleaver depth, the long algorithm's (600 ms)");
+        } else if let Some(v) = combo(ui, "tx_interleaving", &il, INTERLEAVING, 280.0) {
             set(ch, "interleaving", v);
             changed = true;
         }
@@ -1925,18 +1940,23 @@ mod tests {
     /// A, B, C and D and 16-QAM or 4-QAM mapping in robustness mode E."
     #[test]
     fn the_msc_selector_follows_the_robustness_mode() {
-        // Mode E: 64-QAM and its hierarchical variants are out; 16-QAM stays. DecDRM encodes
-        // no 4-QAM MSC yet, so 4-QAM is not offered even though the standard allows it.
+        // Mode E's list holds only what it defines and DecDRM can encode: 64-QAM and its
+        // hierarchical variants are gone from the selector, and so is 4-QAM (the standard
+        // allows it, but mode E's rate table — §7.5.1 table 29 — is not implemented).
+        assert_eq!(msc_modes_for("E").len(), 1, "mode E has one encodable constellation");
+        assert_eq!(msc_modes_for("E")[0].0, "16-QAM");
         assert!(msc_mode_allowed("E", "16-QAM"));
-        for msc in ["64-QAM", "HMsym", "HMmix"] {
+        for msc in ["64-QAM", "HMsym", "HMmix", "4-QAM"] {
             assert!(!msc_mode_allowed("E", msc), "mode E must not offer {msc}");
         }
-        // Modes A-D: 16-QAM and 64-QAM with its hierarchical variants; 4-QAM is mode E's.
+        // Modes A-D: 16-QAM and 64-QAM with its hierarchical variants; 4-QAM is not DRM30's.
         for msc in ["16-QAM", "64-QAM", "HMsym", "HMmix"] {
             assert!(msc_mode_allowed("A", msc), "mode A must offer {msc}");
             assert!(msc_mode_allowed("B", msc));
         }
         assert!(!msc_mode_allowed("A", "4-QAM"));
+        // A-D keep the full list, so their selector is a real choice.
+        assert_eq!(msc_modes_for("A").len(), MSC_MODES.len());
         // A document holding a constellation the mode cannot express falls back to the
         // mode's default: 16-QAM for mode E, 64-QAM for the DRM30 modes.
         assert_eq!(msc_mode_for("E", "64-QAM"), "16-QAM");
@@ -1952,8 +1972,13 @@ mod tests {
     /// robustness mode E."
     #[test]
     fn the_sdc_selector_follows_the_robustness_mode() {
+        // Mode E defines 4-QAM only, so its row is a label (one option is not a choice).
+        assert_eq!(sdc_modes_for("E").len(), 1, "mode E's SDC row is a label, not a selector");
+        assert_eq!(sdc_modes_for("E")[0].0, "4-QAM");
         assert!(sdc_mode_allowed("E", "4-QAM"));
         assert!(!sdc_mode_allowed("E", "16-QAM"), "DRM+ has no 16-QAM SDC");
+        // Modes A-D keep both, so their row stays a selector.
+        assert_eq!(sdc_modes_for("B").len(), 2);
         assert!(sdc_mode_allowed("B", "16-QAM") && sdc_mode_allowed("B", "4-QAM"));
         assert_eq!(sdc_mode_for("E", "16-QAM"), "4-QAM");
         assert_eq!(sdc_mode_for("E", "4-QAM"), "4-QAM");
