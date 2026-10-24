@@ -178,6 +178,20 @@ fn band_limiting_does_not_break_mode_e_reception() {
     assert!(fac_off > 0, "unfiltered path must decode (got FAC {fac_off})");
 }
 
+/// The clean file pair, resolved: the band-limited file is the **same signal, time-shifted**
+/// by the transmit filter's group delay (~415 samples measured; the filter has ~697 taps).
+/// Aligned, the two files agree to 0.35% of peak, so band limiting corrupts nothing.
+///
+/// What that means for the reception failure: it is **timing offset tolerance**, not signal
+/// quality. The in-memory tests pass because the transmitter's and receiver's sample clocks
+/// line up; a written-then-read file carries the extra filter delay, and the receiver does not
+/// re-establish the frame boundary from it. The real recordings presumably differ from
+/// DecDRM's own output by an arbitrary offset of the same kind.
+///
+/// So the next thing to investigate is the receiver's **initial timing/frame alignment for a
+/// pinned mode**, not the filter: `set_mode` skips acquisition, and acquisition is what would
+/// normally find the boundary.
+///
 /// Does the **file round trip** - quantise the output stage's floats to int16 and read them
 /// back - break mode E reception? The in-memory path passes, real recordings fail, and a
 /// written-then-read DecDRM file failed too, so this isolates the one step between them.
@@ -228,6 +242,50 @@ fn int16_quantisation_of_the_output_does_not_break_mode_e_reception() {
         let _ = f;
     }
     assert!(fac_ok > 0, "int16 round trip must decode (got FAC {fac_ok})");
+}
+
+/// Feed in the **exact** chunking `examples/rxfiled` uses (one 100 ms frame of interleaved
+/// floats per `push`), rather than whole frames, to rule the caller's chunk size in or out.
+#[test]
+fn frame_sized_pushes_still_decode() {
+    let rate = WorkingRate::R192;
+    let cfg = tx_config(rate);
+    let mut tx = Transmitter::new(cfg).expect("transmitter");
+    tx.set_fixed_fac_identity(Some(3));
+    let layout = tx.layout();
+    let mut out = OutputStage::new(layout, OutputConfig::iq_at(0.0, rate)).expect("output stage");
+    let mut rx = Receiver::new(ReceiverConfig {
+        input: InputFormat::Iq { swap: false },
+        channels: 2,
+        working_rate: rate,
+        ..Default::default()
+    });
+    rx.set_msc_config(Some(MscConfig {
+        mode: cfg.msc_mode,
+        protection: cfg.protection,
+        part_a_bytes: 0,
+        interleaving: cfg.interleaving,
+    }));
+    rx.set_mode(RobustnessMode::E, SpectrumOccupancy::SO_0);
+
+    let cap = tx.msc_capacity();
+    let msc = vec![0u8; cap.total_bits()];
+    let mut fac_ok = 0;
+    let mut pcm: Vec<f32> = Vec::new();
+    for _ in 0..40 {
+        let sdc = (tx.frame_index() == 0).then(|| vec![0u8; tx.sdc_capacity_bytes()]);
+        let baseband = tx.transmit_frame(&test_fac(), &msc, sdc.as_deref()).expect("transmit");
+        pcm.clear();
+        out.process(&baseband, &mut pcm);
+        // Exactly rxfiled's per_chunk: rate/10 * channels floats.
+        assert_eq!(pcm.len(), (rate.hz() as usize / 10) * 2);
+        for ev in rx.push(&pcm) {
+            if let ReceiverEvent::Fac(_) = ev {
+                fac_ok += 1;
+            }
+        }
+    }
+    assert!(fac_ok > 0, "frame-sized pushes must decode (got FAC {fac_ok})");
 }
 
 /// The mode detector must not choose mode E at a rate that cannot carry it, and must not

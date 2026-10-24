@@ -678,14 +678,23 @@ symbol lengths are 1152/1024/704/448 samples for modes A/B/C/D.
      demodulation is right and the symbol-to-bit stage is not. Note this tool has **no
      equaliser**, so it cannot decode a real recording at all; it bounds the demodulation
      only, and its failure is not evidence about the receiver.
-  2. **The file round trip is unexplained.** DecDRM's own mode E signal written to a WAV and
-     read back with `examples/rxfiled` gives FAC 0 with `band_limit = true` and FAC 2-3 with
-     it false — reproducibly. In memory, and through a manual int16 quantisation, **both
-     settings decode**, so the filter is not the cause (measured: within 0.2 dB of unfiltered
-     up to 47.4 kHz, and its 1.8 ms group delay is doubly ruled out because the passing
-     in-memory path also band-limits). `tests/mode_e_rx.rs` asserts the in-memory truth so
-     band limiting is not mis-blamed again. The file path differs from the in-memory path in
-     some way not yet found.
+  2. **The file round trip is now explained — it is a timing-offset problem, not a signal
+     problem.** Writing DecDRM's own mode E signal to a WAV and reading it back gave FAC 0
+     with `band_limit = true` and FAC 2-3 with it false, which made the transmit filter look
+     like the cause. It is not: measured, the two files are the **same signal time-shifted by
+     ~415 samples** (the filter's ~697-tap group delay), agreeing to **0.35 % of peak** once
+     aligned, and both decode in memory. What the failure really is: `Receiver::set_mode`
+     (which a mode E file needs, since `freqacq` cannot find one) sets `state = Tracking`,
+     drops acquisition and clears the chain, so **nothing establishes the frame boundary** —
+     the receiver assumes it is already aligned, which is true of a signal it generated
+     itself in the same process and false of any file. Letting acquisition run instead finds
+     nothing at all, because `freqacq` hunts for pilots mode E does not have (item 4 below).
+     So the next step is the receiver's **initial timing/frame alignment for a pinned mode**:
+     either give `set_mode` a way to establish the boundary from the signal (frame sync and
+     the time-reference pilots in symbol 0 are the tools) or finish item 4 so acquisition can
+     do it. This also explains the real recordings: they differ from DecDRM's own output by an
+     arbitrary offset of the same kind.
+     `tests/mode_e_rx.rs` pins the in-memory truth so band limiting is not mis-blamed again.
   3. **120 kHz fails at the SDC step** (FAC 32, SDC 0) while 192 kHz passes. Not equaliser
      tuning: a 25-combination sweep of the `TimeWiener` placeholders changed nothing.
   4. `freqacq.rs` cannot find a mode E signal unaided — its detector hunts for the three

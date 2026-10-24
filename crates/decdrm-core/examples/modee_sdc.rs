@@ -36,7 +36,7 @@ fn main() {
              mode.sdc_symbols(), params.total_bits());
 
     // Build a known SDC data field and encode it as the transmitter does.
-    let mut enc = decdrm_core::fec::mlc::MlcEncoder::new(params.clone());
+    let enc = decdrm_core::fec::mlc::MlcEncoder::new(params.clone());
     let capacity = tx.sdc_capacity_bytes();
     let data: Vec<u8> = (0..capacity).map(|i| (i * 7 + 3) as u8).collect();
     let block = decdrm_core::mux::sdc::sdc_block_bits(0, &data, params.total_bits());
