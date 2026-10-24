@@ -296,14 +296,120 @@ const PROTECTION_16: &[(&str, &str)] = &[("0", "0 — code rate 0.5 (most robust
 const PROTECTION_64: &[(&str, &str)] =
     &[("0", "0 — code rate 0.5 (most robust)"), ("1", "1 — code rate 0.6"), ("2", "2 — code rate 0.71"), ("3", "3 — code rate 0.78")];
 
+// ---------------------------------------------------------------------------------
+// What robustness mode E changes in the rest of the form
+// ---------------------------------------------------------------------------------
+//
+// Mode E (DRM+) is not a fifth member of the DRM30 family: §7.5.1 gives it its own MSC
+// constellations — "16-QAM or 4-QAM mapping in robustness mode E", where modes A–D use
+// "64-QAM or 16-QAM" — and §6.3.3 gives its MSC mode field different meanings. The
+// selector must therefore change what it offers when the mode changes, and a document
+// that came from elsewhere (the TOML view, a hand-edited file, a mode E station saved
+// before this existed) can hold a combination the mode cannot express. Both cases go
+// through the functions below, so the form and its tests agree on the rules.
+
+/// MSC constellations offered for robustness mode E.
+///
+/// ES 201 980 §7.5.1 allows "16-QAM or 4-QAM mapping in robustness mode E" (modes A–D get
+/// "64-QAM or 16-QAM"). Only **16-QAM** is offered here: `fec::mlc`'s MSC rate table has no
+/// 4-QAM entry (`Mapping::Qam4` panics in `MlcParams::msc`), so a 4-QAM MSC would abort the
+/// transmitter. The spec's 4-QAM MSC is real (table 29 gives its four code rates) and is
+/// worth adding, but not by offering it in a selector before the encoder exists.
+pub const MSC_MODES_E: &[(&str, &str)] = &[("16-QAM", "16-QAM — the only MSC mapping DecDRM encodes in DRM+")];
+
+/// Whether `msc` names a constellation the form offers for `mode`.
+pub fn msc_mode_allowed(mode: &str, msc: &str) -> bool {
+    let options = if mode == "E" { MSC_MODES_E } else { MSC_MODES };
+    options.iter().any(|(v, _)| canon(v) == canon(msc))
+}
+
+/// The constellation to use for `mode`: `msc` when the mode offers it, else the mode's
+/// default — 16-QAM for mode E (what DRM+ transmissions use, §7.5.1), 64-QAM for modes A–D
+/// (the station default).
+pub fn msc_mode_for(mode: &str, msc: &str) -> &'static str {
+    let options = if mode == "E" { MSC_MODES_E } else { MSC_MODES };
+    match options.iter().find(|(v, _)| canon(v) == canon(msc)) {
+        Some((v, _)) => v,
+        None if mode == "E" => "16-QAM",
+        None => "64-QAM",
+    }
+}
+
+/// SDC constellations offered for robustness mode E.
+///
+/// §7.5.2: "4-QAM mapping with code rate 0,5 or 0,25 for robustness mode E" — 16-QAM does
+/// not exist there. DecDRM's SDC code rate is fixed at 0.5 for every mode (`tables::SDC4_RATE`),
+/// so the 0.25 variant is not offered either; the label says so rather than implying a choice.
+pub const SDC_MODES_E: &[(&str, &str)] = &[("4-QAM", "4-QAM — the only SDC mapping DRM+ has")];
+
+/// Whether `sdc` names an SDC constellation the form offers for `mode`.
+pub fn sdc_mode_allowed(mode: &str, sdc: &str) -> bool {
+    if mode == "E" {
+        SDC_MODES_E.iter().any(|(v, _)| canon(v) == canon(sdc))
+    } else {
+        SDC_MODES.iter().any(|(v, _)| canon(v) == canon(sdc))
+    }
+}
+
+/// The SDC constellation to use for `mode`: `sdc` when the mode offers it, else 4-QAM for
+/// mode E (its only mapping) and 16-QAM for modes A–D.
+pub fn sdc_mode_for(mode: &str, sdc: &str) -> &'static str {
+    let options = if mode == "E" { SDC_MODES_E } else { SDC_MODES };
+    match options.iter().find(|(v, _)| canon(v) == canon(sdc)) {
+        Some((v, _)) => v,
+        None if mode == "E" => "4-QAM",
+        None => "16-QAM",
+    }
+}
+
+/// The interleaving to use for `mode`: long for mode E (§7.6 — "For robustness mode E only
+/// one interleaver depth is available which corresponds to the algorithm for high interleaver
+/// depth", its flag fixed at 0, 600 ms), else `il`.
+pub fn interleaving_for(mode: &str, il: &str) -> &'static str {
+    if mode == "E" {
+        "long"
+    } else if canon(il) == "short" {
+        "short"
+    } else {
+        "long"
+    }
+}
+
+/// Protection levels the form offers for a constellation in a mode.
+///
+/// §7.5.1: 16-QAM has levels 0–1 in modes A–D (table 30) and **0–3 in mode E** (table 31);
+/// 64-QAM has 0–3 (table 32). DecDRM's encoder takes the level from the DRM30 tables
+/// (`tables::MSC16_SM` has two entries), so mode E's levels 2 and 3 are not offered until the
+/// encoder has them — the selector would otherwise write a level the LDPC-style rate lookup
+/// cannot encode.
+pub fn protection_levels(mode: &str, msc: &str) -> &'static [(&'static str, &'static str)] {
+    let _ = mode;
+    if canon(msc) == "16qam" { PROTECTION_16 } else { PROTECTION_64 }
+}
+
 fn channel(ui: &mut Ui, doc: &mut DocumentMut) -> bool {
+    // The grid repairs the fields it draws as it draws them. What it cannot reach while its
+    // own borrow of `doc` is live — the hierarchical marks on the services — is repaired
+    // here, once the borrow is released. The repair is idempotent: a document already in
+    // order comes back unchanged, so this costs a comparison per frame and never rewrites a
+    // valid document. Running it unconditionally also covers a document *loaded* in a state
+    // its mode cannot express (the station's own validation does not reject those), so the
+    // form cannot save one either.
+    let changed = channel_grid(ui, doc);
+    changed | repair_channel_for_mode(doc)
+}
+
+/// The Channel card's grid.
+fn channel_grid(ui: &mut Ui, doc: &mut DocumentMut) -> bool {
     let mut changed = false;
     let uep = uses_part_a(doc);
     let ch = section(doc, "channel");
-    let mode = get_str(ch, "mode").unwrap_or_else(|| "B".into());
-    let msc = get_str(ch, "msc_mode").unwrap_or_else(|| "64-QAM".into());
-    let sixteen = canon(&msc) == "16qam";
-    let hierarchical = canon(&msc).starts_with("hm");
+    // `mode` is re-read after the selectors that can change it (sample rate and mode), so the
+    // rows below draw the mode the document now has rather than the one it had when the frame
+    // started. Without that a switch to E drew one frame of DRM30 bandwidth on a DRM+ signal.
+    let mut mode = get_str(ch, "mode").unwrap_or_else(|| "B".into());
+    let mut msc = get_str(ch, "msc_mode").unwrap_or_else(|| "64-QAM".into());
+    let mut hierarchical = canon(&msc).starts_with("hm");
     grid(ui, "tx_form_channel", |ui| {
         row_label(ui, "Sample rate");
         // The value is a **string** in the file ("192kHz"), because `RateSetting` parses it
@@ -318,7 +424,11 @@ fn channel(ui: &mut Ui, doc: &mut DocumentMut) -> bool {
             let hz = v.parse::<i64>().unwrap_or(48) * 1000;
             if hz < 100_000 && mode == "E" {
                 set(ch, "mode", "B");
+                // Back to DRM30: the mode E choices (16-QAM MSC, 4-QAM SDC, long
+                // interleaving) are all valid there, so nothing else needs changing.
             }
+            // The rows below must draw the rate just picked, not the previous one.
+            mode = get_str(ch, "mode").unwrap_or_else(|| "B".into());
             changed = true;
         }
         ui.end_row();
@@ -332,6 +442,7 @@ fn channel(ui: &mut Ui, doc: &mut DocumentMut) -> bool {
             .collect();
         if let Some(v) = combo(ui, "tx_mode", &mode, &modes, 280.0) {
             set(ch, "mode", v);
+            mode = v.to_string();
             // Modes C and D only have 10 and 20 kHz; mode E only has occupancy 0 (100 kHz).
             match v {
                 "C" | "D" => {
@@ -342,6 +453,12 @@ fn channel(ui: &mut Ui, doc: &mut DocumentMut) -> bool {
                 "E" => set(ch, "occupancy", 0i64),
                 _ => {}
             }
+            // Mode E changes what the rest of the document may hold (§7.5.1-7.6): its MSC
+            // is 16-QAM only in DecDRM, its SDC 4-QAM only, its interleaving long only, and
+            // it has no hierarchical layer. Reaching the new mode with the old choices would
+            // leave a document the station refuses — the rows below repair the channel and
+            // `channel` clears the hierarchical marks. Nothing has to be set here: each row
+            // compares the document against the mode's rule and writes only what differs.
             changed = true;
         }
         if mode == "E" {
@@ -372,8 +489,24 @@ fn channel(ui: &mut Ui, doc: &mut DocumentMut) -> bool {
             ui.end_row();
         }
         row_label(ui, "MSC modulation");
-        if let Some(v) = combo(ui, "tx_msc", &msc, MSC_MODES, 280.0) {
+        // The mode decides which constellations exist (§7.5.1): "The MSC may use either
+        // 64-QAM or 16-QAM mapping in robustness modes A, B, C and D and 16-QAM or 4-QAM
+        // mapping in robustness mode E." The full list stays visible so the choice the mode
+        // removes is explained rather than silently vanishing, but it is greyed out and a
+        // document holding one is repaired to the mode's default before the row is drawn.
+        let msc_now = msc_mode_for(&mode, &msc).to_string();
+        if get_str(ch, "msc_mode").as_deref() != Some(msc_now.as_str()) {
+            set(ch, "msc_mode", msc_now.as_str());
+            msc.clone_from(&msc_now);
+            // The hierarchical-protection row below reads this, so keep it in step with the
+            // constellation actually written.
+            hierarchical = canon(&msc).starts_with("hm");
+            changed = true;
+        }
+        let msc_why = "DRM+ has no 64-QAM: ES 201 980 §7.5.1 gives modes A-D 64-QAM or 16-QAM and mode E 16-QAM or 4-QAM";
+        if let Some(v) = combo_where(ui, "tx_msc", &msc, MSC_MODES, 280.0, |v| msc_mode_allowed(&mode, v), msc_why) {
             set(ch, "msc_mode", v);
+            msc = v.to_string();
             // 16-QAM has protection levels 0-1 only.
             if canon(v) == "16qam" {
                 for key in ["protection_b", "protection_a"] {
@@ -385,24 +518,43 @@ fn channel(ui: &mut Ui, doc: &mut DocumentMut) -> bool {
             if uep {
                 keep_part_a_stronger(ch);
             }
+            // Picking a plain constellation drops any hierarchical layer the document still
+            // marks; `channel` clears the marks after the grid.
+            hierarchical = canon(v).starts_with("hm");
             changed = true;
         }
         ui.end_row();
         row_label(ui, "SDC modulation");
-        let sdc = get_str(ch, "sdc_mode").unwrap_or_else(|| "16-QAM".into());
-        if let Some(v) = combo(ui, "tx_sdc", &sdc, SDC_MODES, 280.0) {
+        // §7.5.2: "The SDC may use either 16-QAM or 4-QAM mapping with code rate 0,5 for
+        // robustness modes A, B, C and D and 4-QAM mapping ... for robustness mode E." So
+        // 16-QAM is greyed in mode E, and a document holding it is repaired to 4-QAM.
+        let sdc = sdc_mode_for(&mode, &get_str(ch, "sdc_mode").unwrap_or_else(|| "16-QAM".into())).to_string();
+        if get_str(ch, "sdc_mode").as_deref() != Some(sdc.as_str()) {
+            set(ch, "sdc_mode", sdc.as_str());
+            changed = true;
+        }
+        let sdc_why = "DRM+ defines 4-QAM for the SDC only; 16-QAM is DRM30-only";
+        if let Some(v) = combo_where(ui, "tx_sdc", &sdc, SDC_MODES, 280.0, |v| sdc_mode_allowed(&mode, v), sdc_why) {
             set(ch, "sdc_mode", v);
             changed = true;
         }
         ui.end_row();
         row_label(ui, "Interleaving");
-        let il = get_str(ch, "interleaving").unwrap_or_else(|| "long".into());
-        if let Some(v) = combo(ui, "tx_interleaving", &il, INTERLEAVING, 280.0) {
+        // §7.6: "For robustness mode E only one interleaver depth is available which
+        // corresponds to the algorithm for high interleaver depth" — so short interleaving is
+        // greyed in mode E, and a document holding it is repaired to long.
+        let il = interleaving_for(&mode, &get_str(ch, "interleaving").unwrap_or_else(|| "long".into())).to_string();
+        if get_str(ch, "interleaving").as_deref() != Some(il.as_str()) {
+            set(ch, "interleaving", il.as_str());
+            changed = true;
+        }
+        let il_why = "Robustness mode E has a single interleaver depth, the long algorithm's (600 ms)";
+        if let Some(v) = combo_where(ui, "tx_interleaving", &il, INTERLEAVING, 280.0, |v| mode != "E" || canon(v) == "long", il_why) {
             set(ch, "interleaving", v);
             changed = true;
         }
         ui.end_row();
-        let levels = if sixteen { PROTECTION_16 } else { PROTECTION_64 };
+        let levels = protection_levels(&mode, &msc);
         row_label(ui, "Protection").on_hover_text("Error protection of the multiplex: a lower code rate survives a weaker signal, a higher one carries more");
         let pb = get_int(ch, "protection_b").unwrap_or(1).to_string();
         if let Some(v) = combo(ui, "tx_prot_b", &pb, levels, 280.0) {
@@ -1197,6 +1349,102 @@ fn keep_part_a_stronger(ch: &mut dyn TableLike) {
     }
 }
 
+/// Bring the rest of the document into what its robustness mode allows, after the mode
+/// changed (or when the document arrived with a combination the mode cannot express).
+///
+/// The three fields with per-mode rules are the MSC constellation (§7.5.1: mode E has
+/// 16-QAM and 4-QAM; A–D have 16-QAM and 64-QAM), the SDC constellation (§7.5.2: mode E
+/// has 4-QAM only) and the interleaving depth (§7.6: mode E has the long depth only).
+/// Protection levels are clamped to what the chosen constellation defines.
+///
+/// Hierarchical modulation only exists in 64-QAM (§7.5.1: "a hierarchical mapping scheme can
+/// only be used in a 64-QAM signal constellation"), so a mode E document cannot carry a
+/// stream marked `hierarchical = true`: the mark is dropped, and the station would otherwise
+/// refuse the configuration.
+///
+/// Returns whether anything changed.
+fn repair_channel_for_mode(doc: &mut DocumentMut) -> bool {
+    let mut changed = false;
+    let ch = section(doc, "channel");
+    let mode = get_str(ch, "mode").unwrap_or_else(|| "B".into());
+    // The comparisons are against the *effective* value (the key, or the default when it is
+    // absent) and are canonical, so a document that leaves a key out at its default, or spells
+    // it its own way, is not rewritten just for being opened.
+    changed |= repair_str(ch, "msc_mode", "64-QAM", |v| msc_mode_for(&mode, v).to_string());
+    changed |= repair_str(ch, "sdc_mode", "16-QAM", |v| sdc_mode_for(&mode, v).to_string());
+    changed |= repair_str(ch, "interleaving", "long", |v| interleaving_for(&mode, v).to_string());
+    // Occupancy: mode E exists at 0 only; C and D only at 3 or 5.
+    let occ = get_int(ch, "occupancy").unwrap_or(3);
+    let occ_ok = match mode.as_str() {
+        "E" => occ == 0,
+        "C" | "D" => matches!(occ, 3 | 5),
+        _ => true,
+    };
+    if !occ_ok {
+        set(ch, "occupancy", if mode == "E" { 0i64 } else { 3 });
+        changed = true;
+    }
+    // Protection levels above what the constellation defines (§7.5.1 tables 29-32).
+    let msc = get_str(ch, "msc_mode").unwrap_or_else(|| "64-QAM".into());
+    let max = protection_levels(&mode, &msc).len() as i64 - 1;
+    for key in ["protection_a", "protection_b", "protection_hierarchical"] {
+        if get_int(ch, key).unwrap_or(0) > max {
+            set(ch, key, max);
+            changed = true;
+        }
+    }
+    // No hierarchical layer without a 64-QAM constellation.
+    if !canon(&msc).starts_with("hm") {
+        changed |= clear_hierarchical_marks(doc);
+    }
+    changed
+}
+
+/// Set `key` to `rule(effective)` when that differs from the value the document already has
+/// (`default` when the key is absent). Comparison is canonical, so an equivalent spelling is
+/// left as written; a key that is absent and whose default already satisfies the rule is not
+/// added. Returns whether the document changed.
+fn repair_str(ch: &mut dyn TableLike, key: &str, default: &str, rule: impl Fn(&str) -> String) -> bool {
+    let effective = get_str(ch, key).unwrap_or_else(|| default.to_string());
+    let corrected = rule(&effective);
+    if canon(&corrected) == canon(&effective) {
+        return false;
+    }
+    set(ch, key, corrected);
+    true
+}
+
+/// Drop `hierarchical = true` from every stream (audio services and data applications).
+/// A mark that cannot be honoured would make the station refuse the configuration.
+/// Returns whether any stream was marked.
+fn clear_hierarchical_marks(doc: &mut DocumentMut) -> bool {
+    let mut changed = false;
+    if let Some(services) = doc.get_mut("service").and_then(Item::as_array_of_tables_mut) {
+        for svc in services.iter_mut() {
+            for key in ["audio", "data"] {
+                if let Some(t) = svc.get_mut(key).and_then(Item::as_table_like_mut) {
+                    changed |= take_true(t, "hierarchical");
+                }
+            }
+            if let Some(apps) = svc.get_mut("app").and_then(Item::as_array_of_tables_mut) {
+                for app in apps.iter_mut() {
+                    changed |= take_true(app, "hierarchical");
+                }
+            }
+        }
+    }
+    changed
+}
+
+/// Remove `key` when it is set to `true`; returns whether it was.
+fn take_true(t: &mut dyn TableLike, key: &str) -> bool {
+    if !get_bool(t, key).unwrap_or(false) {
+        return false;
+    }
+    remove(t, key);
+    true
+}
+
 /// The service's extra data applications (`[[service.app]]`).
 fn extra_apps(ui: &mut Ui, svc: &mut Table, i: usize, ctx: &mut FormCtx, parts: &mut Parts) -> bool {
     let mut changed = false;
@@ -1661,6 +1909,124 @@ mod tests {
             let hz = v.parse::<u32>().unwrap() * 1000;
             assert!(decdrm_core::params::WorkingRate::new(hz).is_some(), "{v} kHz must be a supported rate");
         }
+    }
+
+    /// ES 201 980 §7.5.1: "The MSC may use either 64-QAM or 16-QAM mapping in robustness modes
+    /// A, B, C and D and 16-QAM or 4-QAM mapping in robustness mode E."
+    #[test]
+    fn the_msc_selector_follows_the_robustness_mode() {
+        // Mode E: 64-QAM and its hierarchical variants are out; 16-QAM stays. DecDRM encodes
+        // no 4-QAM MSC yet, so 4-QAM is not offered even though the standard allows it.
+        assert!(msc_mode_allowed("E", "16-QAM"));
+        for msc in ["64-QAM", "HMsym", "HMmix"] {
+            assert!(!msc_mode_allowed("E", msc), "mode E must not offer {msc}");
+        }
+        // Modes A-D: 16-QAM and 64-QAM with its hierarchical variants; 4-QAM is mode E's.
+        for msc in ["16-QAM", "64-QAM", "HMsym", "HMmix"] {
+            assert!(msc_mode_allowed("A", msc), "mode A must offer {msc}");
+            assert!(msc_mode_allowed("B", msc));
+        }
+        assert!(!msc_mode_allowed("A", "4-QAM"));
+        // A document holding a constellation the mode cannot express falls back to the
+        // mode's default: 16-QAM for mode E, 64-QAM for the DRM30 modes.
+        assert_eq!(msc_mode_for("E", "64-QAM"), "16-QAM");
+        assert_eq!(msc_mode_for("E", "HMsym"), "16-QAM");
+        assert_eq!(msc_mode_for("B", "16-QAM"), "16-QAM", "an allowed choice is kept");
+        assert_eq!(msc_mode_for("B", "HMmix"), "HMmix", "an allowed choice is kept");
+        // Canonical spellings come back, so writing one does not rewrite the file forever.
+        assert_eq!(msc_mode_for("B", "qam64"), "64-QAM");
+    }
+
+    /// §7.5.2: "The SDC may use either 16-QAM or 4-QAM mapping with code rate 0,5 for
+    /// robustness modes A, B, C and D and 4-QAM mapping with code rate 0,5 or 0,25 for
+    /// robustness mode E."
+    #[test]
+    fn the_sdc_selector_follows_the_robustness_mode() {
+        assert!(sdc_mode_allowed("E", "4-QAM"));
+        assert!(!sdc_mode_allowed("E", "16-QAM"), "DRM+ has no 16-QAM SDC");
+        assert!(sdc_mode_allowed("B", "16-QAM") && sdc_mode_allowed("B", "4-QAM"));
+        assert_eq!(sdc_mode_for("E", "16-QAM"), "4-QAM");
+        assert_eq!(sdc_mode_for("E", "4-QAM"), "4-QAM");
+        assert_eq!(sdc_mode_for("B", "4-QAM"), "4-QAM", "an allowed choice is kept");
+    }
+
+    /// §7.6: "For robustness mode E only one interleaver depth is available which corresponds
+    /// to the algorithm for high interleaver depth."
+    #[test]
+    fn mode_e_has_one_interleaving_depth() {
+        assert_eq!(interleaving_for("E", "short"), "long", "DRM+ only has the long depth");
+        assert_eq!(interleaving_for("E", "long"), "long");
+        assert_eq!(interleaving_for("B", "short"), "short", "DRM30 keeps both");
+        assert_eq!(interleaving_for("B", "long"), "long");
+        // Mode E's interleaver flag is fixed at 0, so short must never be written.
+        let mut doc: DocumentMut = "[channel]\nmode = \"E\"\ninterleaving = \"short\"\n".parse().unwrap();
+        repair_channel_for_mode(&mut doc);
+        assert_eq!(get_str(section(&mut doc, "channel"), "interleaving").as_deref(), Some("long"));
+    }
+
+    /// Switching to mode E must repair a DRM30 document, or the station refuses it: 64-QAM
+    /// does not exist in DRM+, nor a 16-QAM SDC, nor short interleaving, nor a hierarchical
+    /// layer (§7.5.1: "a hierarchical mapping scheme can only be used in a 64-QAM signal
+    /// constellation").
+    #[test]
+    fn switching_to_mode_e_repairs_the_document() {
+        let mut doc: DocumentMut = r#"
+[channel]
+mode = "E"
+occupancy = 0
+msc_mode = "HMsym"
+sdc_mode = "16-QAM"
+interleaving = "short"
+protection_b = 3
+[[service]]
+label = "R"
+id = 0xD0D001
+[service.audio]
+codec = "aac"
+input = { tone_hz = 1000.0 }
+hierarchical = true
+"#
+        .parse()
+        .unwrap();
+        assert!(repair_channel_for_mode(&mut doc));
+        let ch = section(&mut doc, "channel");
+        assert_eq!(get_str(ch, "msc_mode").as_deref(), Some("16-QAM"), "64-QAM does not exist in DRM+");
+        assert_eq!(get_str(ch, "sdc_mode").as_deref(), Some("4-QAM"), "DRM+ has 4-QAM SDC only");
+        assert_eq!(get_str(ch, "interleaving").as_deref(), Some("long"), "DRM+ has one depth");
+        // 16-QAM has levels 0-1 in the DRM30 tables DecDRM encodes with.
+        assert_eq!(get_int(section(&mut doc, "channel"), "protection_b"), Some(1));
+        // The hierarchical mark cannot survive without a hierarchical constellation.
+        let text = doc.to_string();
+        assert!(!text.contains("hierarchical"), "{text}");
+        // The repaired document must be one the station accepts.
+        let cfg = decdrm_station::StationConfig::from_toml_str(&text)
+            .unwrap_or_else(|e| panic!("repaired mode E document must validate: {e}"));
+        assert_eq!(cfg.channel.mode.0, RobustnessMode::E);
+        // Repairing twice changes nothing more.
+        assert!(!repair_channel_for_mode(&mut doc));
+    }
+
+    /// The mode E rules must not touch a document already in order.
+    #[test]
+    fn a_valid_mode_e_document_is_left_alone() {
+        let mut doc: DocumentMut = "[channel]\nmode = \"E\"\noccupancy = 0\nmsc_mode = \"16-QAM\"\nsdc_mode = \"4-QAM\"\ninterleaving = \"long\"\n"
+            .parse()
+            .unwrap();
+        assert!(!repair_channel_for_mode(&mut doc), "nothing to repair");
+        // A DRM30 document keeps its own choices: 64-QAM, 16-QAM SDC, short interleaving.
+        let mut b: DocumentMut = "[channel]\nmode = \"B\"\nmsc_mode = \"64-QAM\"\nsdc_mode = \"16-QAM\"\ninterleaving = \"short\"\n"
+            .parse()
+            .unwrap();
+        assert!(!repair_channel_for_mode(&mut b));
+        assert_eq!(get_str(section(&mut b, "channel"), "msc_mode").as_deref(), Some("64-QAM"));
+    }
+
+    /// The protection levels a selector offers follow the constellation (§7.5.1 tables 29-32).
+    #[test]
+    fn protection_levels_follow_the_constellation() {
+        assert_eq!(protection_levels("A", "16-QAM").len(), 2, "16-QAM has levels 0-1 in DRM30");
+        assert_eq!(protection_levels("A", "64-QAM").len(), 4);
+        assert_eq!(protection_levels("E", "16-QAM").len(), 2, "DecDRM encodes DRM30's 16-QAM table");
     }
 
     #[test]
