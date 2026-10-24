@@ -139,7 +139,7 @@ impl ChannelEstimator {
         };
         let tw = TimeWiener::new_at(&map, rate);
         let delay = tw.delay;
-        let track = PdsTracker::new(&map, num_pil, delay + 1);
+        let track = PdsTracker::new_at(&map, num_pil, delay + 1, rate);
         let fw_len = freq_wiener_len(map.mode());
         let ns = map.symbols_per_frame;
         let sym_rate = Real::from(rate.hz()) / map.mode().symbol_len_at(rate) as Real;
