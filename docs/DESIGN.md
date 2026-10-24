@@ -678,23 +678,21 @@ symbol lengths are 1152/1024/704/448 samples for modes A/B/C/D.
      demodulation is right and the symbol-to-bit stage is not. Note this tool has **no
      equaliser**, so it cannot decode a real recording at all; it bounds the demodulation
      only, and its failure is not evidence about the receiver.
-  2. **The file round trip is now explained — it is a timing-offset problem, not a signal
-     problem.** Writing DecDRM's own mode E signal to a WAV and reading it back gave FAC 0
-     with `band_limit = true` and FAC 2-3 with it false, which made the transmit filter look
-     like the cause. It is not: measured, the two files are the **same signal time-shifted by
-     ~415 samples** (the filter's ~697-tap group delay), agreeing to **0.35 % of peak** once
-     aligned, and both decode in memory. What the failure really is: `Receiver::set_mode`
-     (which a mode E file needs, since `freqacq` cannot find one) sets `state = Tracking`,
-     drops acquisition and clears the chain, so **nothing establishes the frame boundary** —
-     the receiver assumes it is already aligned, which is true of a signal it generated
-     itself in the same process and false of any file. Letting acquisition run instead finds
-     nothing at all, because `freqacq` hunts for pilots mode E does not have (item 4 below).
-     So the next step is the receiver's **initial timing/frame alignment for a pinned mode**:
-     either give `set_mode` a way to establish the boundary from the signal (frame sync and
-     the time-reference pilots in symbol 0 are the tools) or finish item 4 so acquisition can
-     do it. This also explains the real recordings: they differ from DecDRM's own output by an
-     arbitrary offset of the same kind.
-     `tests/mode_e_rx.rs` pins the in-memory truth so band limiting is not mis-blamed again.
+  2. **A pinned mode did not establish its own frame alignment — fixed.** The file round trip
+     looked like a signal problem (band limiting on gave FAC 0, off gave FAC 2-3) but is a
+     timing one. Measured on the written files: the two are the **same signal shifted by ~415
+     samples** (the transmit filter's ~697-tap group delay), agreeing to **0.36 % of peak**
+     once aligned, so nothing is corrupted. The cause was one line: `Receiver::set_mode` forced
+     `state = Tracking`, which skips the frame-sync attempts *and* the no-FAC resync, so a
+     pinned signal only decoded if it was already aligned — true of a signal generated in the
+     same process, false of any file. Staying in `Acquisition` took a written-then-read mode E
+     file from **FAC 3 to FAC 63** (7.5 s, 192 kHz), so a mode E file now decodes in practice.
+     Pinning says where the signal is, not where the frame boundary is.
+     *Still unexplained:* band limiting changes the outcome (FAC 63 unfiltered, FAC 0 filtered
+     on the same signal) even though it does not degrade the waveform. That is the next thing
+     to look at. *Also:* the test added for this fix does **not** guard it (reverting the line
+     still passes), so the file measurement is the evidence, not the test.
+
   3. **120 kHz fails at the SDC step** (FAC 32, SDC 0) while 192 kHz passes. Not equaliser
      tuning: a 25-combination sweep of the `TimeWiener` placeholders changed nothing.
   4. `freqacq.rs` cannot find a mode E signal unaided — its detector hunts for the three
