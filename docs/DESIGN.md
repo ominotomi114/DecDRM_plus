@@ -688,9 +688,15 @@ symbol lengths are 1152/1024/704/448 samples for modes A/B/C/D.
      same process, false of any file. Staying in `Acquisition` took a written-then-read mode E
      file from **FAC 3 to FAC 63** (7.5 s, 192 kHz), so a mode E file now decodes in practice.
      Pinning says where the signal is, not where the frame boundary is.
-     *Still unexplained:* band limiting changes the outcome (FAC 63 unfiltered, FAC 0 filtered
-     on the same signal) even though it does not degrade the waveform. That is the next thing
-     to look at. *Also:* the test added for this fix does **not** guard it (reverting the line
+     *Band limiting, now fully explained:* the filtered file carries **412 leading zero samples**
+     (the FIR's group delay, written as silence) that the unfiltered one does not, so the
+     receiver counts frames from before the signal starts. Stripping those 412 samples gives
+     **FAC 72, FAC bad 0** - every frame decodes - which confirms the waveform was never the
+     problem and the whole difference is that lead-in. The **real remaining bug** is therefore
+     the receiver's tolerance for a fractional-symbol lead-in: it should resolve a sub-symbol
+     offset at the start of a signal, and does not. (Or `OutputStage` should not emit the
+     filter's warm-up: it reports `delay()` but nothing consumes it.)
+     *Also:* the test added for the `set_mode` fix does **not** guard it (reverting the line
      still passes), so the file measurement is the evidence, not the test.
 
   3. **120 kHz fails at the SDC step** (FAC 32, SDC 0) while 192 kHz passes. Not equaliser
