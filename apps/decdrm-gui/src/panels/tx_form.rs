@@ -2021,6 +2021,26 @@ hierarchical = true
         assert_eq!(get_str(section(&mut b, "channel"), "msc_mode").as_deref(), Some("64-QAM"));
     }
 
+    /// The repair runs on every frame the Channel card is drawn, so a document already in
+    /// order must come back byte for byte — comments, key order, absent keys and equivalent
+    /// spellings included. Otherwise merely *looking* at the form would dirty the file and
+    /// rewrite what the user wrote.
+    #[test]
+    fn a_valid_document_keeps_its_text_exactly() {
+        // Mode B with no constellation keys at all (their defaults are valid there), a
+        // comment on the mode line and a hand-written spelling of the mode.
+        let text = "[channel]\nmode = \"b\"   # the usual choice\noccupancy = 3\n\n[[service]]\nlabel = \"R\"\nid = 0xD0D001\n[service.audio]\ncodec = \"aac\"\ninput = { tone_hz = 1000.0 }\n";
+        let mut doc: DocumentMut = text.parse().unwrap();
+        assert!(!repair_channel_for_mode(&mut doc), "a valid mode B document needs no repair");
+        assert_eq!(doc.to_string(), text, "the text must not change");
+
+        // Mode E already in order, with equivalent spellings and its own layout.
+        let text = "[channel]\nmode = \"E\"\noccupancy = 0\nmsc_mode = \"16qam\"\nsdc_mode = \"4qam\"\ninterleaving = \"long\"\n";
+        let mut doc: DocumentMut = text.parse().unwrap();
+        assert!(!repair_channel_for_mode(&mut doc), "an equivalent spelling is already correct");
+        assert_eq!(doc.to_string(), text, "the text must not change");
+    }
+
     /// The protection levels a selector offers follow the constellation (§7.5.1 tables 29-32).
     #[test]
     fn protection_levels_follow_the_constellation() {
