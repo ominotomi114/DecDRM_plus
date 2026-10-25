@@ -16,6 +16,21 @@ use std::collections::VecDeque;
 const NMODES: usize = RobustnessMode::ALL.len();
 /// Guard correlation is evaluated every `STEP` decimated samples.
 const STEP: usize = 4;
+/// [`STEP`] when the mode's guard interval in the decimated domain is too short to be
+/// resolved by it. At 192 kHz the decimation is 16 and mode E's 48-sample guard is only
+/// **3 decimated samples**, so a 4-sample step (64 real samples) is coarser than the
+/// interval it is looking for: the correlation peak falls between grid points and the
+/// loop parks the FFT window 200-odd samples outside the guard, where the cyclic prefix
+/// no longer covers it and every MSC cell is wrong. Modes A-D have guards of 16-88
+/// decimated samples and keep the coarser step, which is several times cheaper.
+const STEP_FINE: usize = 1;
+
+/// The guard-correlation step for a mode at a rate: [`STEP`], or [`STEP_FINE`] when
+/// [`STEP`] is wider than the mode's decimated guard interval.
+fn step_for(mode: RobustnessMode, rate: crate::params::WorkingRate) -> usize {
+    let g = geom_at(mode, rate);
+    if g.g < STEP * 2 { STEP_FINE } else { STEP }
+}
 /// Robustness-mode detection observes this many symbols.
 const RM_BLOCKS: usize = 16;
 /// Required ratio between best and second-best mode score (Dream: 8). Measured on
@@ -103,6 +118,8 @@ pub struct TimeSync {
     lpf: FirDecimator,
     /// Decimation factor actually used (rate / 12 kHz), for the correlation path.
     dec_factor: usize,
+    /// Guard-correlation evaluation step in decimated samples (see [`step_for`]).
+    step: usize,
     lpf_delay: Real,
     dec: Vec<Cplx>,
     dec_base: i64,
@@ -175,6 +192,7 @@ impl TimeSync {
             buf_base: 0,
             lpf,
             dec_factor: dec,
+            step: step_for(mode, rate),
             lpf_delay,
             dec: Vec::new(),
             dec_base: 0,
@@ -223,14 +241,15 @@ impl TimeSync {
         self.fft_len = mode.fft_size_at(self.rate);
         self.sym_len = mode.symbol_len_at(self.rate);
         let g = geom_at(mode, self.rate);
-        let rm_len = RM_BLOCKS * g.ts / STEP;
+        self.step = step_for(mode, self.rate);
+        let rm_len = RM_BLOCKS * g.ts / self.step;
         if rm_len != self.rm_len {
             self.reset_mode_detection();
         }
         self.rm_len = rm_len;
-        self.rm_len_long = RM_BLOCKS_LONG * g.ts / STEP;
-        self.maxdet_len = g.ts / STEP;
-        self.ma_len = (g.g / STEP).max(1);
+        self.rm_len_long = RM_BLOCKS_LONG * g.ts / self.step;
+        self.maxdet_len = g.ts / self.step;
+        self.ma_len = (g.g / self.step).max(1);
         self.corr_av = vec![0.0; self.maxdet_len];
         self.corr_av_idx = 0;
         self.lambda_co_av = 1.0;
@@ -367,7 +386,7 @@ impl TimeSync {
                     match self.detect_mode() {
                         Some((mode, rel)) if self.rm_candidate == Some(mode) => {
                             self.rm_streak += 1;
-                            if self.rm_streak >= geom_at(mode, self.rate).ts / STEP {
+                            if self.rm_streak >= geom_at(mode, self.rate).ts / self.step {
                                 self.mode_acq = false;
                                 events.push(TimeSyncEvent::ModeDetected { mode, reliability: rel });
                             }
@@ -387,7 +406,7 @@ impl TimeSync {
             if self.timing_acq {
                 self.timing_step(metric[sel], self.next_eval);
             }
-            self.next_eval += STEP as i64;
+            self.next_eval += self.step as i64;
         }
         // Drop decimated samples that are no longer needed.
         let drop = (self.next_eval - self.dec_base).max(0) as usize;
@@ -400,10 +419,10 @@ impl TimeSync {
 
     /// Add one normalised guard correlation per mode to the sliding DFTs.
     fn push_mode_values(&mut self, geoms: &[Geom; NMODES], rho: &[Real; NMODES], detectable: &[bool; NMODES]) {
-        // exp(-j2π·f·n) at each mode's symbol rate f = STEP/ts cycles per evaluation,
+        // exp(-j2π·f·n) at each mode's symbol rate f = step/ts cycles per evaluation,
         // with the phase computed exactly from n mod ts.
         let phasor = |g: &Geom, n: usize| {
-            let k = (n * STEP) % g.ts;
+            let k = (n * self.step) % g.ts;
             Cplx::from_polar(1.0, -2.0 * std::f64::consts::PI * k as Real / g.ts as Real)
         };
         let n = self.rm_count;

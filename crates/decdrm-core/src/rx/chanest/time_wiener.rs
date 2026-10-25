@@ -24,10 +24,10 @@ fn params(mode: RobustnessMode) -> (usize, Real) {
         RobustnessMode::B => (7, 2.7 / 2.0),
         RobustnessMode::C => (9, 5.7 / 2.0),
         RobustnessMode::D => (9, 4.5 / 2.0),
-        // Mode E (DRM+) reception is not implemented yet: it needs the higher working rate
-        // and its own pilot geometry. These are the most conservative (widest) DRM30 values,
-        // so that if the mode is ever reached the estimator degrades rather than misbehaves.
-        // Replace with spec-derived values when mode E reception lands.
+        // Mode E (DRM+): a placeholder, the widest DRM30 value (mode C's). Mode E reception
+        // works with it (real recordings decode end to end), and a sweep of the frequency
+        // filter length showed the equaliser tuning is not where the losses were, but no
+        // spec-derived value has been established. Tune it against the graded recordings.
         RobustnessMode::E => (9, 5.7 / 2.0),
     }
 }
@@ -152,7 +152,7 @@ impl TimeWiener {
         &mut self,
         map: &CellMap,
         sym: &[Cplx],
-        s: usize,
+        sf_sym: usize,
         cum_shift: i64,
         out_cum_shift: i64,
         snr_pilots: Real,
@@ -162,9 +162,13 @@ impl TimeWiener {
         // The timing shift is in working-rate samples, so the rotation denominator is the
         // FFT size at that rate (NOT the mode's 48 kHz size).
         let n = self.fft_size as Real;
-        let cells = map.symbol_cells(s);
-        let pilots = map.symbol_pilots(s);
+        let cells = map.symbol_cells(sf_sym);
+        let pilots = map.symbol_pilots(sf_sym);
         let rot = |h: Cplx, c: usize, dshift: i64| -> Cplx {
+            // Every mode rotates by the timing shift. Mode E used to skip it, because the
+            // shift the loop produced for it was not a real sub-guard drift but the residue
+            // of a timing search coarser than its guard interval (`timesync::step_for`);
+            // with that fixed the rotation is what A-D have always used it for.
             if dshift == 0 {
                 h
             } else {
@@ -172,6 +176,10 @@ impl TimeWiener {
                 h * Cplx::from_polar(1.0, 2.0 * PI * k * dshift as Real / n)
             }
         };
+        // The scattered grid repeats with period `t` **symbols within a frame**, and `s0`
+        // is a frame-relative symbol, so the filter phase must use the frame-relative
+        // symbol. `sf_sym` is a super-frame index (only the map rows need that).
+        let s = sf_sym % self.ns;
         for (p, hist) in self.hist.iter_mut().enumerate() {
             let c = p * x;
             if c >= map.num_carriers {

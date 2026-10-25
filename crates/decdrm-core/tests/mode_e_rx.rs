@@ -60,16 +60,18 @@ fn test_fac() -> Fac {
 /// Decode `seconds` of self-generated mode E signal at `rate`; returns
 /// (FACs decoded, SDC CRCs that passed, multiplex frames recovered).
 fn run(rate: WorkingRate, seconds: Real) -> (usize, usize, usize) {
-    run_with_band_limit(rate, seconds, true)
+    // `DECDRM_ME_NOBAND` takes the transmit channel filter out of the loop, to tell a
+    // transmit-stage distortion from a receiver one.
+    let band = std::env::var_os("DECDRM_ME_NOBAND").is_none();
+    run_with_band_limit(rate, seconds, band)
 }
 
 /// `band_limit` = the transmit channel filter (`OutputConfig::band_limit`).
 ///
-/// This distinction matters and is currently NOT understood: with the filter **on** the same
-/// mode E signal does not decode (FAC 0), with it **off** it does (FAC 2-3). It is not the
-/// filter's in-band response (measured within 0.2 dB of unfiltered up to 47.4 kHz) nor its
-/// group delay (1.8 ms at 192 kHz, far less than the interleaver's own delay). See
-/// `band_limiting_breaks_mode_e_reception` below.
+/// This used to decide whether mode E decoded at all, but the cause of that was the guard
+/// correlation step being coarser than mode E's guard interval (`timesync::step_for`), not
+/// the filter: the loop parked the FFT window outside the guard, and whether the residual
+/// timing error pushed it far enough to matter depended on the filter's group delay.
 fn run_with_band_limit(rate: WorkingRate, seconds: Real, band_limit: bool) -> (usize, usize, usize) {
     let cfg = tx_config(rate);
     let mut tx = Transmitter::new(cfg).expect("mode E transmitter");
@@ -102,7 +104,7 @@ fn run_with_band_limit(rate: WorkingRate, seconds: Real, band_limit: bool) -> (u
     let frames = (seconds / 0.1).ceil() as usize;
     // A plain counter stands in for the MSC payload; the test only needs the container.
     let mut msc = vec![0u8; cap.total_bits()];
-    let (mut fac_ok, mut sdc_ok, mut msc_ok) = (0, 0, 0);
+    let (mut fac_ok, mut sdc_ok, mut msc_ok, mut sdc_bad) = (0, 0, 0, 0);
     let mut pcm: Vec<f32> = Vec::new();
     for f in 0..frames {
         for (i, b) in msc.iter_mut().enumerate() {
@@ -116,11 +118,31 @@ fn run_with_band_limit(rate: WorkingRate, seconds: Real, band_limit: bool) -> (u
             match ev {
                 ReceiverEvent::Fac(_) => fac_ok += 1,
                 ReceiverEvent::Sdc(s) if s.crc_ok => sdc_ok += 1,
+                ReceiverEvent::Sdc(_) => {
+                    sdc_bad += 1;
+                    if std::env::var_os("DECDRM_ME_TRACE").is_some() {
+                        eprintln!("[me] SDC CRC fail (frame {f})");
+                    }
+                }
                 ReceiverEvent::Msc(frame) if frame.complete => msc_ok += 1,
+                ReceiverEvent::Restarted => {
+                    if std::env::var_os("DECDRM_ME_TRACE").is_some() {
+                        eprintln!("[me] RESTARTED at frame {f}");
+                    }
+                }
                 _ => {}
             }
         }
     }
+    if std::env::var_os("DECDRM_ME_TRACE").is_some() {
+        let st = rx.status();
+        eprintln!("[me] rate {rate}: FAC {fac_ok}, SDC ok {sdc_ok}, SDC bad {sdc_bad}, MSC {msc_ok}");
+        eprintln!("[me]   state {:?} frame_sync {:?} fac_ok {} fac_bad {} snr {:?} mer {:?} wmer {:?} fac_mer {:?}",
+            st.state, st.frame_sync, st.fac_ok, st.fac_bad, st.snr_db, st.mer_db, st.wmer_db, st.fac_mer_db);
+        eprintln!("[me]   doppler {:.2} Hz delay {:.3} ms sro {:.2} Hz dc {:?}",
+            st.doppler_hz, st.delay_ms, st.sro_hz, st.dc_frequency_hz);
+    }
+    let _ = sdc_bad;
     (fac_ok, sdc_ok, msc_ok)
 }
 
@@ -204,13 +226,20 @@ fn a_pinned_mode_e_signal_is_aligned_from_the_signal_itself() {
     assert!(fac_ok > 0, "a small lead-in must be re-acquired (FAC {fac_ok})");
 }
 
-/// At 192 kHz: the receiver locks on, decodes the FAC and the SDC, and recovers multiplex
-/// frames from DecDRM's own mode E signal.
+/// At 192 kHz: the receiver locks on and decodes the FAC, and must also decode the SDC and
+/// recover multiplex frames from DecDRM's own mode E signal.
 ///
-/// This passes as of the interleaver-depth (D = 6 for mode E, §7.6) and TimeWiener
-/// working-rate fixes. It is a DecDRM-to-DecDRM loopback, so it cannot catch a misreading
-/// shared by this transmitter and receiver — for that, decode a real recording with
-/// `--example modee_real` or `--example rxfiled` (see the mode E notes).
+/// This test used to fail unless the transmit band-limiting filter was taken out of the loop,
+/// and the fault was in the receiver: `timesync` evaluates the guard correlation every
+/// `STEP` = 4 decimated samples, which at 192 kHz is 64 real samples — wider than mode E's
+/// 48-sample guard. The correlation peak fell between grid points, the loop parked the FFT
+/// window ~280 samples out rather than inside the guard, and every data cell came out wrong
+/// (only the heavily protected FAC survived). `timesync::step_for` now uses a 1-sample step
+/// whenever `STEP` is wider than the mode's decimated guard. See `docs/DESIGN.md`.
+///
+/// It is a DecDRM-to-DecDRM loopback, so it cannot catch a misreading shared by this
+/// transmitter and receiver — for that, decode a real recording with `--example modee_real`
+/// or `--example rxfiled` (see the mode E notes).
 #[test]
 fn mode_e_loopback_at_192k() {
     let (fac, sdc, msc) = run(WorkingRate::R192, 8.0);
@@ -224,13 +253,10 @@ fn mode_e_loopback_at_192k() {
 
 /// The same at 120 kHz, the other rate mode E runs at.
 ///
-/// KNOWN FAILING at the SDC step: the FAC decodes (32 of 80 frames) but no SDC block passes
-/// its CRC, so no multiplex frame comes out. 192 kHz works, 120 kHz does not, and the
-/// difference is not yet understood — a sweep of the TimeWiener filter-length/Doppler
-/// placeholders (25 combinations) made no difference, so it is not equaliser tuning. Run with
-/// `--ignored` to see it.
+/// The decimation here is 10, so mode E's guard is 5 decimated samples — still wider than
+/// nothing but close to `STEP`, which is why this rate was the harder of the two before
+/// `timesync::step_for` picked the fine step by guard width rather than by rate.
 #[test]
-#[ignore = "mode E at 120 kHz: FAC decodes but the SDC CRC fails; 192 kHz passes"]
 fn mode_e_loopback_at_120k() {
     let (fac, sdc, msc) = run(WorkingRate::R120, 8.0);
     assert!(fac > 0, "no FAC decoded");
@@ -464,3 +490,4 @@ fn a_pinned_configuration_reaches_mode_e_without_set_mode() {
         "a restart must keep the pin, not fall back to searching"
     );
 }
+

@@ -197,9 +197,11 @@ impl Transmitter {
             }
         }
 
-        let msc_params =
-            MlcParams::msc(cfg.msc_mode.mapping(), map.msc_cells_per_frame, cfg.protection, cfg.part_a_bytes);
-        // `MlcParams::msc` silently falls back to EEP when part A does not fit.
+        // The mode's own tables: mode E's 16-QAM rates (table 31) and 4-QAM rates
+        // (table 29) are not modes A-D's, and `MlcParams::msc` is hardcoded to mode B.
+        let msc_params = MlcParams::msc_for(
+            cfg.mode, cfg.msc_mode.mapping(), map.msc_cells_per_frame, cfg.protection, cfg.part_a_bytes);
+        // `MlcParams::msc_for` silently falls back to EEP when part A does not fit.
         if cfg.part_a_bytes > 0 && msc_params.n1 == 0 {
             return Err(TxError::PartATooLong { bytes: cfg.part_a_bytes });
         }
@@ -325,10 +327,16 @@ impl Transmitter {
     }
 
     /// The FAC exactly as it will be sent in the next frame: the caller's FAC with
-    /// the frame index and the transmission parameters (occupancy, interleaving,
-    /// MSC and SDC mode) taken from the transmitter. The AFS-valid flag is kept for
-    /// the first frame of a super frame and cleared otherwise (or both follow
-    /// [`Self::set_fixed_fac_identity`]).
+    /// the frame index, the transmission parameters (occupancy, interleaving, MSC and
+    /// SDC mode) and the **toggle flag** taken from the transmitter. The AFS-valid flag
+    /// is kept for the first frame of a super frame and cleared otherwise (or both
+    /// follow [`Self::set_fixed_fac_identity`]).
+    ///
+    /// The toggle is derived from the frame's position rather than taken from the
+    /// caller, because §6.3.3 defines it that way: zero for modes A–D, and `0, 1, 0, 1`
+    /// across mode E's four frames. [`Fac::to_bits`] writes the same value, so this and
+    /// what leaves the antenna are the same FAC — which is what makes the loopback tests
+    /// (they compare the received FAC against this one) a real check.
     pub fn fac_for_next_frame(&self, fac: &Fac) -> Fac {
         // `Fac` is `Copy`, so `*fac` makes a copy we can modify.
         let mut f = *fac;
@@ -340,6 +348,7 @@ impl Transmitter {
             ch.frame_index = if id == 3 { 0 } else { id };
             ch.afs_valid = id == 0;
         }
+        ch.toggle = crate::fac::toggle_for_frame(ch.frame_index, self.cfg.mode.frames_per_superframe());
         ch.occupancy = self.cfg.occupancy;
         ch.interleaving = self.cfg.interleaving;
         ch.msc_mode = self.cfg.msc_mode;

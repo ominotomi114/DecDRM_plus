@@ -204,8 +204,18 @@ impl SymbolChain {
         let last_fac_symbol = crate::tables::fac_positions(mode).iter().map(|&(s, _)| s as usize).max().unwrap_or(0);
         let mut fac_dec = MlcDecoder::new(MlcParams::fac_for(mode), 0);
         fac_dec.metric = cfg.metric;
-        let sdc_mode = SdcMode::Qam16;
-        let mut sdc_dec = MlcDecoder::new(MlcParams::sdc(sdc_mode.mapping(), map.sdc_cells_per_superframe), 1);
+        // Mode E's SDC is 4-QAM only (§8.5.3.2), so guess that there; modes A-D start on
+        // 16-QAM and the FAC corrects it either way.
+        let sdc_mode = if mode.is_drm_plus() { SdcMode::Qam4 } else { SdcMode::Qam16 };
+        let mut sdc_dec = MlcDecoder::new(
+            MlcParams::sdc_for(
+                mode,
+                sdc_mode.mapping(),
+                map.sdc_cells_per_superframe,
+                sdc_mode.protection(),
+            ),
+            1,
+        );
         sdc_dec.metric = cfg.metric;
         Some(Self {
             mode,
@@ -327,7 +337,19 @@ impl SymbolChain {
         }
         if fac.channel.sdc_mode != self.sdc_mode || self.sdc_dec.params().cells != self.map.sdc_cells_per_superframe {
             self.sdc_mode = fac.channel.sdc_mode;
-            let mut d = MlcDecoder::new(MlcParams::sdc(self.sdc_mode.mapping(), self.map.sdc_cells_per_superframe), 1);
+            // The FAC's SDC-mode bit is the modulation in modes A-D but a **protection
+            // level** in mode E (0 = rate 1/2, 1 = rate 1/4, table 38), which is why it is
+            // passed through here rather than assumed. Assuming level 0 decodes a mode E
+            // SDC sent at rate 1/4 with the wrong code rate and the CRC never passes.
+            let mut d = MlcDecoder::new(
+                MlcParams::sdc_for(
+                    self.mode,
+                    self.sdc_mode.mapping(),
+                    self.map.sdc_cells_per_superframe,
+                    self.sdc_mode.protection(),
+                ),
+                1,
+            );
             d.metric = cfg.metric;
             self.sdc_dec = d;
         }
@@ -393,9 +415,10 @@ impl SymbolChain {
             self.recent.clear();
             self.history.clear();
         }
-        let eq = self.chanest.process(&cells, fs.symbol, win.shift);
+        let sf_sym = self.super_symbol(fs.symbol);
+        let eq = self.chanest.process(&cells, sf_sym, win.shift);
         self.cells = cells;
-        self.remember(win, fs.symbol);
+        self.remember(win, sf_sym);
         let track = self.chanest.last_track;
         if self.chanest.timing_tracking() {
             out.timing_adjust = track.timing_adjust;
@@ -405,9 +428,33 @@ impl SymbolChain {
 
         let Some(eq) = eq else { return out };
         self.history.push(&eq.chan, eq.cum_shift);
-        self.capture(&eq.cells, eq.symbol, &eq.chan);
+        self.capture(&eq.cells, eq.sf_sym, &eq.chan);
         self.demap(&eq.cells, eq.symbol, &mut out.events);
         out
+    }
+
+    /// The super-frame index of the frame-relative symbol `s`.
+    ///
+    /// The cell map spans a super frame while the receiver's symbol counter is
+    /// frame-relative. For modes A-D every frame's rows are identical so the two
+    /// coincide, but **mode E is not frame-periodic**: its AFS references sit at
+    /// super-frame symbols 4 and 159 only (§8.4.5), so the map must be indexed by this.
+    ///
+    /// The estimator's output is delayed by `delay` symbols, so the symbol arriving now
+    /// belongs to the frame `delay` symbols *ahead* of the one being demapped: whenever
+    /// the current symbol is earlier in its frame than the delay, the frame boundary it
+    /// has not reached yet will have been passed by the demapper. Bumping only at `s == 0`
+    /// (the original code) left every `s < delay` symbol — 1..17 for mode E — tagged with
+    /// the previous frame, which is invisible for A-D but makes a mode E receiver read
+    /// frame 0's SDC carriers off a frame 3 symbol.
+    fn super_symbol(&self, s: usize) -> usize {
+        let ns = self.map.symbols_per_frame;
+        let frame = match self.frame_id {
+            Some(f) if s < self.chanest.delay() => (f + 1) % self.mode.frames_per_superframe(),
+            Some(f) => f,
+            None => 1,
+        };
+        frame * ns + s
     }
 
     /// Keep the window just given to the channel estimator for a possible replay
@@ -426,22 +473,17 @@ impl SymbolChain {
 
     /// Keep the latest cells of each channel for the constellation plots (a frame's
     /// worth of FAC and MSC cells, a super frame's worth of SDC cells, so the plots move
-    /// symbol by symbol) and the channel power per carrier. Called before `demap`, so at
-    /// symbol 0 the frame index has not advanced yet.
-    fn capture(&mut self, cells: &[EqCell], s: usize, chan: &[Cplx]) {
+    /// symbol by symbol) and the channel power per carrier.
+    ///
+    /// `sf_sym` is the **super-frame** symbol index of the equalised symbol (from the
+    /// estimator, which tags each symbol when it is received); FAC carriers are the same
+    /// in every frame so they use its frame-relative part.
+    fn capture(&mut self, cells: &[EqCell], sf_sym: usize, chan: &[Cplx]) {
         let map = &self.map;
         let ns = map.symbols_per_frame;
-        for &c in map.fac_carriers(s) {
+        for &c in map.fac_carriers(sf_sym % ns) {
             self.vis_fac.push_back(cells[c as usize].sig);
         }
-        // Frame within the super frame (unknown before the first FAC: assume a frame
-        // without SDC so MSC cells are still plotted).
-        let frame = match self.frame_id {
-            Some(f) if s == 0 => (f + 1) % self.mode.frames_per_superframe(),
-            Some(f) => f,
-            None => 1,
-        };
-        let sf_sym = frame * ns + s;
         if sf_sym < map.mode().sdc_symbols() {
             for &c in map.sdc_carriers(sf_sym) {
                 self.vis_sdc.push_back(cells[c as usize].sig);
@@ -533,6 +575,10 @@ impl SymbolChain {
         // the CRC.
         let sdc_symbols = map.mode().sdc_symbols();
         let seeking = !self.identity_trusted && self.seek_sdc;
+        // SDC carriers come from the *frame-relative* symbol, not the super-frame index:
+        // while the super-frame start is sought, the trial asks "does the super frame
+        // start at this frame?", which makes the current symbol super-frame row `s`. In
+        // frame 0 the two are the same row anyway.
         if s < sdc_symbols && (f == 0 || seeking) {
             if s == 0 {
                 self.sf_synced = true;
@@ -542,7 +588,7 @@ impl SymbolChain {
                 for &c in map.sdc_carriers(s) {
                     self.sdc_cells.push(cells[c as usize]);
                 }
-                if s == sdc_symbols - 1 && self.sdc_cells.len() == map.sdc_cells_per_superframe {
+               if s == sdc_symbols - 1 && self.sdc_cells.len() == map.sdc_cells_per_superframe {
                     let block = self.decode_sdc();
                     self.sdc_cells.clear();
                     if f != 0 {
@@ -580,7 +626,9 @@ impl SymbolChain {
         // followed by 0..=2 dummy cells. Collection may start at any multiplex-frame
         // boundary, so audio can begin up to a super frame earlier after sync.
         let n_mux = map.msc_cells_per_frame;
-        let useful = 3 * n_mux;
+        // Must be the mode's frame count, not 3: a hardcoded 3 silently dropped every
+        // fourth multiplex frame for mode E (3 frames for A-D, 4 for E, §7.7).
+        let useful = self.mode.frames_per_superframe() * n_mux;
         let first = self.msc_offset[sf_sym];
         for (pos, &c) in (first..).zip(map.msc_carriers(sf_sym)) {
             if pos < useful {

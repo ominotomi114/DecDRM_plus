@@ -30,7 +30,9 @@ fn freq_wiener_len(mode: RobustnessMode) -> usize {
         RobustnessMode::A => 6,
         RobustnessMode::B | RobustnessMode::C => 11,
         RobustnessMode::D => 13,
-        // Mode E reception is not implemented yet; widest DRM30 value (see time_wiener.rs).
+        // Mode E (DRM+): a placeholder, the widest DRM30 value (mode D's); no spec-derived
+        // value has been established, and a sweep from 3 to 21 taps changed nothing (see
+        // time_wiener.rs). Tune it against the graded recordings.
         RobustnessMode::E => 13,
     }
 }
@@ -40,6 +42,10 @@ fn freq_wiener_len(mode: RobustnessMode) -> usize {
 pub struct EqSymbol {
     /// Symbol index within the frame.
     pub symbol: usize,
+    /// Symbol index within the **super frame**: the row of the cell map this symbol was
+    /// actually modulated on. The estimator's output is delayed by `delay` symbols, so
+    /// this is not `frame_id * symbols_per_frame + symbol` at the time it is returned.
+    pub sf_sym: usize,
     /// Equalised cells with channel power as reliability.
     pub cells: Vec<EqCell>,
     /// Channel estimate per carrier.
@@ -79,7 +85,7 @@ pub struct ChannelEstimator {
     dc_grid: Option<usize>,
     tw: TimeWiener,
     track: PdsTracker,
-    hist: VecDeque<(Vec<Cplx>, usize, i64)>,
+    hist: VecDeque<(Vec<Cplx>, usize, usize, i64)>,
     cum_shift: i64,
     init_cnt: usize,
     grid: Vec<Cplx>,
@@ -269,20 +275,29 @@ impl ChannelEstimator {
         }
     }
 
-    /// Process one demodulated symbol (`s` = frame symbol index, `shift` = timing
-    /// shift of this window). Returns the equalised symbol `delay` symbols later.
-    pub fn process(&mut self, sym: &[Cplx], s: usize, shift: i64) -> Option<EqSymbol> {
+    /// Process one demodulated symbol. `sf_sym` is its **super-frame** symbol index and
+    /// `shift` the timing shift of this window. Returns the equalised symbol `delay`
+    /// symbols later.
+    ///
+    /// The map must be indexed by `sf_sym`, not by the frame-relative symbol: for modes
+    /// A–D every frame's rows are identical so the two agree, but mode E's AFS
+    /// references sit at super-frame symbols 4 and 159 only (§8.4.5).
+    pub fn process(&mut self, sym: &[Cplx], sf_sym: usize, shift: i64) -> Option<EqSymbol> {
         let map = Arc::clone(&self.map);
+        let sf = sf_sym % map.symbols_per_superframe;
+        // Per-frame indices (`fac_noise_sym`, the scattered filter phase, the caller's
+        // demapper) count within the frame; only the map rows span the super frame.
+        let s_frame = sf % map.symbols_per_frame;
         self.cum_shift += shift;
-        self.hist.push_back((sym.to_vec(), s, self.cum_shift));
+        self.hist.push_back((sym.to_vec(), sf, s_frame, self.cum_shift));
         if self.hist.len() > self.tw.delay + 1 {
             self.hist.pop_front();
         }
-        let out_cum = self.hist.front().map(|h| h.2).unwrap_or(self.cum_shift);
+        let out_cum = self.hist.front().map(|h| h.3).unwrap_or(self.cum_shift);
 
         let snr_pil = self.snr_estimate * self.snr_pil_corr;
         let mut grid = std::mem::take(&mut self.grid);
-        let snr_after_ti = self.tw.estimate(&map, sym, s, self.cum_shift, out_cum, snr_pil, &mut grid);
+        let snr_after_ti = self.tw.estimate(&map, sym, sf, self.cum_shift, out_cum, snr_pil, &mut grid);
         if let Some(dc) = self.dc_grid {
             grid[dc] = Cplx::new(0.0, 0.0);
         }
@@ -311,8 +326,8 @@ impl ChannelEstimator {
         self.grid = grid;
 
         // Equalise the delayed symbol.
-        let (data, out_s, cum_shift) = self.hist.front().expect("history filled");
-        let (out_s, cum_shift) = (*out_s, *cum_shift);
+        let (data, out_s, out_s_frame, cum_shift) = self.hist.front().expect("history filled");
+        let (out_s, out_s_frame, cum_shift) = (*out_s, *out_s_frame, *cum_shift);
         let cells: Vec<EqCell> = data
             .iter()
             .zip(&chan)
@@ -322,12 +337,16 @@ impl ChannelEstimator {
             })
             .collect();
 
+        // The map row is per super frame; the caller demaps and captures by the
+        // frame-relative symbol, which is what `EqSymbol::symbol` has always meant.
         self.update_quality(&map, &cells, out_s);
-        Some(EqSymbol { symbol: out_s, cells, chan, cum_shift })
+        Some(EqSymbol { symbol: out_s_frame, sf_sym: out_s, cells, chan, cum_shift })
     }
 
-    fn update_quality(&mut self, map: &CellMap, cells: &[EqCell], s: usize) {
-        let row = map.symbol_cells(s);
+    fn update_quality(&mut self, map: &CellMap, cells: &[EqCell], sf_sym: usize) {
+        // The map row is per super frame; the running per-symbol sums are per frame.
+        let row = map.symbol_cells(sf_sym);
+        let s = sf_sym % map.symbols_per_frame;
         let min_dist4 = |c: Cplx| -> Real { nearest_err(c.re, &QAM4).powi(2) + nearest_err(c.im, &QAM4).powi(2) };
 
         // SNR from FAC decisions.

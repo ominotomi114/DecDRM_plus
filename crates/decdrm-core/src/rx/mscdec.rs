@@ -34,7 +34,15 @@ impl MscDecoder {
         metric: MetricKind,
     ) -> Self {
         let depth = crate::interleave::interleaver_depth(mode, config.interleaving);
-        let mut dec = MlcDecoder::new(MlcParams::msc(config.mode.mapping(), cells, config.protection, config.part_a_bytes), iterations);
+        // The **mode's** protection tables: mode E's 16-QAM rates (table 31) differ from
+        // modes A-D's (table 30) at every level except its last, so `MlcParams::msc`
+        // (hardcoded to mode B) would decode a DRM+ 16-QAM multiplex frame into noise —
+        // except at protection level 3, whose rate coincides, which is what made the
+        // fault look like a signal-quality problem.
+        let mut dec = MlcDecoder::new(
+            MlcParams::msc_for(mode, config.mode.mapping(), cells, config.protection, config.part_a_bytes),
+            iterations,
+        );
         dec.metric = metric;
         Self { config, deint: CellDeinterleaver::new(cells, depth), dec, cells, since_reset: 0 }
     }

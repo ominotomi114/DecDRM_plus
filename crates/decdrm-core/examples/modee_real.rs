@@ -14,6 +14,7 @@
 use decdrm_core::cellmap::CellMap;
 use decdrm_core::fac::Fac;
 use decdrm_core::fec::mlc::{MlcDecoder, MlcParams};
+use decdrm_core::fec::qam::MetricKind;
 use decdrm_core::fec::qam::EqCell;
 use decdrm_core::params::{RobustnessMode, SpectrumOccupancy, WorkingRate};
 use decdrm_core::rx::ofdm::OfdmDemod;
@@ -135,11 +136,45 @@ fn main() {
         return;
     }
 
+    // Apply a common phase rotation to every cell after demodulation. The cells are
+    // collected taking one symbol per received symbol, so a carrier offset of δ Hz adds
+    // 2πδ·Ts to each successive symbol — a phase that ramps across the 22 FAC symbols.
+    // The receiver's own conversion corrects exactly this with its mixer; this diagnostic
+    // corrects it with no mixer at all, so it needs the same rotation applied by hand.
+    // A wrong de-rotation scrambles the phase but leaves the amplitudes alone, which is
+    // what the phase check below has been showing.
+    if let Ok(v) = std::env::var("DECDRM_FAC_DF") {
+        let df: f64 = v.parse().unwrap_or(0.0);
+        let ts = ts as f64; // samples per symbol
+        let fs = f64::from(rate.hz());
+        for (s, sym) in symbols.iter_mut().enumerate() {
+            let ph = -2.0 * std::f64::consts::PI * df * (s as f64 * ts) / fs;
+            let r = Cplx::from_polar(1.0, ph);
+            for c in sym.iter_mut() {
+                *c *= r;
+            }
+        }
+    }
+
     // Collect the FAC cells in the receiver's order and decode.
+    //
+    // The cells must be put on the 4-QAM constellation's own scale before any soft metric
+    // looks at them: this diagnostic has no equaliser, so a raw cell is ~0.0098 where the
+    // PAM points are +-0.7071, and at that scale both candidates are equally distant, which
+    // makes the metric's decision arbitrary. (The real receiver divides by its channel
+    // estimate and so is already normalised; this stands in for that.)
+    let mean_amp = {
+        let n: f64 = (0..ns)
+            .flat_map(|s| map.fac_carriers(s).iter().map(move |&c| (s, c)))
+            .map(|(s, c)| symbols[s][c as usize].norm())
+            .sum();
+        n / 244.0
+    };
+    let scale = (1.0 / 2f64.sqrt()) / mean_amp;
     let mut fac_cells = Vec::new();
     for s in 0..ns {
         for &c in map.fac_carriers(s) {
-            fac_cells.push(EqCell { sig: symbols[s][c as usize], chan: 1.0 });
+            fac_cells.push(EqCell { sig: symbols[s][c as usize] * scale, chan: 1.0 });
         }
     }
     println!("collected {} FAC cells (expect {})", fac_cells.len(),
@@ -148,6 +183,19 @@ fn main() {
     let mut bits = Vec::new();
     dec.decode(&fac_cells, &mut bits);
     println!("decoded {} bits", bits.len());
+    // Channel parameter bits as they come off the air, so the interpretation of an
+    // RM-flag-dependent field can be checked against the recording rather than the
+    // file name.
+    if bits.len() >= 20 {
+        let s: String = bits[..20].iter().map(|&b| char::from(b'0' + (b & 1))).collect();
+        println!("channel bits  : {s}");
+        println!("  base/enh {} identity {} rm_flag {} occ {} intl {} msc {} sdc {} svc {} reconf {} toggle {} rfu {}",
+            bits[0], (bits[1] << 1) | bits[2], bits[3],
+            (bits[4] << 2) | (bits[5] << 1) | bits[6], bits[7],
+            (bits[8] << 1) | bits[9], bits[10],
+            (bits[11] << 3) | (bits[12] << 2) | (bits[13] << 1) | bits[14],
+            (bits[15] << 2) | (bits[16] << 1) | bits[17], bits[18], bits[19]);
+    }
     // Are the FAC cells on the 4-QAM constellation at all? A real signal puts them at four
     // phases 90 degrees apart; noise scatters. Print how many land near one of four ideal
     // points, which tells us whether the cell values are being extracted correctly.
@@ -177,6 +225,104 @@ fn main() {
         println!("phase check: mean |.| {mean:.5}; nearest-ideal-phase counts {:?}", hits);
         println!("  (a real 4-QAM signal spreads them over all four; worst phase error {:.1} deg)",
                  worst.to_degrees());
+    }
+
+    // Differential diagnostic: try CRC-coverage conventions directly on the decoded bits,
+    // to find which slicing of `bits` the transmitter actually used. The receiver's own
+    // `Fac::parse` is one of these; a decoder that only ever sees its own transmitter
+    // cannot tell which.
+    {
+        use decdrm_core::fec::crc::Crc;
+        // `extra0` zero bits are appended after the first `info` bits before the CRC is
+        // taken (the reference's 4 untransmitted reserved bits). The check bits are read
+        // from the on-air stream at `at`.
+        let crc_with = |src: &[u8], info: usize, extra0: usize, at: usize| -> (u8, u8) {
+            let mut c = Crc::crc8();
+            for &b in src.iter().take(info) {
+                c.add_bit(b & 1 == 1);
+            }
+            for _ in 0..extra0 {
+                c.add_bit(false);
+            }
+            let mut v = 0u8;
+            for i in 0..8 {
+                v = (v << 1) | (src.get(at + i).copied().unwrap_or(0) & 1);
+            }
+            (c.value() as u8, v)
+        };
+        println!("== CRC variants: (info bits, appended zero bits, check-bit offset) ==");
+        for (info, extra0, at, name) in [
+            (108usize, 0usize, 108usize, "108 info, crc@108 (DecDRM current)"),
+            (108, 4, 108, "108 info + 4 zeros, crc@108 (reference)"),
+            (112, 0, 112, "112 info, crc@112"),
+            (108, 0, 112, "108 info, crc@112"),
+        ] {
+            let (got, want) = crc_with(&bits, info, extra0, at);
+            println!("  {name:38} computed {got:02x}  on-air {want:02x}  {}",
+                if got == want { "MATCH" } else { "" });
+        }
+        // A conjugate (imaginary-sign) convention is invisible to the phase check above
+        // (conjugating maps each ideal phase onto another ideal phase) and would invert
+        // every cell's quadrature bit — 50 % of the payload, fatal to the Viterbi. Combined
+        // with the soft metric (the reference uses |r/h − s|·|h|, DecDRM's FAC default is
+        // the same, but the receiver's FAC uses the MSC metric), that is the remaining
+        // free space. Try the cross product and report any CRC match in either coverage.
+        println!("== axis convention x metric (CRC 108+4zeros @108, and 108 @108) ==");
+        let variants: [(&str, fn(Cplx) -> Cplx); 4] = [
+            ("as received", |z| z),
+            ("conjugated", |z| z.conj()),
+            ("re/im swapped", |z| Cplx::new(z.im, z.re)),
+            ("conj + swapped", |z| Cplx::new(z.im, -z.re)),
+        ];
+        let kinds = [
+            ("DreamLinear", MetricKind::DreamLinear),
+            ("Euclidean", MetricKind::Euclidean),
+        ];
+        for (vname, f) in variants {
+            for (kname, kind) in kinds {
+                let cs: Vec<EqCell> = fac_cells.iter().map(|c| EqCell { sig: f(c.sig), chan: c.chan }).collect();
+                let mut d = MlcDecoder::new(MlcParams::fac_for(mode), 0);
+                d.metric = kind;
+                let mut b = Vec::new();
+                d.decode(&cs, &mut b);
+                let (g1, w1) = crc_with(&b, 108, 4, 108);
+                let (g2, w2) = crc_with(&b, 108, 0, 108);
+                let hit = if g1 == w1 {
+                    "MATCH(ref)"
+                } else if g2 == w2 {
+                    "MATCH(cur)"
+                } else {
+                    ""
+                };
+                println!("  {vname:16} {kname:12} ref {g1:02x}/{w1:02x}  cur {g2:02x}/{w2:02x}  {hit}");
+            }
+        }
+        // Independent of any CRC: does the CRC we compute over the plausible payloads
+        // appear ANYWHERE in the stream? That says the bits are right but placed wrongly.
+        {
+            let mut c = Crc::crc8();
+            for &b in bits.iter().take(108) {
+                c.add_bit(b & 1 == 1);
+            }
+            for _ in 0..4 {
+                c.add_bit(false);
+            }
+            let want = c.value() as u8;
+            let found = (0..bits.len().saturating_sub(8))
+                .find(|&i| {
+                    let mut v = 0u8;
+                    for j in 0..8 {
+                        v = (v << 1) | bits[i + j];
+                    }
+                    v == want
+                });
+            println!("  reference-CRC value {want:02x} found in the stream at {found:?} (none => bits differ, not just their placement)");
+        }
+        // Also: is the 4-bit field before the CRC actually zero, as the reference sets it?
+        if bits.len() >= 112 {
+            println!("  bits 108..112 = {:?}  (reference zeroes these; zero means the 4 bits are the untransmitted field)",
+                &bits[108..112]);
+        }
     }
 
     match Fac::parse(&bits) {

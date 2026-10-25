@@ -664,22 +664,125 @@ needs 120 or 192 kHz; the input is resampled to whatever the receiver is configu
   reference recordings. Mode E at 48 or 96 kHz is refused by `check_mode_rate`.
   `tests/mode_e_tx.rs` asserts the signal against those measurements.
 
-  *Receive: partial, and this is the open work.* The mode E loopback at 192 kHz decodes end
-  to end (FAC, SDC and multiplex frames) — `tests/mode_e_rx.rs`. Two bugs had to be found
+  *Receive: works* (2026-10-26). Every DRM+ recording in `refs/` decodes end to end —
+  FAC, SDC, multiplex frames and **xHE-AAC audio** — at both rates and down to 3 dB SNR.
+  The two mode E loopback tests in `tests/mode_e_rx.rs` that used to be ignored-passing or
+  failing now pass unignored. Two bugs had to be found
   for that: the MSC interleaver depth is **D = 6** for mode E (§7.6), not the 5 the code
   hardcoded, and the channel estimator's timing rotation must use the FFT size *at the
   working rate* (it used the 48 kHz one, 4× too small at 192 kHz). A third, in the PDS
   tracker's `ir_per_sample`, was the same class of mistake.
 
+  **The 120 kHz fault is solved by upsampling to 192 kHz** (2026-10-25). `examples/upsprobe.rs`
+  generates mode E at 120 kHz, converts it to 192 with `channel::resample::Resampler`
+  (ratio 1.6), and decodes at 192: **FAC 193, SDC 46 over 20 s**, against FAC 193, SDC 47
+  for the same signal generated and decoded natively at 192 — i.e. identical, where the
+  120 kHz receiver alone gives FAC 3, SDC 0. This is the intended design, not a workaround:
+  **JvanKatwijk's DRM+ decoder — which decodes these recordings — runs entirely at 192 kHz**
+  (`#define SAMPLE_RATE 192000`, a 192000-entry mixer table, and no input resampler at all).
+  It does not have a 120 kHz path. Mode E's 1.9 kHz carrier spacing over ±47.11 kHz is
+  comfortably inside 192 kHz's 96 kHz Nyquist, and the upsampling image of the band edge
+  (72.89 kHz) is 23 kHz clear of it, so the interpolation filter removes it.
+  **The consequence for DecDRM: convert 120 kHz input to 192 kHz and receive everything at
+  192.** A file at 120 kHz needs `rate × 1.6`; a live 120 kHz SDR needs the same. The native
+  120 kHz receive path can then be left alone — or removed — rather than debugged further.
+
   Still failing, in decreasing order of how well it is understood:
 
-  1. **Real DRM+ recordings do not decode** (`refs/`; FAC 0/681) although every in-memory
-     path passes. `examples/modee_real.rs` demodulates a recording with perfect timing and
-     shows the geometry, the 244 FAC cells and the 116 decoded bits are all correct, and
-     that the FAC cells land evenly on all four 4-QAM phases (worst error 16.6°) — so the
-     demodulation is right and the symbol-to-bit stage is not. Note this tool has **no
-     equaliser**, so it cannot decode a real recording at all; it bounds the demodulation
-     only, and its failure is not evidence about the receiver.
+  1. **Real DRM+ recordings did not decode — fixed** (2026-10-25 and 2026-10-26). All
+     eleven 192 kHz DRM+ recordings in `refs/` now decode end to end, audio included
+     (`decdrm rx <file> --drm-plus --format iq`, after mixing the +20 kHz carrier down —
+     `--example mixwav`):
+
+     | recording | MSC frames (ok) | audio frames ok |
+     |---|---|---|
+     | 4-QAM LPP0, 1 service | 307 (151) | 566 |
+     | 4-QAM LPP1 | 175 (85) | 398 |
+     | 4-QAM LPP2 | 271 (133) | 623 |
+     | 4-QAM LPP3 | 499 (247) | 1157 |
+     | 4-QAM LPP0, 3 dB AWGN | 283 (139) | 521 |
+     | 4-QAM LPP0, 6 dB AWGN | 283 (139) | 521 |
+     | 16-QAM LPP0, 1 service | 511 (253) | 1185 |
+     | 16-QAM LPP1 | 331 (163) | 1528 |
+     | 16-QAM LPP2 | 343 (169) | 1584 |
+     | 16-QAM LPP3 | 307 (150) | 1414 |
+     | 16-QAM LPP3, 4 services (2 xHE + 2 HE) | 535 (265) | 994 |
+
+     (About half the multiplex frames are counted before the long interleaver has filled,
+     which is the expected `D - 1` of them; the concealment count is 0-1 per file.)
+
+     Three further faults had to be found for the **audio** to come out, each invisible in
+     a DecDRM-to-DecDRM loopback because both ends made the same mistake:
+
+     - **The guard-correlation step was coarser than mode E's guard interval.** `timesync`
+       searches for the symbol boundary every `STEP` = 4 *decimated* samples; at 192 kHz
+       the decimation is 16, so that is 64 real samples, while mode E's guard is only **48**
+       (3 decimated). The correlation peak fell between grid points and the loop parked the
+       FFT window ~280 samples out — outside the guard, where the cyclic prefix no longer
+       covers the window and every data cell is wrong. Only the heavily protected FAC
+       survived, which is why this read as a signal-quality problem for so long, and why
+       whether it decoded at all depended on the transmit filter's group delay.
+       `timesync::step_for` now takes the fine step whenever `STEP` is wider than the mode's
+       decimated guard. *Measured: removing the transmit band-limiting filter had moved the
+       counts before (FAC 3 to 66); with this fix they rise at both rates without it
+       (FAC 77 of 77, SDC 19, MSC 75, bit-exact on a synthetic signal).*
+     - **The receiver's MSC decoder hardcoded mode B's protection tables.** `MlcParams::msc`
+       is fixed to `RobustnessMode::B`, and `rx/mscdec.rs` (and `tx/mod.rs`) called it, so
+       mode E's 16-QAM used table 30 instead of table 31 and its 4-QAM had no rates at all.
+       The rates differ at every level **except the last**, where both tables say 0.62 —
+       which is why 16-QAM LPP3 decoded while LPP0/1/2 came out as noise, and why the fault
+       looked like an equaliser problem. Both sides now call `MlcParams::msc_for(mode, ...)`.
+     - **The audio super frame spans two logical frames in mode E.** §5.3.1.0 and clause 6:
+       "For robustness mode E, the audio super frame is mapped onto two logical frames,
+       since the audio super frame is of twice the duration of the logical frame" — 200 ms
+       of xHE-AAC over two 100 ms multiplex frames. `AudioDeframer` was fed one logical frame
+       per multiplex frame as for A-D, so every xHE-AAC super frame was parsed from half its
+       bytes and failed. The two halves are not aligned to anything in the bits, so
+       `AudioDeframer::new_at(params, stream, mode)` now collects `super_frames_per_logical`
+       parts and finds the boundary by the super frame's own check — the fixed-header CRC-8
+       plus every directory element repeating the border count (§5.3.1.1-2), the same way the
+       rest of the stream is found.
+
+     The four coding faults fixed on 2026-10-25 were responsible for the FAC/SDC half, all in
+     the same place: **every field that the FAC's RM flag re-interprets was being read with
+     the RM-flag-0 table.** §6.3.3 says "the interpretation of [the interleaver depth, MSC
+     mode, SDC mode and toggle] is dependent on the value of the RM flag"; DecDRM read one
+     table for both modes. Each fault below was confirmed by reverting just that change and
+     watching the count collapse:
+
+     - **The occupancy field was read 4 bits wide.** §6.3.3's channel parameters are 20 bits
+       in *every* mode — occupancy is **3** bits — but the code read 4, swallowing the RM
+       flag as the value's top bit. Mode E's `1 000` became 8, not a valid occupancy, so
+       every real mode E frame was rejected (`FAC 0`). DecDRM's own transmitter wrote the
+       same wrong width, so only a loopback ever passed. *Reverting to the 4-bit read leaves
+       FAC at 1269 but MSC at 0.*
+     - **The MSC-mode field used the A–D table.** RM flag = 0 codes `00` 64-QAM / `11`
+       16-QAM; **RM flag = 1 codes `00` 16-QAM / `11` 4-QAM**. Reading the A–D table reports
+       each mode E signal one step high — a real 4-QAM file as 16-QAM, a real 16-QAM one as
+       64-QAM — and there was no 4-QAM MSC variant at all. `MscMode::from_bits` now takes the
+       flag and can return `None` for the reserved mode E codes.
+     - **The SDC-mode bit was treated as a constellation only.** In modes A–D it picks 16-QAM
+       or 4-QAM; in **mode E it is the SDC protection level** — `0` is 4-QAM at rate 1/2, `1`
+       at rate **1/4** (table 38). `MlcParams::sdc_for` was called with a hardcoded level 0 in
+       both places that build an SDC decoder, so a mode E SDC sent at rate 1/4 was decoded
+       with the wrong code rate and the CRC never passed. *Reverting this drops SDC to 0 and
+       MSC to 0.* `SdcMode::Qam4Rate25` carries the level, and `SdcMode::protection()` feeds
+       it through.
+     - **The Identity field was read as the frame index.** It encodes *position in the FAC
+       cycle*: `00`/`11` first, `01` intermediate, `10` last. Modes A–D have three frames and
+       one intermediate block, so identity == frame index works; **mode E has four frames and
+       two intermediate blocks, both `01`, told apart by the toggle flag** (§6.3.3: "zero for
+       the first and third FAC block and to one for the second and fourth"). The real signal
+       sends `{0|3} 01 01 10` with toggle `0 1 0 1`. Mapping identity straight through
+       mis-numbered frames 2 and 3 as 1 and 2, so the super frame restarted constantly and
+       the multiplex frame was never assembled. *Reverting this leaves FAC 1269 and SDC 316
+       but MSC 0* — the SDC gate is not the only consumer, the MSC assembler needs the count
+       to reach 3. `frame_index_of` now takes the toggle and the frame count, and
+       `identity_and_toggle` is its inverse for the transmitter.
+
+     `examples/modee_real.rs`'s earlier "FAC 0/681" reading was a symptom of the occupancy
+     width, not a demodulation fault: that tool has **no equaliser**, so its failure was never
+     evidence about the receiver's decoding.
   2. **A pinned mode did not establish its own frame alignment — fixed.** The file round trip
      looked like a signal problem (band limiting on gave FAC 0, off gave FAC 2-3) but is a
      timing one. Measured on the written files: the two are the **same signal shifted by ~415
@@ -717,8 +820,12 @@ needs 120 or 192 kHz; the input is resampled to whatever the receiver is configu
      re-acquire) rather than aligning first time; not emitting the transmit filter's warm-up
      would avoid the restart, but the receiver now survives it.
 
-  3. **120 kHz fails at the SDC step** (FAC 32, SDC 0) while 192 kHz passes. Not equaliser
-     tuning: a 25-combination sweep of the `TimeWiener` placeholders changed nothing.
+  3. **120 kHz reception — fixed** (2026-10-26), by the same guard-step fix as item 1: at
+     120 kHz the decimation is 10, so mode E's guard is 5 decimated samples against a
+     `STEP` of 4. `tests/mode_e_rx.rs::mode_e_loopback_at_120k` (which used to carry a long
+     list of measurements ruling out the equaliser) now passes unignored. The upsampling
+     note above is therefore no longer needed as a workaround, though it remains a valid
+     design choice — JvanKatwijk's decoder runs at 192 kHz only.
   4. `freqacq.rs` cannot find a mode E signal unaided — its detector hunts for the three
      DRM30 frequency-reference pilots at 750/2250/3000 Hz, and mode E defines none. So
      decoding a mode E file needs the mode to be pinned. A plateau/bandwidth detector is the
@@ -735,8 +842,11 @@ needs 120 or 192 kHz; the input is resampled to whatever the receiver is configu
      runs at DC, no frequency search).
 
   The `TimeWiener` `params(E)` filter length/Doppler pair and `freq_wiener_len(E)` are
-  **placeholders** copied from mode C, marked as such in the code. The 120 kHz sweep suggests
-  they are not the blocker, but they are unverified.
+  **placeholders** copied from mode C/D, marked as such in the code. They are demonstrably
+  not the blocker — a sweep of the frequency length from 3 to 21 taps on a synthetic signal
+  changed nothing, before and after the timing fix — but they are unverified, and the
+  graded recording sweep is the place to tune them (a lower protection level or more noise
+  would show it first).
 
   *Fixed in the form since the list above was written:* the sample-rate value was written to
   the TOML as a number where `RateSetting` needs a string (the saved file could not be read

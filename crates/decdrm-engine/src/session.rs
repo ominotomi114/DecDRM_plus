@@ -716,6 +716,12 @@ impl Session {
         out.push(SessionEvent::ServicesChanged);
     }
 
+    /// The robustness mode being received, as far as it is known (`mode` of the status:
+    /// the FAC cannot express mode E, so a pinned receiver is the only source there).
+    fn mode(&self) -> RobustnessMode {
+        self.status().mode.unwrap_or(RobustnessMode::B)
+    }
+
     /// (Re)create the audio pipeline for the selected service and a data pipeline for
     /// every application, keeping those whose parameters did not change.
     fn rebuild_pipelines(&mut self, out: &mut Vec<SessionEvent>) {
@@ -740,7 +746,7 @@ impl Session {
                 if !same {
                     self.audio = None;
                     if let Some(stream) = stream {
-                        match build_audio(short_id, &params, stream) {
+                        match build_audio(short_id, &params, stream, self.mode()) {
                             Ok(p) => {
                                 self.audio_stats =
                                     AudioStats { codec: p.decoder.describe(), ..AudioStats::default() };
@@ -1065,7 +1071,12 @@ fn app_name(app: UserApplication) -> String {
     }
 }
 
-fn build_audio(short_id: u8, params: &AudioParams, stream: StreamLengths) -> Result<AudioPipeline, String> {
+fn build_audio(
+    short_id: u8,
+    params: &AudioParams,
+    stream: StreamLengths,
+    mode: RobustnessMode,
+) -> Result<AudioPipeline, String> {
     let coding = match params.codec {
         AudioCodec::Aac => Some(DrmAudioCoding::Aac),
         AudioCodec::XheAac => Some(DrmAudioCoding::XheAac),
@@ -1074,7 +1085,7 @@ fn build_audio(short_id: u8, params: &AudioParams, stream: StreamLengths) -> Res
         AudioCodec::Encodec => return Err(decdrm_dac::ConfigError::Encodec.to_string()),
         AudioCodec::Reserved => return Err("reserved audio coding (CELP/HVXC are not supported)".into()),
     };
-    let deframer = AudioDeframer::new(params, stream).map_err(|e| e.to_string())?;
+    let deframer = AudioDeframer::new_at(params, stream, mode).map_err(|e| e.to_string())?;
     let decoder = match coding {
         Some(coding) => open_decoder(coding, &params.type9_bytes).map_err(|e| e.to_string())?,
         None => open_dac(params)?,
@@ -1227,7 +1238,7 @@ mod tests {
                 type9_bytes: info.to_type9_bytes(),
             };
             let mut session = Session::new(ReceiverConfig::default());
-            session.audio = Some(build_audio(0, &params, StreamLengths { part_a: 0, part_b: len }).unwrap());
+            session.audio = Some(build_audio(0, &params, StreamLengths { part_a: 0, part_b: len }, RobustnessMode::B).unwrap());
             (session, Self { enc, framer: Default::default(), len, t: 0 })
         }
 

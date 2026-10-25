@@ -697,4 +697,31 @@ mod tests {
             assert!((p.levels[0].rate_b_ratio() - want).abs() < 1e-12, "{m:?}");
         }
     }
+
+    /// Every level of an MSC block must produce exactly the coded bits its mapping
+    /// consumes (`coded_bits_per_level`); a short mask is silently zero-padded by
+    /// `MlcEncoder::encode`, which corrupts the block instead of failing.
+    #[test]
+    fn mode_e_msc_puncture_lengths_match_the_constellation() {
+        let cells = 7460;
+        for mapping in [Mapping::Qam4, Mapping::Qam16] {
+            for prot in 0..4usize {
+                let p = MlcParams::msc_for(
+                    RobustnessMode::E,
+                    mapping,
+                    cells,
+                    MscProtection { part_a: prot, part_b: prot, hierarchical: 0 },
+                    0,
+                );
+                let per = p.mapping.coded_bits_per_level(p.cells);
+                for (j, masks) in p.masks().iter().enumerate() {
+                    let got: usize = masks.iter().map(|m| m.count_ones() as usize).sum();
+                    assert_eq!(
+                        got, per,
+                        "{mapping:?} prot {prot} level {j}: {got} coded bits, mapping wants {per}"
+                    );
+                }
+            }
+        }
+    }
 }

@@ -874,13 +874,16 @@ pub struct MscModeSetting(pub MscMode);
 string_setting!(
     MscModeSetting,
     |s: &str| match norm(s).as_str() {
+        "4qam" | "qam4" | "qpsk" | "4" => Ok(MscModeSetting(MscMode::Qam4)),
         "16qam" | "qam16" | "16qamsm" | "16" => Ok(MscModeSetting(MscMode::Qam16Sm)),
         "64qam" | "qam64" | "64qamsm" | "64" | "sm" => Ok(MscModeSetting(MscMode::Qam64Sm)),
         "hmsym" | "64qamhmsym" | "qam64hmsym" => Ok(MscModeSetting(MscMode::Qam64HmSym)),
         "hmmix" | "64qamhmmix" | "qam64hmmix" => Ok(MscModeSetting(MscMode::Qam64HmMix)),
-        _ => Err(format!("unknown MSC mode \"{s}\" (use 16-QAM, 64-QAM, HMsym or HMmix)")),
+        _ => Err(format!("unknown MSC mode \"{s}\" (use 4-QAM, 16-QAM, 64-QAM, HMsym or HMmix)")),
     },
     |m: MscModeSetting| match m.0 {
+        // The 4-QAM MSC exists only in mode E (§8.1); the station form rejects it elsewhere.
+        MscMode::Qam4 => "4-QAM",
         MscMode::Qam16Sm => "16-QAM",
         MscMode::Qam64Sm => "64-QAM",
         MscMode::Qam64HmSym => "HMsym",
@@ -898,11 +901,13 @@ string_setting!(
     SdcModeSetting,
     |s: &str| match norm(s).as_str() {
         "4qam" | "qam4" | "qpsk" | "4" => Ok(SdcModeSetting(SdcMode::Qam4)),
+        "4qamr14" | "qam4r14" | "rate1/4" | "1/4" => Ok(SdcModeSetting(SdcMode::Qam4Rate25)),
         "16qam" | "qam16" | "16" => Ok(SdcModeSetting(SdcMode::Qam16)),
-        _ => Err(format!("unknown SDC mode \"{s}\" (use 4-QAM or 16-QAM)")),
+        _ => Err(format!("unknown SDC mode \"{s}\" (use 4-QAM, 16-QAM or 4-QAM rate 1/4)")),
     },
     |m: SdcModeSetting| match m.0 {
         SdcMode::Qam4 => "4-QAM",
+        SdcMode::Qam4Rate25 => "4-QAM rate 1/4",
         SdcMode::Qam16 => "16-QAM",
     }
     .to_string()

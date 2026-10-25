@@ -10,6 +10,7 @@
 //! mode E recording is decoded: its mode cannot be inferred from the 2-bit FAC field, and
 //! the acquisition search is still 48 kHz-bound.
 
+use decdrm_core::mux::Ensemble;
 use decdrm_core::params::{RobustnessMode, WorkingRate};
 use decdrm_core::rx::{InputFormat, Receiver, ReceiverConfig, ReceiverEvent};
 use std::io::Read;
@@ -90,7 +91,27 @@ fn main() {
         panic!("unsupported rate {khz} kHz (use 48, 96, 120 or 192)");
     };
 
-    let (wav_rate, ch, samples) = read_wav(path);
+    let (wav_rate, ch, mut samples) = read_wav(path);
+    // `DECDRM_DC_HZ`: shift the signal to baseband by hand. A pinned receiver runs at DC
+    // with no frequency search, so a recording whose DRM+ carrier sits off-centre cannot be
+    // found; this mixes it down so the rest of the chain can be exercised.
+    if let Ok(v) = std::env::var("DECDRM_DC_HZ") {
+        let hz: f64 = v.parse().unwrap_or(0.0);
+        let rate_hz = f64::from(wav_rate);
+        let n = samples.len() / ch;
+        let mut phase = 0.0f64;
+        let w = -2.0 * std::f64::consts::PI * hz / rate_hz;
+        for i in 0..n {
+            let (re, im) = (f64::from(samples[i * ch]), f64::from(samples[i * ch + 1]));
+            let (c, s) = (phase.cos(), phase.sin());
+            samples[i * ch] = (re * c - im * s) as f32;
+            samples[i * ch + 1] = (re * s + im * c) as f32;
+            phase += w;
+            if phase > std::f64::consts::PI { phase -= 2.0 * std::f64::consts::PI; }
+            else if phase < -std::f64::consts::PI { phase += 2.0 * std::f64::consts::PI; }
+        }
+        println!("mixed down by {hz:.0} Hz");
+    }
     println!("{path}: {wav_rate} Hz, {ch} ch, {} frames ({:.1} s)",
              samples.len() / ch, samples.len() as f64 / ch as f64 / wav_rate as f64);
     if wav_rate != rate.hz() {
@@ -119,6 +140,13 @@ fn main() {
     rms = (rms / (samples.len() / 97).max(1) as f64).sqrt();
     println!("input rms {rms:.4}");
 
+    // The MSC decoders need the multiplex description, which only exists once both the FAC
+    // and the SDC have been decoded — the `Ensemble` is that join, exactly as the engine's
+    // `Session` uses it. Without this the receiver has no `MscConfig` and never assembles a
+    // multiplex frame.
+    let mut ens = Ensemble::new();
+    let mut msc_cfg = None;
+
     let per_chunk = (rate.hz() / 10) as usize * ch; // 100 ms
     let (mut fac_ok, mut fac_bad, mut sdc_ok, mut msc_ok) = (0, 0, 0, 0);
     let mut modes = Vec::new();
@@ -138,6 +166,12 @@ fn main() {
                 }
                 ReceiverEvent::Fac(f) => {
                     fac_ok += 1;
+                    ens.update_fac(&f);
+                    let cfg = ens.msc_config();
+                    if cfg != msc_cfg {
+                        msc_cfg = cfg;
+                        rx.set_msc_config(cfg);
+                    }
                     if fac_ok <= 2 || fac_ok % 50 == 0 {
                         println!("{t:7.2}s FAC ok: {:?} occupancy {} services {}",
                                  f.channel, f.channel.occupancy.value(), f.channel.num_audio);
@@ -154,6 +188,12 @@ fn main() {
                 ReceiverEvent::Sdc(b) => {
                     if b.crc_ok {
                         sdc_ok += 1;
+                        ens.update_sdc(&b.data);
+                        let cfg = ens.msc_config();
+                        if cfg != msc_cfg {
+                            msc_cfg = cfg;
+                            rx.set_msc_config(cfg);
+                        }
                         if sdc_ok <= 2 {
                             println!("{t:7.2}s SDC ok: {} bytes, afs index {}", b.data.len(), b.afs_index);
                         }
