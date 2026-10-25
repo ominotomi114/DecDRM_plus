@@ -12,9 +12,9 @@ use std::f64::consts::PI;
 
 /// Classification of one OFDM cell. Several pilot flags can be set at once (e.g. a
 /// time reference that falls on a gain reference position), so this is a small bit
-/// set rather than an enum.
+/// set rather than an enum. `u16` because the nine flags no longer fit a byte.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct CellType(u8);
+pub struct CellType(u16);
 
 impl CellType {
     pub const DC: Self = Self(1);
@@ -25,6 +25,8 @@ impl CellType {
     pub const FREQ_PILOT: Self = Self(32);
     pub const SCAT_PILOT: Self = Self(64);
     pub const BOOSTED: Self = Self(128);
+    /// AFS reference cell (mode E only, §8.4.5).
+    pub const AFS_PILOT: Self = Self(256);
 
     pub const fn contains(self, other: Self) -> bool {
         self.0 & other.0 != 0
@@ -46,7 +48,12 @@ impl CellType {
         self.0 & (Self::MSC.0 | Self::SDC.0 | Self::FAC.0) != 0
     }
     pub const fn is_pilot(self) -> bool {
-        self.0 & (Self::TIME_PILOT.0 | Self::FREQ_PILOT.0 | Self::SCAT_PILOT.0) != 0
+        self.0
+            & (Self::TIME_PILOT.0 | Self::FREQ_PILOT.0 | Self::SCAT_PILOT.0 | Self::AFS_PILOT.0)
+            != 0
+    }
+    pub const fn is_afs(self) -> bool {
+        self.contains(Self::AFS_PILOT)
     }
     pub const fn is_scattered(self) -> bool {
         self.contains(Self::SCAT_PILOT)
@@ -197,6 +204,23 @@ impl CellMap {
                     pilots[idx] = polar_1024(PILOT_POWER.sqrt(), phase);
                 }
 
+                // AFS references, mode E only (§8.4.5.1): super-frame symbols 4 and 159.
+                // They clear the SDC/MSC classification — they are control cells, and the
+                // spec's cell counts (936 SDC, 7460 MSC) only come out if they are
+                // excluded. Where one coincides with a scattered pilot the phase is the
+                // AFS one and the amplitude stays the gain reference's (note under table
+                // 61), so `pilots` is left alone in that case; elsewhere the gain is 1.0
+                // (§8.4.5.2).
+                if let Some(&(_, afs_phase)) =
+                    tables::afs_cells(mode, sym as u8).iter().find(|&&(ak, _)| i32::from(ak) == k)
+                {
+                    let shared = ty.is_scattered() || ty.is_time_pilot() || ty.is_freq_pilot();
+                    ty = if shared { ty | CellType::AFS_PILOT } else { CellType::AFS_PILOT };
+                    if !shared {
+                        pilots[idx] = polar_1024(1.0, i32::from(afs_phase));
+                    }
+                }
+
                 // Unused carriers (overrides pilots, e.g. mode D gain refs at k = 0).
                 // Mode E leaves none unused (§8.3.1, table 50), so this must not fire there.
                 if !mode.is_drm_plus()
@@ -302,6 +326,25 @@ impl CellMap {
         &self.cells[sym * self.num_carriers..(sym + 1) * self.num_carriers]
     }
 
+    /// Row of cell types of frame `frame`'s symbol `s`.
+    ///
+    /// The receiver counts symbols modulo the frame (`framesync`'s counter wraps at
+    /// `symbols_per_frame`), but the map spans a whole super frame. For modes A–D every
+    /// frame's rows are identical, so the two coincide; **mode E is not frame-periodic**
+    /// — its AFS references sit at super-frame symbols 4 and 159 only (§8.4.5) — so a
+    /// receiver that indexes the map by its frame-relative symbol reads the wrong row.
+    /// This is the lookup callers with a frame-relative symbol must use.
+    pub fn frame_cell_row(&self, frame: usize, s: usize) -> &[CellType] {
+        let super_symbol = (frame % self.layout.mode.frames_per_superframe()) * self.symbols_per_frame + s;
+        self.symbol_cells(super_symbol)
+    }
+
+    /// Reference values of frame `frame`'s symbol `s` (see [`Self::frame_cell_row`]).
+    pub fn frame_pilot_row(&self, frame: usize, s: usize) -> &[Cplx] {
+        let super_symbol = (frame % self.layout.mode.frames_per_superframe()) * self.symbols_per_frame + s;
+        self.symbol_pilots(super_symbol)
+    }
+
     /// Row of pilot values for one super-frame symbol.
     pub fn symbol_pilots(&self, sym: usize) -> &[Cplx] {
         &self.pilots[sym * self.num_carriers..(sym + 1) * self.num_carriers]
@@ -368,16 +411,76 @@ mod tests {
     #[test]
     fn known_cell_counts() {
         use RobustnessMode::*;
-        let expected: [(RobustnessMode, u8, usize, usize); 16] = [
+        let expected: [(RobustnessMode, u8, usize, usize); 17] = [
             (A, 0, 1259, 167), (A, 1, 1422, 190), (A, 2, 2632, 359), (A, 3, 2959, 405),
             (A, 4, 5464, 754), (A, 5, 6118, 846), (B, 0, 966, 130), (B, 1, 1110, 150),
             (B, 2, 2051, 282), (B, 3, 2337, 322), (B, 4, 4249, 588), (B, 5, 4774, 662),
             (C, 3, 1844, 288), (C, 5, 3867, 607), (D, 3, 1226, 152), (D, 5, 2606, 332),
+            // Mode E, occupancy 0 (tables 45 and 25). These are 10 and 41 below the raw
+            // count of non-pilot cells: the AFS references at super-frame symbols 4 and
+            // 159 take that many cells out of the MSC and SDC (§8.4.5).
+            (E, 0, 7460, 936),
         ];
         for (m, so, n_mux, n_sdc) in expected {
             let map = CellMap::new(m, SpectrumOccupancy::new(so).unwrap()).unwrap();
             assert_eq!(map.msc_cells_per_frame, n_mux, "{}", map.layout);
             assert_eq!(map.sdc_cells_per_superframe, n_sdc, "{}", map.layout);
+        }
+    }
+
+    /// The AFS references exist only in mode E, only at super-frame symbols 4 and 159,
+    /// on every fourth carrier, and 13 of them share a gain reference exactly where
+    /// table 61 marks them with an asterisk.
+    #[test]
+    fn afs_references_are_where_the_standard_puts_them() {
+        use RobustnessMode::*;
+        // No mode A–D defines AFS cells at all.
+        for so in SpectrumOccupancy::ALL {
+            for m in [A, B, C, D] {
+                if let Some(map) = CellMap::new(m, so) {
+                    for sym in 0..map.symbols_per_superframe {
+                        for c in 0..map.num_carriers {
+                            assert!(!map.cell(sym, c).is_afs(), "{m} {so} sym {sym}");
+                        }
+                    }
+                }
+            }
+        }
+
+        // `c` is the carrier offset k − Kmin (§conventions); `carrier_index` maps back.
+        let map = CellMap::new(E, SpectrumOccupancy::SO_0).unwrap();
+        let (kmin, kmax) = map.layout.carrier_range();
+        for sym in 0..map.symbols_per_superframe {
+            for c in 0..map.num_carriers {
+                let t = map.cell(sym, c);
+                if t.is_afs() {
+                    // AFS cells exist only at symbols 4 and 159, and only on carriers
+                    // where the AFS grid falls.
+                    assert!(matches!(sym, 4 | 159), "sym {sym} c {c}");
+                    assert_eq!((map.carrier_index(c) - kmin).rem_euclid(4), 0, "sym {sym} c {c}");
+                    // An AFS cell is a control cell, never data.
+                    assert!(!t.is_msc() && !t.is_sdc() && !t.is_fac());
+                } else if matches!(sym, 4 | 159) {
+                    assert_ne!((map.carrier_index(c) - kmin).rem_euclid(4), 0, "sym {sym} c {c}");
+                }
+            }
+        }
+        for sym in [4usize, 159] {
+            let afs: Vec<i32> = (0..map.num_carriers)
+                .filter(|&c| map.cell(sym, c).is_afs())
+                .map(|c| map.carrier_index(c))
+                .collect();
+            assert_eq!(afs.len(), 54, "sym {sym}");
+            // Every fourth carrier, starting at Kmin.
+            assert!(afs.iter().all(|k| (k - kmin) % 4 == 0), "sym {sym}: {afs:?}");
+            assert_eq!(*afs.last().unwrap(), kmax, "sym {sym}");
+            let shared = (0..map.num_carriers)
+                .filter(|&c| {
+                    let t = map.cell(sym, c);
+                    t.is_afs() && t.is_scattered()
+                })
+                .count();
+            assert_eq!(shared, 13, "sym {sym}");
         }
     }
 
@@ -391,6 +494,11 @@ mod tests {
                     if ty.is_pilot() && !ty.is_dc() {
                         let want = if ty.is_boosted() && !ty.is_freq_pilot() && !ty.is_time_pilot() {
                             4.0
+                        } else if ty.is_afs() && !ty.is_scattered() {
+                            // AFS cells are unboosted: gain 1.0 (§8.4.5.2). Where one
+                            // coincides with a gain reference the amplitude stays the
+                            // gain reference's (note under table 61), so 2.0 there.
+                            1.0
                         } else {
                             2.0
                         };

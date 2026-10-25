@@ -421,11 +421,58 @@ pub const DATA_CELL_POWER: f64 = 1.0;
 pub const PILOT_POWER: f64 = 2.0;
 pub const BOOSTED_PILOT_POWER: f64 = 4.0;
 
+/// AFS reference cells of robustness mode E (§8.4.5, table 61), by **super-frame**
+/// OFDM symbol: s = 4 (fifth symbol of the first frame) and s = 39 of the fourth frame,
+/// i.e. super-frame index 3·40 + 39 = 159. Carriers are every fourth one (k ≡ 2 mod 4),
+/// 54 in all.
+///
+/// These cells are AFS *and* gain references at once where they coincide with a
+/// scattered pilot (13 of the 54; the note under table 61), so the phase is the AFS
+/// one and the amplitude the gain reference's. They are therefore neither SDC nor MSC
+/// cells — ignoring them left mode E with 977 SDC cells instead of the standard's 936
+/// and 7470 MSC cells instead of 7460 (table 25, table 45), which is why the DRM+ SDC
+/// never decoded.
+pub const fn afs_cells(mode: RobustnessMode, super_symbol: u8) -> &'static [(i16, u16)] {
+    if !matches!(mode, RobustnessMode::E) {
+        return &[];
+    }
+    match super_symbol {
+        4 => &AFS_S4,
+        // s = 39 of the fourth frame (§8.4.5.0).
+        159 => &AFS_S39,
+        _ => &[],
+    }
+}
+
+/// Phase of the AFS cells at symbol 4 (§8.4.5.1, table 61).
+static AFS_S4: [(i16, u16); 54] = [
+    (-106, 134), (-102, 866), (-98, 588), (-94, 325), (-90, 77), (-86, 868), (-82, 649),
+    (-78, 445), (-74, 256), (-70, 82), (-66, 946), (-62, 801), (-58, 671), (-54, 556),
+    (-50, 455), (-46, 369), (-42, 298), (-38, 242), (-34, 200), (-30, 173), (-26, 161),
+    (-22, 164), (-18, 181), (-14, 213), (-10, 260), (-6, 322), (-2, 398), (2, 489), (6, 595),
+    (10, 716), (14, 851), (18, 1001), (22, 142), (26, 322), (30, 516), (34, 725), (38, 949),
+    (42, 164), (46, 417), (50, 685), (54, 968), (58, 242), (62, 554), (66, 881), (70, 199),
+    (74, 556), (78, 927), (82, 289), (86, 690), (90, 82), (94, 512), (98, 957), (102, 393),
+    (106, 868),
+];
+
+/// Phase of the AFS cells at symbol 39 (§8.4.5.1, table 61). Symmetric about k = −2.
+static AFS_S39: [(i16, u16); 54] = [
+    (-106, 115), (-102, 135), (-98, 194), (-94, 293), (-90, 431), (-86, 608), (-82, 825),
+    (-78, 57), (-74, 353), (-70, 688), (-66, 38), (-62, 452), (-58, 905), (-54, 373),
+    (-50, 905), (-46, 452), (-42, 39), (-38, 689), (-34, 354), (-30, 59), (-26, 827),
+    (-22, 610), (-18, 433), (-14, 295), (-10, 197), (-6, 138), (-2, 118), (2, 138), (6, 197),
+    (10, 295), (14, 433), (18, 610), (22, 827), (26, 59), (30, 354), (34, 689), (38, 39),
+    (42, 452), (46, 905), (50, 373), (54, 905), (58, 452), (62, 38), (66, 688), (70, 353),
+    (74, 57), (78, 825), (82, 608), (86, 431), (90, 293), (94, 194), (98, 135), (102, 115),
+    (106, 134),
+];
+
 // ---------------------------------------------------------------------------------
 // Channel coding (§7.3)
 // ---------------------------------------------------------------------------------
 
-/// Constraint length of the DRM convolutional mother code (rate 1/4).
+/// Constraint length of the DRM convolutional mother code (rate 1/6, §7.3.2).
 pub const CONSTRAINT_LENGTH: usize = 7;
 
 /// Number of trellis states.
@@ -433,16 +480,32 @@ pub const NUM_STATES: usize = 1 << (CONSTRAINT_LENGTH - 1);
 
 /// Generator polynomials of the mother code, as tap masks over the shift register
 /// where bit `i` holds the input bit delayed by `i` (bit 0 = current input).
-/// The standard gives them as octal 133, 171, 145, 133 with the current input as the
-/// most significant tap; these are the bit-reversed forms (Dream's `byGeneratorMatrix`).
-pub const GENERATORS: [u8; 4] = [0o155, 0o117, 0o123, 0o155];
+/// The standard gives them as octal 133, 171, 145, 133, 171, 145 with the current input
+/// as the most significant tap; these are the bit-reversed forms (Dream's
+/// `byGeneratorMatrix`). The mother code is rate **1/6** (§7.3.2): outputs b₃..b₅ repeat
+/// the polynomials of b₀..b₂, and only the 1/6 rate keeps them. Every rate modes A–D use
+/// punctures them away, which is why four generators sufficed until mode E needed 1/6
+/// (its 16-QAM protection level 0, table 31).
+pub const GENERATORS: [u8; NUM_MOTHER_OUTPUTS] =
+    [0o155, 0o117, 0o123, 0o155, 0o117, 0o123];
+
+/// Outputs of the rate-1/6 mother code (§7.3.2). The puncturing masks are `u8`, so all
+/// six fit in one mask.
+pub const NUM_MOTHER_OUTPUTS: usize = 6;
 
 /// Which of the four mother-code outputs b0..b3 are transmitted for one input bit.
 /// Bit `i` of the mask set ⇒ output `b_i` is kept (Dream's `PP_TYPE_*`).
 pub type PunctureMask = u8;
 
-/// The 13 code rates used by DRM, index 0..=12 (§7.3.1, table 66):
+/// The code rates used by DRM, index 0..=12 (§7.3.1, table 27):
 /// 1/4, 3/10, 1/3, 4/11, 1/2, 4/7, 3/5, 2/3, 8/11, 3/4, 4/5, 7/8, 8/9.
+///
+/// Indices 0..=12 are the rates modes A–D use and must not move: they are what the SDC
+/// and FAC signal, and [`MSC16_SM`] and friends are index tables into them.
+///
+/// Robustness mode E additionally uses **1/6** and **2/5** (tables 29 and 31), which
+/// modes A–D never do. They are appended at [`RATE_1_6`] and [`RATE_2_5`] so the existing
+/// numbering stays put — the two extra rates are reached by name, not by index.
 #[derive(Debug, Clone, Copy)]
 pub struct CodeRate {
     /// Numerator RX (input bits per puncturing period).
@@ -459,13 +522,18 @@ impl CodeRate {
     }
 }
 
-const P1111: PunctureMask = 0b1111;
+const P111111: PunctureMask = 0b111111;
 const P0111: PunctureMask = 0b0111;
 const P0011: PunctureMask = 0b0011;
 const P0001: PunctureMask = 0b0001;
 const P0101: PunctureMask = 0b0101;
+const P1111: PunctureMask = 0b1111;
+/// 2/5, first of the two input bits: b₀ b₁ b₂ (table 27).
+const P111000: PunctureMask = 0b000111;
+/// 2/5, second input bit: b₀ b₁ only.
+const P110000: PunctureMask = 0b000011;
 
-pub const CODE_RATES: [CodeRate; 13] = [
+pub const CODE_RATES: [CodeRate; 15] = [
     CodeRate { rx: 1, ry: 4, pattern: &[P1111] },
     CodeRate { rx: 3, ry: 10, pattern: &[P1111, P0111, P0111] },
     CodeRate { rx: 1, ry: 3, pattern: &[P0111] },
@@ -487,7 +555,17 @@ pub const CODE_RATES: [CodeRate; 13] = [
         ry: 9,
         pattern: &[P0011, P0001, P0001, P0001, P0001, P0001, P0001, P0001],
     },
+    // 1/6 — the unpunctured mother code, all six outputs. Mode E 16-QAM level 0
+    // (table 31: R₀ = 1/6); modes A–D never use it.
+    CodeRate { rx: 1, ry: 6, pattern: &[P111111] },
+    // 2/5 — mode E 4-QAM protection level 2 (table 29: R₀ = 2/5). Modes A–D never use it.
+    CodeRate { rx: 2, ry: 5, pattern: &[P111000, P110000] },
 ];
+
+/// Index of the 1/6 mother rate in [`CODE_RATES`] (mode E 16-QAM level 0).
+pub const RATE_1_6: usize = 13;
+/// Index of the 2/5 rate in [`CODE_RATES`] (mode E 4-QAM protection level 2).
+pub const RATE_2_5: usize = 14;
 
 /// Puncturing patterns for the six tail bits, selected by
 /// `r_p = (2·N₂ − 12) − RY·⌊(2·N₂ − 12)/RY⌋` (§7.3.1, table 68).
@@ -510,6 +588,31 @@ pub const TAIL_PATTERNS: [[PunctureMask; 6]; 12] = [
 /// (§7.5.1, table 70).
 pub const MSC16_SM: [([usize; 2], usize); 2] = [([2, 7], 3), ([4, 9], 4)];
 
+/// MSC 16-QAM code-rate indices for robustness mode E: [R0, R1] and RYlcm, protection
+/// levels 0..=3 (table 31). Levels 2 and 3 are the same rates as [`MSC16_SM`]'s two
+/// levels — mode E simply adds the two more-robust ones above them (1/6 and 1/4).
+///
+/// R₀ = 1/6 is the **unpunctured mother code**, so these are the only mode E levels that
+/// keep mother outputs b₄ and b₅ (see [`GENERATORS`]).
+pub const MSC16_SM_E: [([usize; 2], usize); 4] =
+    [([RATE_1_6, 4], 6), ([0, 5], 28), ([2, 7], 3), ([4, 9], 4)];
+
+/// MSC 4-QAM code-rate indices for robustness mode E, protection levels 0..=3
+/// (table 29: R₀ = 1/4, 1/3, 2/5, 1/2). There is one level, so the whole rate is
+/// that level's rate and no RYlcm is needed.
+pub const MSC4_E: [usize; 4] = [0, 2, RATE_2_5, 4];
+
+/// SDC 16-QAM code-rate indices [R0, R1] (overall rate 0.5).
+pub const SDC16_RATES: [usize; 2] = [2, 7];
+/// SDC 4-QAM code-rate index for modes A–D (rate 0.5).
+pub const SDC4_RATE: usize = 4;
+/// SDC 4-QAM code rates for robustness mode E, protection levels 0..=1
+/// (table 38: 0.5 and 0.25). The FAC's SDC-mode bit selects between them.
+pub const SDC4_E: [usize; 2] = [4, 0];
+/// FAC 4-QAM code-rate index (rate 0.6).
+/// FAC code-rate index for modes A-D (3/5). Mode E uses 1/4: see `fec::mlc::fac_rate_index`.
+pub const FAC_RATE: usize = 6;
+
 /// MSC 64-QAM SM code-rate indices per protection level: [R0, R1, R2] and RYlcm
 /// (§7.5.1, table 71).
 pub const MSC64_SM: [([usize; 3], usize); 4] =
@@ -527,14 +630,6 @@ pub const MSC64_HMMIX: [([usize; 6], usize); 4] = [
     ([6, 4, 5, 9, 11, 11], 56),
     ([7, 7, 7, 10, 12, 12], 45),
 ];
-
-/// SDC 16-QAM code-rate indices [R0, R1] (overall rate 0.5).
-pub const SDC16_RATES: [usize; 2] = [2, 7];
-/// SDC 4-QAM code-rate index (rate 0.5).
-pub const SDC4_RATE: usize = 4;
-/// FAC 4-QAM code-rate index (rate 0.6).
-/// FAC code-rate index for modes A-D (3/5). Mode E uses 1/4: see `fec::mlc::fac_rate_index`.
-pub const FAC_RATE: usize = 6;
 
 /// Bit-interleaver constants t₀ for the two interleaver types (§7.3.3).
 pub const BIT_INTERLEAVER_T0: [usize; 2] = [13, 21];

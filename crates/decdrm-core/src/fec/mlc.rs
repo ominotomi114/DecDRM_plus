@@ -13,8 +13,8 @@ use super::BitMetric;
 use crate::Cplx;
 use crate::params::RobustnessMode;
 use crate::tables::{
-    BIT_INTERLEAVER_T0, CODE_RATES, MSC16_SM, MSC64_HMMIX, MSC64_HMSYM, MSC64_SM,
-    num_fac_cells, PunctureMask, SDC4_RATE, SDC16_RATES,
+    BIT_INTERLEAVER_T0, CODE_RATES, MSC16_SM, MSC16_SM_E, MSC4_E, MSC64_HMMIX, MSC64_HMSYM,
+    MSC64_SM, num_fac_cells, PunctureMask, SDC4_E, SDC4_RATE, SDC16_RATES,
 };
 
 /// Number of FAC information bits per frame (incl. CRC) (§7.2.1.2): 72 for robustness
@@ -57,6 +57,13 @@ pub struct LevelParams {
     pub rate_b: usize,
     /// Bit interleaver type (index into `BIT_INTERLEAVER_T0`), if any.
     pub interleaver: Option<usize>,
+}
+
+impl LevelParams {
+    /// The part B (lower protected) code rate, RX/RY.
+    pub fn rate_b_ratio(&self) -> f64 {
+        rate_of(self.rate_b)
+    }
 }
 
 /// Full MLC configuration of one logical channel (FAC, SDC or MSC frame).
@@ -117,17 +124,32 @@ impl MlcParams {
         }
     }
 
-    /// SDC with 4-QAM (R = 0.5) or 16-QAM (R = 0.5) over `n_sdc` cells.
+    /// SDC with 4-QAM (R = 0.5) or 16-QAM (R = 0.5) over `n_sdc` cells. Modes A–D only;
+    /// robustness mode E selects between two 4-QAM rates, so use [`Self::sdc_for`].
     pub fn sdc(mapping: Mapping, n_sdc: usize) -> Self {
+        Self::sdc_for(RobustnessMode::B, mapping, n_sdc, 0)
+    }
+
+    /// SDC over `n_sdc` cells in `mode` (§7.5.2). Modes A–D use 16-QAM or 4-QAM, both at
+    /// rate 0.5; mode E uses 4-QAM at rate 0.5 or 0.25 (table 38), `protection` picking
+    /// the level.
+    pub fn sdc_for(mode: RobustnessMode, mapping: Mapping, n_sdc: usize, protection: usize) -> Self {
         let coded = 2 * n_sdc as i64 - 12;
         let levels = match mapping {
-            Mapping::Qam4 => vec![LevelParams {
-                bits_a: 0,
-                bits_b: floor_bits(SDC4_RATE, coded),
-                rate_a: 0,
-                rate_b: SDC4_RATE,
-                interleaver: Some(1),
-            }],
+            Mapping::Qam4 => {
+                let rate = if mode == RobustnessMode::E {
+                    SDC4_E[protection.min(1)]
+                } else {
+                    SDC4_RATE
+                };
+                vec![LevelParams {
+                    bits_a: 0,
+                    bits_b: floor_bits(rate, coded),
+                    rate_a: 0,
+                    rate_b: rate,
+                    interleaver: Some(1),
+                }]
+            }
             Mapping::Qam16 => SDC16_RATES
                 .iter()
                 .enumerate()
@@ -156,9 +178,24 @@ impl MlcParams {
         }
     }
 
-    /// MSC over `n_mux` cells. `part_a_bytes` is the total length of the higher
-    /// protected parts of all streams (bytes per multiplex frame).
+    /// MSC over `n_mux` cells, robustness modes A–D: 16-QAM or 64-QAM. `part_a_bytes`
+    /// is the total length of the higher protected parts of all streams (bytes per
+    /// multiplex frame). For mode E use [`Self::msc_for`], which also allows 4-QAM.
     pub fn msc(mapping: Mapping, n_mux: usize, prot: MscProtection, part_a_bytes: usize) -> Self {
+        debug_assert_ne!(mapping, Mapping::Qam4, "DRM30 MSC does not use 4-QAM; use msc_for");
+        Self::msc_for(RobustnessMode::B, mapping, n_mux, prot, part_a_bytes)
+    }
+
+    /// MSC over `n_mux` cells in `mode` (§7.5.1). Robustness mode E additionally allows
+    /// **4-QAM** and has its own protection tables (tables 29 and 31, four levels each);
+    /// modes A–D use 16- and 64-QAM with two and four levels (tables 30 and 32).
+    pub fn msc_for(
+        mode: RobustnessMode,
+        mapping: Mapping,
+        n_mux: usize,
+        prot: MscProtection,
+        part_a_bytes: usize,
+    ) -> Self {
         let x = 8.0 * part_a_bytes as f64;
         // N₁ = ⌈8X / (k·RYlcm·ΣR_p)⌉ · RYlcm, with k = 2 (1 for HMmix).
         let n1_for = |rates: &[usize], rylcm: usize, k: f64| -> usize {
@@ -176,15 +213,41 @@ impl MlcParams {
         };
 
         let (n1, levels, tail_rule, vspp) = match mapping {
+            // 4-QAM: a single level (Pmax = 1), so part A and part B are the same level's
+            // two parts and each carries its own rate (mode E only — table 29).
+            Mapping::Qam4 => {
+                let ra = MSC4_E[prot.part_a.min(3)];
+                let rb = MSC4_E[prot.part_b.min(3)];
+                // A single level has no RYlcm; the period of its own rate plays that role.
+                let rylcm = CODE_RATES[ra].ry;
+                let n1 = n1_for(&[ra], rylcm, 2.0);
+                let n2 = n_mux - n1;
+                let levels = vec![LevelParams {
+                    bits_a: (2.0 * n1 as f64 * rate_of(ra)) as usize,
+                    bits_b: floor_bits(rb, 2 * n2 as i64 - 12),
+                    rate_a: ra,
+                    rate_b: rb,
+                    interleaver: il(0),
+                }];
+                (n1, levels, TailRule::Standard, 0)
+            }
             Mapping::Qam16 | Mapping::Qam64Sm => {
-                let (ra, rb, rylcm): (Vec<usize>, Vec<usize>, usize) = if mapping == Mapping::Qam16 {
-                    let a = MSC16_SM[prot.part_a.min(1)];
-                    let b = MSC16_SM[prot.part_b.min(1)];
-                    (a.0.to_vec(), b.0.to_vec(), a.1)
-                } else {
-                    let a = MSC64_SM[prot.part_a.min(3)];
-                    let b = MSC64_SM[prot.part_b.min(3)];
-                    (a.0.to_vec(), b.0.to_vec(), a.1)
+                let (ra, rb, rylcm): (Vec<usize>, Vec<usize>, usize) = match mapping {
+                    Mapping::Qam16 if mode == RobustnessMode::E => {
+                        let a = MSC16_SM_E[prot.part_a.min(3)];
+                        let b = MSC16_SM_E[prot.part_b.min(3)];
+                        (a.0.to_vec(), b.0.to_vec(), a.1)
+                    }
+                    Mapping::Qam16 => {
+                        let a = MSC16_SM[prot.part_a.min(1)];
+                        let b = MSC16_SM[prot.part_b.min(1)];
+                        (a.0.to_vec(), b.0.to_vec(), a.1)
+                    }
+                    _ => {
+                        let a = MSC64_SM[prot.part_a.min(3)];
+                        let b = MSC64_SM[prot.part_b.min(3)];
+                        (a.0.to_vec(), b.0.to_vec(), a.1)
+                    }
                 };
                 let n1 = n1_for(&ra, rylcm, 2.0);
                 let n2 = n_mux - n1;
@@ -249,7 +312,6 @@ impl MlcParams {
                 let vspp = levels[0].bits_b;
                 (n1, levels, TailRule::HmMix, vspp)
             }
-            Mapping::Qam4 => panic!("DRM30 MSC does not use 4-QAM"),
         };
 
         let first = if vspp > 0 { 1 } else { 0 };
@@ -555,6 +617,84 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    /// Every mode E MSC combination must round-trip: 4-QAM and 16-QAM, all four
+    /// protection levels of tables 29 and 31, both EEP and UEP. Level 0 of the 16-QAM
+    /// table uses the unpunctured 1/6 mother code, and 4-QAM level 2 uses 2/5, so this
+    /// is what covers the two rates modes A–D never exercise.
+    #[test]
+    fn msc_roundtrip_mode_e_all_protections() {
+        let map = CellMap::new(RobustnessMode::E, SpectrumOccupancy::SO_0).unwrap();
+        let n = map.msc_cells_per_frame;
+        for mapping in [Mapping::Qam4, Mapping::Qam16] {
+            for pa in 0..4 {
+                for pb in 0..4 {
+                    for part_a in [0usize, 60, 400] {
+                        let prot = MscProtection { part_a: pa, part_b: pb, hierarchical: 0 };
+                        let p = MlcParams::msc_for(RobustnessMode::E, mapping, n, prot, part_a);
+                        check_params(&p).unwrap();
+                        roundtrip(p, 1);
+                    }
+                }
+            }
+        }
+    }
+
+    /// The mode E rates against the standard's own capacity annex (table J.5): for each
+    /// published rate, the MLC's information bits per multiplex frame must equal the
+    /// number the spec states. This checks the rate tables, the level split, the N₁/N₂
+    /// formulas and RYlcm together — a misread rate or a wrong RYlcm cannot reproduce
+    /// all eight numbers.
+    #[test]
+    fn mode_e_rates_match_the_spec_capacity_table() {
+        let map = CellMap::new(RobustnessMode::E, SpectrumOccupancy::SO_0).unwrap();
+        let n_mux = map.msc_cells_per_frame;
+        assert_eq!(n_mux, 7460, "table 45");
+        let want: [(Mapping, usize, usize); 8] = [
+            (Mapping::Qam16, 0, 9_938),
+            (Mapping::Qam16, 1, 12_243),
+            (Mapping::Qam16, 2, 14_907),
+            (Mapping::Qam16, 3, 18_635),
+            (Mapping::Qam4, 0, 3_727),
+            (Mapping::Qam4, 1, 4_969),
+            (Mapping::Qam4, 2, 5_962),
+            (Mapping::Qam4, 3, 7_454),
+        ];
+        for (mapping, level, expected) in want {
+            // EEP: one protection level, so part A is absent and part B is the whole frame.
+            let prot = MscProtection { part_a: 0, part_b: level, hierarchical: 0 };
+            let p = MlcParams::msc_for(RobustnessMode::E, mapping, n_mux, prot, 0);
+            assert_eq!(p.n1, 0, "EEP must have no part A");
+            assert_eq!(
+                p.total_bits(),
+                expected,
+                "{mapping:?} level {level} ({:.3})",
+                p.levels[0].rate_b_ratio()
+            );
+        }
+    }
+
+    /// The SDC's two mode E 4-QAM rates against table J.10 (930 and 465 bits).
+    #[test]
+    fn mode_e_sdc_rates_match_the_spec_capacity_table() {
+        let map = CellMap::new(RobustnessMode::E, SpectrumOccupancy::SO_0).unwrap();
+        let n_sdc = map.sdc_cells_per_superframe;
+        assert_eq!(n_sdc, 936, "table 25");
+        for (level, expected) in [(0usize, 930usize), (1, 465)] {
+            let p = MlcParams::sdc_for(RobustnessMode::E, Mapping::Qam4, n_sdc, level);
+            assert_eq!(p.total_bits(), expected, "SDC protection level {level}");
+        }
+    }
+
+    /// The FAC's fixed rate per mode (§7.5.3): 3/5 for A–D, 1/4 for E.
+    #[test]
+    fn fac_rates_are_the_standard_ones() {
+        for m in RobustnessMode::ALL {
+            let p = MlcParams::fac_for(m);
+            let want = if m == RobustnessMode::E { 0.25 } else { 0.6 };
+            assert!((p.levels[0].rate_b_ratio() - want).abs() < 1e-12, "{m:?}");
         }
     }
 }
