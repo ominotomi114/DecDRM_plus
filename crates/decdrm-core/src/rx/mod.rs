@@ -108,11 +108,11 @@ pub struct ReceiverConfig {
     /// [`WorkingRate::R120`] or more, because its 213 carriers reach ±47.11 kHz.
     pub working_rate: WorkingRate,
     /// Decode this robustness mode instead of searching for one, at this spectrum
-    /// occupancy (see [`Receiver::set_mode`]). Needed for mode E (DRM+): the automatic
-    /// search cannot find it (the FAC's 2-bit mode field cannot express it and the
-    /// frequency scan is built for 48 kHz geometry), so a DRM+ signal must be pinned.
-    /// The signal must sit at DC when the receiver starts (the pinned receiver does not
-    /// search for a frequency); retuning restarts the search when this is `None`.
+    /// occupancy (see [`Receiver::set_mode`]). Pinning is no longer *required* for mode E
+    /// (DRM+): the frequency scan finds its spectrum plateau itself (see [`freqacq`]) and
+    /// the time sync identifies the mode, at 120/192 kHz. It remains a shortcut when both
+    /// the mode and the centre frequency are known. A pinned receiver runs at DC with no
+    /// frequency search, so a signal pinned while off centre decodes nothing.
     pub pinned: Option<(RobustnessMode, SpectrumOccupancy)>,
 }
 
@@ -364,7 +364,7 @@ impl Receiver {
         let mode = RobustnessMode::B;
         Self {
             pinned: None,
-            acq: Some(FreqAcquisition::new(real, cfg.auto_flip)),
+            acq: Some(FreqAcquisition::new_at(real, cfg.auto_flip, cfg.working_rate)),
             acq_power: None,
             loud_samples: 0,
             input,
@@ -502,7 +502,7 @@ impl Receiver {
         // good. Pinned, run at DC as `set_mode` left it. Unpinned, scan afresh.
         if self.pinned.is_none() {
             let real = self.input.is_real();
-            self.acq = Some(FreqAcquisition::new(real, self.cfg.auto_flip));
+            self.acq = Some(FreqAcquisition::new_at(real, self.cfg.auto_flip, self.cfg.working_rate));
             self.conj = false;
             self.dc_hz = 0.0;
         }
@@ -582,7 +582,7 @@ impl Receiver {
             self.pending.extend_from_slice(&samples);
             // Keep only what the frequency search looked at (≈0.45 s), so no
             // pre-signal data reaches time sync.
-            let max_pending = freqacq::ANALYSIS_SPAN;
+            let max_pending = freqacq::analysis_span_at(self.cfg.working_rate);
             if self.pending.len() > max_pending {
                 let d = self.pending.len() - max_pending;
                 self.pending.drain(..d);
@@ -655,7 +655,16 @@ impl Receiver {
 
     fn process_window(&mut self, win: timesync::SymbolWindow) {
         if self.chain.is_none() {
-            let so = self.pinned.map_or(SpectrumOccupancy::SO_3, |(_, so)| so);
+            // Mode E exists at occupancy 0 only (§8.1), so an unpinned receiver that mode
+            // detection has just switched to E must not be given the DRM30 default: the
+            // cell map refuses that pair, `SymbolChain::new` returns None, and the receiver
+            // stays in acquisition with no chain at all.
+            let default_so = if self.mode == RobustnessMode::E {
+                SpectrumOccupancy::SO_0
+            } else {
+                SpectrumOccupancy::SO_3
+            };
+            let so = self.pinned.map_or(default_so, |(_, so)| so);
             self.chain = SymbolChain::new(self.mode, so, &self.cfg);
             self.sro_reports = 0;
             self.sro_prev = None;

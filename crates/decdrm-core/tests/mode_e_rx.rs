@@ -13,7 +13,7 @@ use decdrm_core::params::{RobustnessMode, SpectrumOccupancy, WorkingRate};
 use decdrm_core::rx::{InputFormat, MscConfig, Receiver, ReceiverConfig, ReceiverEvent};
 use decdrm_core::tx::output::{OutputConfig, OutputStage};
 use decdrm_core::tx::{Transmitter, TxConfig};
-use decdrm_core::Real;
+use decdrm_core::{Cplx, Real};
 
 /// A mode E transmission configuration at `rate`, one 16-QAM stream.
 fn tx_config(rate: WorkingRate) -> TxConfig {
@@ -489,5 +489,73 @@ fn a_pinned_configuration_reaches_mode_e_without_set_mode() {
         Some((RobustnessMode::E, SpectrumOccupancy::SO_0)),
         "a restart must keep the pin, not fall back to searching"
     );
+
 }
 
+/// Coarse acquisition must find a mode E signal by itself, and the receiver must then
+/// receive it unpinned.
+///
+/// The pilot search cannot do this — mode E defines no frequency reference cells (§8.4.2),
+/// so the three bins it looks in are empty in a DRM+ signal. `FreqAcquisition` therefore
+/// also searches for the **spectrum plateau** above 48 kHz (see its `detect_plateau`), and
+/// the receiver must act on both halves of what that returns: the mode it reports and the
+/// occupancy the cell map needs (mode E has occupancy 0 only, §8.1 — building its chain at
+/// the DRM30 default leaves `SymbolChain::new` returning `None` and the receiver stuck).
+///
+/// The transmitter runs at 192 kHz and the signal is put **off centre** so the frequency
+/// half is exercised too: a receiver that ran at DC would decode nothing.
+#[test]
+fn mode_e_is_acquired_without_pinning() {
+    let rate = WorkingRate::R192;
+    let mut tx = Transmitter::new(tx_config(rate)).expect("mode E transmitter");
+    let frame_samples = tx.samples_per_frame();
+    let cap = tx.msc_capacity();
+
+    // Off centre by +20 kHz, the offset the reference recordings carry.
+    const DC_HZ: Real = 20_000.0;
+    let mut sig = Vec::new();
+    let mut msc = vec![0u8; cap.total_bits()];
+    for f in 0..60u64 {
+        for (i, b) in msc.iter_mut().enumerate() {
+            *b = (((f * 7 + i as u64) >> 3) & 1) as u8;
+        }
+        let sdc = (tx.frame_index() == 0).then(|| vec![0u8; tx.sdc_capacity_bytes()]);
+        let baseband = tx.transmit_frame(&test_fac(), &msc, sdc.as_deref()).expect("transmit");
+        let w = 2.0 * std::f64::consts::PI * DC_HZ / f64::from(rate.hz());
+        for (n, c) in baseband.iter().enumerate() {
+            let ph = w * (f as usize * frame_samples + n) as f64;
+            let (s, co) = ph.sin_cos();
+            let up = c * Cplx::new(co, s);
+            sig.push(up.re as f32);
+            sig.push(up.im as f32);
+        }
+    }
+
+    let mut rx = Receiver::new(ReceiverConfig {
+        input: InputFormat::Iq { swap: false },
+        channels: 2,
+        working_rate: rate,
+        ..Default::default()
+    });
+    let (mut found, mut mode_e, mut fac_ok) = (false, false, 0usize);
+    for chunk in sig.chunks(rate.hz() as usize / 10 * 2) {
+        for ev in rx.push(chunk) {
+            match ev {
+                ReceiverEvent::SignalFound { dc_hz, .. } => {
+                    found = true;
+                    // Coarse: the plateau's edges put the carrier within a kHz.
+                    assert!(
+                        (dc_hz - DC_HZ).abs() < 1500.0,
+                        "found the signal at {dc_hz:.0} Hz, expected about {DC_HZ:.0}"
+                    );
+                }
+                ReceiverEvent::ModeDetected(m) => mode_e |= m == RobustnessMode::E,
+                ReceiverEvent::Fac(_) => fac_ok += 1,
+                _ => {}
+            }
+        }
+    }
+    assert!(found, "coarse acquisition did not find the mode E signal");
+    assert!(mode_e, "the receiver did not identify the signal as mode E");
+    assert!(fac_ok > 0, "no FAC decoded from an unpinned mode E signal");
+}

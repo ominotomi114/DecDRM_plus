@@ -258,12 +258,13 @@ impl Fac {
     /// Parse a decoded FAC block, one bit per byte. Returns `None` if the CRC fails or a
     /// field is invalid.
     ///
-    /// Two widths exist (§7.2.1.2): **72 bits** for robustness modes A–D (20 channel bits
-    /// + one 44-bit service parameter set + 8 CRC) and **116 bits** for mode E (the same
-    /// channel bits + **two** service parameter sets + 8 CRC — §6.3's "two sets of service
-    /// parameters"), the CRC covering everything before it. The width is taken from the
-    /// slice, so a caller that knows the mode does not have to say so — which also fixes the
-    /// super frame's length the Identity field is read against (3 frames for A–D, 4 for E).
+    /// Two widths exist (§7.2.1.2): **72 bits** for robustness modes A–D — 20 channel bits
+    /// plus one 44-bit service parameter set plus 8 CRC — and **116 bits** for mode E, which
+    /// is the same channel bits plus **two** service parameter sets plus 8 CRC (§6.3's "two
+    /// sets of service parameters"), the CRC covering everything before it. The width is
+    /// taken from the slice, so a caller that knows the mode does not have to say so — which
+    /// also fixes the super frame's length the Identity field is read against (3 frames for
+    /// A–D, 4 for E).
     pub fn parse(bits: &[u8]) -> Option<Self> {
         // 64 + 8 for A–D, 108 + 8 for mode E.
         let (payload, crc_at, frames) = if bits.len() >= 116 {

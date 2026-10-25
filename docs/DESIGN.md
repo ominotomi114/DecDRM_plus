@@ -826,20 +826,39 @@ needs 120 or 192 kHz; the input is resampled to whatever the receiver is configu
      list of measurements ruling out the equaliser) now passes unignored. The upsampling
      note above is therefore no longer needed as a workaround, though it remains a valid
      design choice — JvanKatwijk's decoder runs at 192 kHz only.
-  4. `freqacq.rs` cannot find a mode E signal unaided — its detector hunts for the three
-     DRM30 frequency-reference pilots at 750/2250/3000 Hz, and mode E defines none. So
-     decoding a mode E file needs the mode to be pinned. A plateau/bandwidth detector is the
-     replacement. The file is also still 48 kHz-calibrated (fixed 6144-point FFT, `HOP`,
-     `NUM_AVERAGE`).
+  4. **`freqacq.rs` finds mode E now** (2026-10-26), so a DRM+ signal no longer has to be
+     pinned. The pilot detector cannot do it — it hunts for the three DRM30 frequency
+     reference pilots at 750/2250/3000 Hz, and mode E defines none (§8.4.2) — so
+     `FreqAcquisition::detect_plateau` searches for the signal's **spectrum plateau**
+     instead: the widest run of bins above six times the PSD's 20th percentile, whose edges
+     are then taken at half the band's own median power (a low threshold finds the run
+     reliably but its edges smear ~1 kHz outward; the half-power points cancel that
+     symmetrically, since a mode E spectrum is symmetric about its DC carrier). The plateau
+     is only searched above 48 kHz, where a 95 kHz DRM30 signal cannot exist.
+     Measured on the reference recording whose carrier is at +20 kHz: `SignalFound` at
+     **20 000 Hz** exactly, `ModeDetected E`, and a full decode **unpinned**
+     (`decdrm rx <file> --sample-rate 192 --format iq`: FAC 261, MSC 265 (123 ok),
+     461 audio frames, no manual mixing). The FFT length, hop and analysis span now scale
+     with the working rate, keeping the 7.8 Hz bin the detection threshold was set for.
+
+     Two things the unpinned path needed besides the detector: an unpinned receiver that
+     mode detection has switched to E must build its chain at **occupancy 0** (mode E has
+     no other, §8.1 — the DRM30 default leaves `SymbolChain::new` returning `None` and the
+     receiver stuck in acquisition with no chain), and `mode_e_rx.rs` guards the whole
+     thing (`mode_e_is_acquired_without_pinning`, with the signal put off centre on
+     purpose).
+
+     It was also 48 kHz-calibrated (fixed 6144-point FFT, `HOP`, `NUM_AVERAGE`); those
+     scale with the rate now.
      *Reachable from the GUI and CLI now* (2026-10-25): `ReceiverConfig::pinned` carries a
      mode/occupancy to decode instead of searching, so `Receiver::new` pins it without a
      caller having to reach in with `set_mode`. The GUI's source bar has a **mode picker**
      (Auto / Mode E (DRM+), which also raises the rate to 120 kHz if it is still 48); the CLI
      has `--sample-rate` for the rate and `--drm-plus` to pin the mode (which raises the rate
      itself if it is left at the default). Mode E's occupancy is always 0 (§8.1), so the
-     picker derives that rather than offering a choice. The automatic search still cannot
-     detect DRM+; a DRM+ signal must be tuned to the receiver's centre frequency (pinning
-     runs at DC, no frequency search).
+     picker derives that rather than offering a choice. **Auto works now too** (see item 4):
+     the mode picker is a shortcut, not a requirement, and a DRM+ signal no longer has to
+     be tuned to the receiver's centre frequency.
 
   The `TimeWiener` `params(E)` filter length/Doppler pair and `freq_wiener_len(E)` are
   **placeholders** copied from mode C/D, marked as such in the code. They are demonstrably
