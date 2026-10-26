@@ -295,6 +295,12 @@ const INTERLEAVING: &[(&str, &str)] = &[("long", "Long (2 s) — rides out fadin
 const PROTECTION_16: &[(&str, &str)] = &[("0", "0 — code rate 0.5 (most robust)"), ("1", "1 — code rate 0.62")];
 const PROTECTION_64: &[(&str, &str)] =
     &[("0", "0 — code rate 0.5 (most robust)"), ("1", "1 — code rate 0.6"), ("2", "2 — code rate 0.71"), ("3", "3 — code rate 0.78")];
+/// Mode E's own four levels, whose code rates are not the DRM30 ones: 16-QAM is table 31
+/// (0.33, 0.41, 0.5, 0.62) and 4-QAM table 29 (0.25, 0.33, 0.4, 0.5).
+const PROTECTION_E_16: &[(&str, &str)] =
+    &[("0", "0 — code rate 0.33 (most robust)"), ("1", "1 — code rate 0.41"), ("2", "2 — code rate 0.5"), ("3", "3 — code rate 0.62")];
+const PROTECTION_E_4: &[(&str, &str)] =
+    &[("0", "0 — code rate 0.25 (most robust)"), ("1", "1 — code rate 0.33"), ("2", "2 — code rate 0.4"), ("3", "3 — code rate 0.5")];
 
 // ---------------------------------------------------------------------------------
 // What robustness mode E changes in the rest of the form
@@ -315,14 +321,12 @@ const PROTECTION_64: &[(&str, &str)] =
 /// not define is **left out of the selector** rather than shown greyed: it is not a choice,
 /// and the list the user sees should be the list of real options.
 ///
-/// Mode E lists only 16-QAM. The standard also allows 4-QAM there, but DecDRM cannot encode
-/// it: `fec::mlc`'s MSC tables are the DRM30 ones, and mode E's 4-QAM needs its own code
-/// rates (§7.5.1 table 29: 1/4, 1/3, **2/5**, 1/2 — and 2/5 is a rate `tables::CODE_RATES`
-/// does not carry at all, so the puncturing pattern would have to be added first). Until
-/// that exists, offering 4-QAM would only write a station the transmitter refuses.
+/// Mode E lists its two constellations — 16-QAM and 4-QAM — in the order §7.5.1 names them.
+/// DecDRM encodes both: mode E's own code-rate tables (29 and 31) are in `tables`, and
+/// `MlcParams::msc_for` takes the mode.
 pub fn msc_modes_for(mode: &str) -> &'static [(&'static str, &'static str)] {
     if mode == "E" {
-        &[("16-QAM", "16-QAM — the DRM+ workhorse")]
+        &[("16-QAM", "16-QAM — the DRM+ workhorse"), ("4-QAM", "4-QAM — the robust DRM+ option")]
     } else {
         MSC_MODES
     }
@@ -386,13 +390,17 @@ pub fn interleaving_for(mode: &str, il: &str) -> &'static str {
 /// Protection levels the form offers for a constellation in a mode.
 ///
 /// §7.5.1: 16-QAM has levels 0–1 in modes A–D (table 30) and **0–3 in mode E** (table 31);
-/// 64-QAM has 0–3 (table 32). DecDRM's encoder takes the level from the DRM30 tables
-/// (`tables::MSC16_SM` has two entries), so mode E's levels 2 and 3 are not offered until the
-/// encoder has them — the selector would otherwise write a level the LDPC-style rate lookup
-/// cannot encode.
+/// 4-QAM is mode E only and has 0–3 (table 29); 64-QAM has 0–3 (table 32). `MlcParams::msc_for`
+/// uses the mode's own tables, so all four levels of both mode E constellations are real
+/// choices, not just the two the DRM30 16-QAM table happens to carry.
 pub fn protection_levels(mode: &str, msc: &str) -> &'static [(&'static str, &'static str)] {
-    let _ = mode;
-    if canon(msc) == "16qam" { PROTECTION_16 } else { PROTECTION_64 }
+    if mode == "E" {
+        if canon(msc) == "4qam" { PROTECTION_E_4 } else { PROTECTION_E_16 }
+    } else if canon(msc) == "16qam" {
+        PROTECTION_16
+    } else {
+        PROTECTION_64
+    }
 }
 
 fn channel(ui: &mut Ui, doc: &mut DocumentMut) -> bool {
@@ -1940,13 +1948,14 @@ mod tests {
     /// A, B, C and D and 16-QAM or 4-QAM mapping in robustness mode E."
     #[test]
     fn the_msc_selector_follows_the_robustness_mode() {
-        // Mode E's list holds only what it defines and DecDRM can encode: 64-QAM and its
-        // hierarchical variants are gone from the selector, and so is 4-QAM (the standard
-        // allows it, but mode E's rate table — §7.5.1 table 29 — is not implemented).
-        assert_eq!(msc_modes_for("E").len(), 1, "mode E has one encodable constellation");
+        // Mode E's list holds exactly what it defines: both its constellations, and none of
+        // the 64-QAM family (which DRM+ does not have).
+        assert_eq!(msc_modes_for("E").len(), 2, "mode E's two constellations: {:?}", msc_modes_for("E"));
         assert_eq!(msc_modes_for("E")[0].0, "16-QAM");
+        assert_eq!(msc_modes_for("E")[1].0, "4-QAM");
         assert!(msc_mode_allowed("E", "16-QAM"));
-        for msc in ["64-QAM", "HMsym", "HMmix", "4-QAM"] {
+        assert!(msc_mode_allowed("E", "4-QAM"), "mode E defines 4-QAM (§7.5.1)");
+        for msc in ["64-QAM", "HMsym", "HMmix"] {
             assert!(!msc_mode_allowed("E", msc), "mode E must not offer {msc}");
         }
         // Modes A-D: 16-QAM and 64-QAM with its hierarchical variants; 4-QAM is not DRM30's.
@@ -1961,6 +1970,7 @@ mod tests {
         // mode's default: 16-QAM for mode E, 64-QAM for the DRM30 modes.
         assert_eq!(msc_mode_for("E", "64-QAM"), "16-QAM");
         assert_eq!(msc_mode_for("E", "HMsym"), "16-QAM");
+        assert_eq!(msc_mode_for("E", "4-QAM"), "4-QAM", "an allowed choice is kept");
         assert_eq!(msc_mode_for("B", "16-QAM"), "16-QAM", "an allowed choice is kept");
         assert_eq!(msc_mode_for("B", "HMmix"), "HMmix", "an allowed choice is kept");
         // Canonical spellings come back, so writing one does not rewrite the file forever.
@@ -2028,8 +2038,9 @@ hierarchical = true
         assert_eq!(get_str(ch, "msc_mode").as_deref(), Some("16-QAM"), "64-QAM does not exist in DRM+");
         assert_eq!(get_str(ch, "sdc_mode").as_deref(), Some("4-QAM"), "DRM+ has 4-QAM SDC only");
         assert_eq!(get_str(ch, "interleaving").as_deref(), Some("long"), "DRM+ has one depth");
-        // 16-QAM has levels 0-1 in the DRM30 tables DecDRM encodes with.
-        assert_eq!(get_int(section(&mut doc, "channel"), "protection_b"), Some(1));
+        // Level 3 is a real choice in mode E's own 16-QAM table (§7.5.1 table 31), so the
+        // document's level stands rather than being clamped to the DRM30 two.
+        assert_eq!(get_int(section(&mut doc, "channel"), "protection_b"), Some(3));
         // The hierarchical mark cannot survive without a hierarchical constellation.
         let text = doc.to_string();
         assert!(!text.contains("hierarchical"), "{text}");
@@ -2098,7 +2109,15 @@ hierarchical = true
     fn protection_levels_follow_the_constellation() {
         assert_eq!(protection_levels("A", "16-QAM").len(), 2, "16-QAM has levels 0-1 in DRM30");
         assert_eq!(protection_levels("A", "64-QAM").len(), 4);
-        assert_eq!(protection_levels("E", "16-QAM").len(), 2, "DecDRM encodes DRM30's 16-QAM table");
+        // Mode E has four of both its constellations (tables 31 and 29), and their code
+        // rates are not the DRM30 ones, so the labels differ too.
+        assert_eq!(protection_levels("E", "16-QAM").len(), 4, "mode E's 16-QAM has levels 0-3");
+        assert_eq!(protection_levels("E", "4-QAM").len(), 4, "mode E's 4-QAM has levels 0-3");
+        assert_ne!(
+            protection_levels("E", "16-QAM")[0].1,
+            protection_levels("A", "16-QAM")[0].1,
+            "the same level number is a different code rate in mode E"
+        );
     }
 
     #[test]

@@ -187,7 +187,13 @@ impl Transmitter {
         if cfg.afs_index > 15 {
             return Err(TxError::InvalidAfsIndex(cfg.afs_index));
         }
-        let max_level = if cfg.msc_mode == MscMode::Qam16Sm { 1 } else { 3 };
+        // Protection levels: 16-QAM has 0-1 in modes A-D (table 30) but **0-3 in mode E**
+        // (table 31); 4-QAM is mode E only and has 0-3 (table 29); 64-QAM has 0-3 (table 32).
+        let max_level = match (cfg.msc_mode, cfg.mode) {
+            (MscMode::Qam16Sm, RobustnessMode::E) => 3,
+            (MscMode::Qam16Sm, _) => 1,
+            _ => 3,
+        };
         let p = cfg.protection;
         for (what, level, max) in
             [("part A", p.part_a, max_level), ("part B", p.part_b, max_level), ("hierarchical", p.hierarchical, 3)]

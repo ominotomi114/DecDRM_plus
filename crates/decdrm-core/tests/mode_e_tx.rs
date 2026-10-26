@@ -181,3 +181,69 @@ fn generated_signal_occupies_the_expected_band() {
         "energy above the band at 60 kHz: {outside:.1} dB vs peak {peak:.1}"
     );
 }
+/// Every MSC constellation and protection level the station form can produce must encode,
+/// and the FAC must announce the same one back.
+///
+/// §7.5.1 gives mode E two constellations and **four** levels of each (tables 29 and 31),
+/// where modes A–D have 16-QAM at levels 0–1 only. `Transmitter::new` used to reject level
+/// 2 and 3 whatever the mode — the DRM30 cap — so the form's two extra levels were dead
+/// choices, and its 4-QAM row was hidden for the same reason. This walks the whole grid.
+///
+/// The capacity of each combination is checked against ES 201 980 annex J table J.5, which
+/// publishes the number of MSC input bits per multiplex frame for every mode E rate — the
+/// strongest available check that the rate tables, the level split and the puncturing all
+/// agree with the standard.
+#[test]
+fn every_mode_e_msc_combination_encodes() {
+    use decdrm_core::fac::{MscMode as M, SdcMode as S};
+
+    // From table J.5 (protected part A + B, equal error protection, occupancy 0).
+    let want = |msc: M, level: usize| -> usize {
+        match (msc, level) {
+            // 4-QAM, table 29: rates 0.25, 0.33, 0.4, 0.5.
+            (M::Qam4, 0) => 3_727,
+            (M::Qam4, 1) => 4_969,
+            (M::Qam4, 2) => 5_962,
+            (M::Qam4, 3) => 7_454,
+            // 16-QAM, table 31: rates 0.33, 0.41, 0.5, 0.62.
+            (M::Qam16Sm, 0) => 9_938,
+            (M::Qam16Sm, 1) => 12_243,
+            (M::Qam16Sm, 2) => 14_907,
+            (M::Qam16Sm, 3) => 18_635,
+            _ => unreachable!(),
+        }
+    };
+
+    for msc in [M::Qam16Sm, M::Qam4] {
+        for level in 0..4usize {
+            let mut c = cfg(WorkingRate::R192);
+            c.msc_mode = msc;
+            c.sdc_mode = S::Qam4;
+            c.protection = MscProtection { part_a: level, part_b: level, hierarchical: 0 };
+            let mut tx = Transmitter::new(c)
+                .unwrap_or_else(|e| panic!("mode E {msc:?} level {level} must encode: {e}"));
+            assert_eq!(
+                tx.msc_capacity().total_bits(),
+                want(msc, level),
+                "{msc:?} level {level} capacity disagrees with table J.5"
+            );
+            // And it transmits: a frame of the right size comes out.
+            let bits = vec![0u8; tx.msc_capacity().total_bits()];
+            let sdc = (tx.frame_index() == 0).then(|| vec![0u8; tx.sdc_capacity_bytes()]);
+            let mut f = fac();
+            f.channel.msc_mode = msc;
+            f.channel.sdc_mode = S::Qam4;
+            let frame = tx.transmit_frame(&f, &bits, sdc.as_deref()).expect("transmit");
+            assert_eq!(frame.len(), tx.samples_per_frame(), "{msc:?} level {level}: frame length");
+        }
+    }
+
+    // The level cap is the mode's, not fixed at the DRM30 two: a DRM30 mode still refuses
+    // level 2 for 16-QAM, which is exactly what the mode E acceptance above must not have
+    // loosened.
+    let mut b = cfg(WorkingRate::R48);
+    b.mode = RobustnessMode::B;
+    b.occupancy = SpectrumOccupancy::SO_3;
+    b.protection = MscProtection { part_a: 2, part_b: 2, hierarchical: 0 };
+    assert!(Transmitter::new(b).is_err(), "modes A-D keep their 16-QAM two-level cap");
+}
