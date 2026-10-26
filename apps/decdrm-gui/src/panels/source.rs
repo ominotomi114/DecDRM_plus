@@ -28,22 +28,69 @@ pub const MDI_EXTENSIONS: &[&str] =
 /// so it is not done every frame) and on "refresh".
 #[derive(Debug, Default)]
 pub struct DeviceLists {
-    inputs: Option<Vec<String>>,
-    outputs: Option<Vec<String>>,
+    inputs: Option<Vec<NamedDevice>>,
+    outputs: Option<Vec<NamedDevice>>,
     pub error: Option<String>,
 }
 
+/// A device name and the rates it can carry, as the driver reports them. The name alone
+/// does not identify a device when a driver exposes the same virtual cable twice at
+/// different rates (VB-Audio does: "CABLE-A Output" appears at both 48 and 192 kHz), and
+/// picking the low-rate twin silently band-limits the input below what mode E needs.
+#[derive(Debug, Clone)]
+pub struct NamedDevice {
+    /// The name to store in the settings and to open the device with.
+    pub name: String,
+    /// Distinct supported rates, ascending; empty when the driver reports none.
+    pub rates: Vec<u32>,
+}
+
+impl NamedDevice {
+    /// The label shown in a picker: the name plus its rates, so endpoints that share a
+    /// name are told apart. Falls back to the bare name when no rate is known.
+    pub fn label(&self) -> String {
+        const MOST: usize = 4;
+        if self.rates.is_empty() {
+            return self.name.clone();
+        }
+        let shown = self.rates.len().min(MOST);
+        let mut text = String::with_capacity(self.name.len() + 24);
+        text.push_str(&self.name);
+        text.push_str(" — ");
+        for (i, r) in self.rates[..shown].iter().enumerate() {
+            if i > 0 {
+                text.push_str(", ");
+            }
+            text.push_str(&khz(*r));
+        }
+        if shown < self.rates.len() {
+            text.push('…');
+        }
+        text
+    }
+}
+
+/// A rate in kHz without losing the fractional part: 44100 Hz is "44.1 kHz", not "44 kHz"
+/// (integer division would misreport the one rate that is commonly fractional).
+fn khz(hz: u32) -> String {
+    if hz.is_multiple_of(1000) {
+        format!("{} kHz", hz / 1000)
+    } else {
+        format!("{:.1} kHz", f64::from(hz) / 1000.0)
+    }
+}
+
 impl DeviceLists {
-    pub fn inputs(&mut self) -> &[String] {
+    pub fn inputs(&mut self) -> &[NamedDevice] {
         if self.inputs.is_none() {
-            self.inputs = Some(names(decdrm_io::list_input_devices(), &mut self.error));
+            self.inputs = Some(named(decdrm_io::list_input_devices(), &mut self.error));
         }
         self.inputs.as_deref().unwrap_or_default()
     }
 
-    pub fn outputs(&mut self) -> &[String] {
+    pub fn outputs(&mut self) -> &[NamedDevice] {
         if self.outputs.is_none() {
-            self.outputs = Some(names(decdrm_io::list_output_devices(), &mut self.error));
+            self.outputs = Some(named(decdrm_io::list_output_devices(), &mut self.error));
         }
         self.outputs.as_deref().unwrap_or_default()
     }
@@ -53,12 +100,21 @@ impl DeviceLists {
     }
 }
 
-fn names(
+fn named(
     list: decdrm_io::Result<Vec<decdrm_io::DeviceInfo>>,
     error: &mut Option<String>,
-) -> Vec<String> {
+) -> Vec<NamedDevice> {
     match list {
-        Ok(devices) => devices.into_iter().map(|d| d.name).collect(),
+        Ok(devices) => devices
+            .into_iter()
+            .map(|d| {
+                let rates = d.sample_rates();
+                NamedDevice {
+                    name: d.name,
+                    rates,
+                }
+            })
+            .collect(),
         Err(e) => {
             *error = Some(format!("sound-card enumeration failed: {e}"));
             Vec::new()
@@ -354,17 +410,25 @@ fn receiver_options(ui: &mut Ui, settings: &mut Settings) {
 }
 
 fn device_picker(ui: &mut Ui, settings: &mut Settings, devices: &mut DeviceLists) {
-    let current = settings
-        .input_device
-        .clone()
-        .unwrap_or_else(|| "System default".into());
+    // The closed box shows the rate too: two endpoints of one virtual cable share a name
+    // and differ only in the rates they accept (VB-Audio lists "CABLE-A Output" at both
+    // 48 and 192 kHz), so the bare name cannot tell the user which one is selected.
+    let current = match &settings.input_device {
+        None => "System default".to_string(),
+        Some(want) => devices
+            .inputs()
+            .iter()
+            .find(|d| &d.name == want)
+            .map(NamedDevice::label)
+            .unwrap_or_else(|| want.clone()),
+    };
     ComboBox::from_id_salt("input_device")
         .width(260.0)
         .selected_text(current)
         .show_ui(ui, |ui| {
             ui.selectable_value(&mut settings.input_device, None, "System default");
-            for name in devices.inputs().to_vec() {
-                ui.selectable_value(&mut settings.input_device, Some(name.clone()), name);
+            for d in devices.inputs().to_vec() {
+                ui.selectable_value(&mut settings.input_device, Some(d.name.clone()), d.label());
             }
         });
     if ui
@@ -377,17 +441,24 @@ fn device_picker(ui: &mut Ui, settings: &mut Settings, devices: &mut DeviceLists
 }
 
 fn output_picker(ui: &mut Ui, settings: &mut Settings, devices: &mut DeviceLists) {
-    let current = settings
-        .output_device
-        .clone()
-        .unwrap_or_else(|| "Default output".into());
+    // Like the input picker, show the endpoint's rates: a virtual cable lists the same name
+    // at 48 and 192 kHz and only one of them can carry a mode E signal.
+    let current = match &settings.output_device {
+        None => "Default output".to_string(),
+        Some(want) => devices
+            .outputs()
+            .iter()
+            .find(|d| &d.name == want)
+            .map(NamedDevice::label)
+            .unwrap_or_else(|| want.clone()),
+    };
     ComboBox::from_id_salt("output_device")
         .width(180.0)
         .selected_text(current)
         .show_ui(ui, |ui| {
             ui.selectable_value(&mut settings.output_device, None, "Default output");
-            for name in devices.outputs().to_vec() {
-                ui.selectable_value(&mut settings.output_device, Some(name.clone()), name);
+            for d in devices.outputs().to_vec() {
+                ui.selectable_value(&mut settings.output_device, Some(d.name.clone()), d.label());
             }
         });
 }
@@ -471,5 +542,48 @@ fn format_picker(ui: &mut Ui, settings: &mut Settings) {
             })
             .response
             .on_hover_text("Channel carrying the signal (stereo sources).");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_label_tells_endpoints_apart_by_their_rates() {
+        // VB-Audio lists one virtual cable twice under the same name; only the rate
+        // distinguishes a usable mode E input from one that would be band-limited.
+        let low = NamedDevice { name: "CABLE-A Output (VB-Audio Cable A)".into(), rates: vec![48_000] };
+        let high = NamedDevice { name: low.name.clone(), rates: vec![48_000, 192_000] };
+        assert_ne!(low.label(), high.label());
+        assert!(low.label().ends_with("48 kHz"));
+        assert!(high.label().ends_with("48 kHz, 192 kHz"));
+    }
+
+    #[test]
+    fn the_label_is_the_bare_name_when_no_rate_is_known() {
+        let d = NamedDevice { name: "Some Device".into(), rates: Vec::new() };
+        assert_eq!(d.label(), "Some Device");
+    }
+
+    #[test]
+    fn a_long_rate_list_is_cut_short() {
+        let d = NamedDevice {
+            name: "Everything".into(),
+            rates: vec![8_000, 16_000, 32_000, 44_100, 48_000, 96_000, 192_000],
+        };
+        let label = d.label();
+        assert!(label.starts_with("Everything — 8 kHz"), "{label}");
+        // Four rates fit; the rest are elided rather than dropped silently.
+        assert!(label.ends_with("44.1 kHz…"), "{label}");
+    }
+
+    #[test]
+    fn a_fractional_rate_keeps_its_fraction() {
+        // Integer division would print 44.1 kHz as "44 kHz", misreporting a real rate.
+        assert_eq!(khz(44_100), "44.1 kHz");
+        assert_eq!(khz(48_000), "48 kHz");
+        assert_eq!(khz(192_000), "192 kHz");
+        assert_eq!(khz(22_050), "22.1 kHz"); // 22.05 rounds to 22.1
     }
 }

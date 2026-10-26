@@ -1173,9 +1173,9 @@ fn input_settings(ui: &mut Ui, input: &mut dyn TableLike, i: usize, ctx: &mut Fo
                         set(input, "device", "default");
                         changed = true;
                     }
-                    for name in ctx.devices.inputs().to_vec() {
-                        if ui.selectable_label(current == name, &name).clicked() {
-                            set(input, "device", name.as_str());
+                    for d in ctx.devices.inputs().to_vec() {
+                        if ui.selectable_label(current == d.name, d.label()).clicked() {
+                            set(input, "device", d.name.as_str());
                             changed = true;
                         }
                     }
@@ -1632,10 +1632,10 @@ fn output(ui: &mut Ui, doc: &mut DocumentMut, ctx: &mut FormCtx) -> bool {
                     remove(out, "device");
                     changed = true;
                 }
-                for name in ctx.devices.outputs().to_vec() {
-                    if ui.selectable_label(dev == name, &name).clicked() {
-                        dev.clone_from(&name);
-                        set(out, "device", name.as_str());
+                for d in ctx.devices.outputs().to_vec() {
+                    if ui.selectable_label(dev == d.name, d.label()).clicked() {
+                        dev.clone_from(&d.name);
+                        set(out, "device", d.name.as_str());
                         changed = true;
                     }
                 }
