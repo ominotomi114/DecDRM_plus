@@ -51,16 +51,16 @@ pub struct SearchWindow {
     pub max_hz: Real,
 }
 
-/// Fraction of the in-band mean power a bin must exceed to count as occupied.
-const OCCUPIED_OVER_FLOOR: Real = 6.0;
-/// Percentile of the PSD taken as the noise floor.
-const FLOOR_PERCENTILE: Real = 0.2;
-/// A run of occupied bins shorter than this is noise, not a signal band.
+/// Smallest ratio of mean power inside the mode E band to mean power outside it that counts
+/// as a signal. A mode E band 3 dB above the noise reads about 2 and empty spectrum about
+/// 1, so this sits between them with room for the band's own ripple.
+const MIN_BAND_RATIO: Real = 1.5;
+/// Fraction of the best ratio that still counts as the plateau: the carrier is taken at the
+/// centre of the region scoring at least this much (see `detect_plateau`).
+const CREST: Real = 0.9;
+/// A band narrower than this many bins is noise, not a signal.
 const MIN_BAND_BINS: usize = 8;
-/// Occupied bins of guard beyond the signal's own span that a plateau must show on each
-/// side. With the ±47.11 kHz span a mode E signal can sit anywhere in a 192 kHz input, so
-/// an edge is only recognisable when there is clear spectrum next to it.
-const MIN_OUTSIDE_BINS: usize = 4;
+
 
 /// Successful acquisition.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -260,16 +260,24 @@ impl FreqAcquisition {
         })
     }
 
-    /// Find a mode E (DRM+) signal by its **spectrum plateau**: a wide band of flat
-    /// occupied spectrum with sharp edges, and a notch where its DC carrier is.
+    /// Find a mode E (DRM+) signal by matching its **spectrum plateau**.
     ///
     /// The pilot search cannot find DRM+ at all — mode E defines no frequency reference
     /// cells (§8.4.2), so the three bins it looks in are empty in a DRM+ signal. What a
-    /// mode E signal does have is 213 carriers over a flat ±47.11 kHz, i.e. `n_carriers`
-    /// times the carrier spacing at this rate.
+    /// mode E signal does have is 213 carriers over a flat ±47.11 kHz with sharp edges, so
+    /// this slides a window of exactly that width along the spectrum and keeps the position
+    /// where the power inside most exceeds the power outside. That is the "sharp ascend and
+    /// descend about 98 kHz apart" of the signal, and being a matched filter it needs only
+    /// that the band be *relatively* stronger than its surroundings — no absolute
+    /// threshold, which is what an edge test cannot avoid and what made the noisiest
+    /// recordings unfindable.
+    ///
+    /// The window is the mode's own width, so the peak of the ratio is the carrier
+    /// position directly; the spectrum can sit anywhere in a 192 kHz input, which is the
+    /// case every real recording here is in.
     ///
     /// This only runs on the **unconjugated** spectrum: mirroring swaps the two edges, and
-    /// an edge-position test cannot tell that a mirrored plateau is mirrored, so an inverted
+    /// a symmetric window cannot tell that a mirrored plateau is mirrored, so an inverted
     /// mode E signal is not found here (the pinned path and `flip` cover it).
     fn detect_plateau(&self, psd: &[Real], power: Real) -> Option<Acquisition> {
         let n = psd.len();
@@ -281,75 +289,73 @@ impl FreqAcquisition {
         let half = (n / 2) as isize;
         let lo = (((self.search.min_hz / bin_hz).floor() as isize) + half).max(0) as usize;
         let hi = (((self.search.max_hz / bin_hz).ceil() as isize) + half).min(n as isize - 1) as usize;
-        if hi <= lo {
-            return None;
-        }
-        // Noise floor: a low percentile of the PSD over the searched span (the one-pole
-        // smoother cannot serve: it tracks a 95 kHz plateau as if it were the floor).
-        let mut sorted: Vec<Real> = psd[lo..=hi].to_vec();
-        sorted.sort_by(Real::total_cmp);
-        let floor = sorted[((sorted.len() - 1) as Real * FLOOR_PERCENTILE) as usize];
-        if floor <= 0.0 {
-            return None;
-        }
-        let occupied: Vec<bool> = psd[lo..=hi].iter().map(|&v| v > OCCUPIED_OVER_FLOOR * floor).collect();
-        if std::env::var_os("DECDRM_ACQDBG").is_some() {
-            eprintln!("ACQ n {n} bin {bin_hz:.2} Hz lo {lo} hi {hi} floor {floor:.3e} occ {}/{}",
-                      occupied.iter().filter(|&&b| b).count(), occupied.len());
-        }
-        // Longest run of occupied bins, with the band of guard around it clear.
-        let (mut best_len, mut best_start) = (0usize, lo);
-        let mut run_start = lo;
-        for i in 0..=occupied.len() {
-            let here = i < occupied.len() && occupied[i];
-            if here {
-                if i == 0 || !occupied[i - 1] {
-                    run_start = lo + i;
-                }
-            } else if i > 0 && occupied[i - 1] {
-                let len = lo + i - run_start;
-                let clear = run_start.saturating_sub(lo) >= MIN_OUTSIDE_BINS
-                    && hi + 1 - (lo + i) >= MIN_OUTSIDE_BINS;
-                if clear && len > best_len {
-                    (best_len, best_start) = (len, run_start);
-                }
-            }
-        }
-        let (len, start_bin) = (best_len, best_start);
-        if len < MIN_BAND_BINS {
-            return None;
-        }
-        // The span of a mode E signal at this rate, in bins.
         // The ±47.11 kHz span: 212 carrier spacings either side of the DC carrier.
         let span_hz = 2.0 * 106.0 * RobustnessMode::E.carrier_spacing_at(self.rate);
-        let want_bins = (span_hz / bin_hz).round() as usize;
-        // Accept a plateau that is the signal's own width (within a bin or two of trimming)
-        // or wider (a real signal in a wide input, edges partly outside the search span).
-        if want_bins == 0 || len + 2 < want_bins {
+        let w = (span_hz / bin_hz).round() as usize;
+        if hi <= lo || w < MIN_BAND_BINS || w >= hi - lo {
             return None;
         }
-        // The DC carrier is the **middle of the band's edges**, not the left edge plus half
-        // the nominal span: both edges smear outward by the same amount (the window and the
-        // outermost carriers' own skirts), so their midpoint cancels that where an edge
-        // does not. The mode E spectrum is symmetric about its DC carrier by construction.
-        //
-        // The edges are taken at **half the band's own median power**, which is where a
-        // flat plateau's skirt actually starts; the threshold used to find the run is set
-        // low so nothing is missed, and that alone puts the midpoint ~1 kHz off.
-        let (band_lo, band_hi) = (start_bin, start_bin + len - 1);
-        let mut inside: Vec<Real> = psd[band_lo..=band_hi].to_vec();
-        inside.sort_by(Real::total_cmp);
-        let half_power = 0.5 * inside[inside.len() / 2];
-        let left = (band_lo..=band_hi).find(|&i| psd[i] >= half_power).unwrap_or(band_lo);
-        let right = (band_lo..=band_hi).rev().find(|&i| psd[i] >= half_power).unwrap_or(band_hi);
-        let center_bin = (left + right) as Real / 2.0;
+        // Prefix sums: the band's power at every window position in one pass.
+        let mut prefix = vec![0.0; hi - lo + 2];
+        for i in lo..=hi {
+            prefix[i - lo + 1] = prefix[i - lo] + psd[i];
+        }
+        let total = prefix[hi - lo + 1];
+        let inside_at = |start: usize| -> Real {
+            prefix[start - lo + w] - prefix[start - lo]
+        };
+        // The window slides over the searched span, computing the ratio of mean power
+        // inside it to mean power outside.
+        let score_at = |start: usize| -> Real {
+            let inside = inside_at(start);
+            let outside = total - inside;
+            if outside > 0.0 { (inside / w as Real) / (outside / (hi - lo + 1 - w) as Real) } else { 0.0 }
+        };
+        let mut best: Real = 0.0;
+        for start in lo..=(hi + 1 - w) {
+            best = best.max(score_at(start));
+        }
+        // The ratio's own peak is flat — the band, the pilots and the DC notch ripple it —
+        // so its argmax wanders over tens of bins: that is a carrier error of several
+        // hundred Hz, which is enough to keep the tracking loop from ever pulling in (it
+        // restarts instead, without end). Take the **centre of the region that is nearly
+        // maximal** instead, which for a signal wider than the ripples is the band's centre.
+        let (mut first, mut last) = (usize::MAX, 0usize);
+        for start in lo..=(hi + 1 - w) {
+            if score_at(start) >= CREST * best {
+                first = first.min(start);
+                last = last.max(start);
+            }
+        }
+        if best < MIN_BAND_RATIO || first == usize::MAX {
+            return None;
+        }
+        // The crest's *centre*, to sub-bin precision: `(first + last) / 2` is quantised to
+        // whole bins and moves with the crest's asymmetry, which at 7.8 Hz a bin is already
+        // a few percent of a carrier spacing. The weighted centroid of the crest region is
+        // stable against both.
+        let (mut num, mut den) = (0.0 as Real, 0.0 as Real);
+        for start in first..=last {
+            let weight = score_at(start) - CREST * best;
+            num += weight * start as Real;
+            den += weight;
+        }
+        let centroid = if den > 0.0 { num / den } else { (first + last) as Real / 2.0 };
+        let best_start = centroid as usize;
+        if std::env::var_os("DECDRM_ACQDBG").is_some() {
+            eprintln!("ACQ w {w} best {best:.2} span {first}..{last} centroid {centroid:.1}");
+        }
+        // The carrier is the centre of the matched window: the band is symmetric about it
+        // by construction, so no edge measurement is needed. (The `best_start` above is
+        // already the centre of the region scoring near the maximum, not the bare argmax,
+        // which wanders over the ratio's flat top.)
+        let center_bin = centroid + w as Real / 2.0 - 0.5;
         let dc = (center_bin - half as Real) * bin_hz;
-        // The DC carrier must sit inside the search window, or the mixer would be handed a
-        // frequency the receiver may not use.
         if dc < self.search.min_hz || dc > self.search.max_hz {
             return None;
         }
-        let score = psd[start_bin..start_bin + len].iter().sum::<Real>() / len as Real;
+        let score = inside_at(best_start) / w as Real;
         Some(Acquisition { dc_hz: dc, inverted: false, score, power })
     }
+
 }

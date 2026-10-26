@@ -43,8 +43,16 @@ use std::collections::VecDeque;
 use std::f64::consts::PI;
 use timesync::{TimeSync, TimeSyncEvent};
 
-/// Symbols of time sync without a valid FAC before restarting acquisition.
+/// Symbols of time sync without a valid FAC before restarting acquisition. Sized for modes
+/// A-D, whose symbols are 20-26.7 ms: 150 of them is 3-4 s.
 const MAX_SYMBOLS_WITHOUT_FAC: usize = 150;
+/// [`MAX_SYMBOLS_WITHOUT_FAC`] in seconds, which is what mode E needs instead of a count:
+/// its symbols are 2.5 ms, so 150 of them is only 0.375 s — far too little for a mode E
+/// signal whose carrier the mixer has only roughly on frequency to pull in (§8.4.2 gives
+/// the mode no frequency reference cells to refine it against, so acquisition is the only
+/// chance to get close). Modes A-D keep the symbol count, which is what their tests were
+/// tuned against.
+const FAC_WAIT_S: Real = 4.0;
 /// A frequency acquisition that no FAC has confirmed yet is dropped at once when the
 /// input power rises this many times (10 dB) above its level during the search: the
 /// detection predates the signal. A virtual audio cable, for instance, carries the
@@ -549,6 +557,16 @@ impl Receiver {
         self.cfg.working_rate.hz()
     }
 
+    /// Time-sync symbols without a valid FAC that acquisition tolerates (see
+    /// [`MAX_SYMBOLS_WITHOUT_FAC`] and [`FAC_WAIT_S`]).
+    fn max_symbols_without_fac(&self) -> usize {
+        if self.mode != RobustnessMode::E {
+            return MAX_SYMBOLS_WITHOUT_FAC;
+        }
+        let symbol_s = self.mode.symbol_len_at(self.cfg.working_rate) as Real / Real::from(self.fs());
+        (FAC_WAIT_S / symbol_s.max(1e-9)).ceil() as usize
+    }
+
     /// Feed interleaved samples (any number of frames) at the working rate and return the
     /// events produced.
     pub fn push(&mut self, interleaved: &[f32]) -> Vec<ReceiverEvent> {
@@ -772,7 +790,7 @@ impl Receiver {
 
         if self.state == RxState::Acquisition {
             self.symbols_without_fac += 1;
-            if self.symbols_without_fac > MAX_SYMBOLS_WITHOUT_FAC {
+            if self.symbols_without_fac > self.max_symbols_without_fac() {
                 self.restart();
                 self.events.push(ReceiverEvent::Restarted);
             }

@@ -826,8 +826,9 @@ needs 120 or 192 kHz; the input is resampled to whatever the receiver is configu
      list of measurements ruling out the equaliser) now passes unignored. The upsampling
      note above is therefore no longer needed as a workaround, though it remains a valid
      design choice — JvanKatwijk's decoder runs at 192 kHz only.
-  4. **`freqacq.rs` finds mode E now** (2026-10-26), so a DRM+ signal no longer has to be
-     pinned. The pilot detector cannot do it — it hunts for the three DRM30 frequency
+  4. **`freqacq.rs` finds mode E, best-effort** (2026-10-26), so a DRM+ signal need not be
+     pinned. This is a *convenience*, not the reliable path — see the caveat at the end of
+     this item before relying on it. The pilot detector cannot do it — it hunts for the three DRM30 frequency
      reference pilots at 750/2250/3000 Hz, and mode E defines none (§8.4.2) — so
      `FreqAcquisition::detect_plateau` searches for the signal's **spectrum plateau**
      instead: the widest run of bins above six times the PSD's 20th percentile, whose edges
@@ -850,6 +851,19 @@ needs 120 or 192 kHz; the input is resampled to whatever the receiver is configu
 
      It was also 48 kHz-calibrated (fixed 6144-point FFT, `HOP`, `NUM_AVERAGE`); those
      scale with the rate now.
+
+     **The caveat, measured.** The plateau locates the carrier to about **±50 Hz**, and
+     there is nothing to refine it with: mode E defines no frequency reference cells
+     (§8.4.2) *and* no continuous pilots, so `framesync` disables frequency tracking for the
+     mode outright ("skip it entirely rather than reading carrier 0 three times as if it
+     were a pilot"). At 213 carriers and a 444⁴⁄₉ Hz spacing, ±50 Hz is about ±12 % of a
+     carrier — enough to cost real multiplex frames. On the recordings, unpinned: two of the
+     eleven decode fully (16-QAM LPP0, 4-QAM LPP3 and LPP0-with-AWGN in some runs, run to
+     run), the rest lose most or all of their multiplex frames, while **all eleven decode
+     fully pinned**. Getting the carrier inside a few Hz without reference cells needs a
+     data-directed estimate from the FAC/MSC decisions, which is future work. Use
+     `--drm-plus` (or the GUI's mode picker) for real reception; unpinned mode E is there so
+     the signal is *found* and identified, which it now is.
      *Reachable from the GUI and CLI now* (2026-10-25): `ReceiverConfig::pinned` carries a
      mode/occupancy to decode instead of searching, so `Receiver::new` pins it without a
      caller having to reach in with `set_mode`. The GUI's source bar has a **mode picker**

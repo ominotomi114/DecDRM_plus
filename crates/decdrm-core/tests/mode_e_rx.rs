@@ -504,6 +504,14 @@ fn a_pinned_configuration_reaches_mode_e_without_set_mode() {
 ///
 /// The transmitter runs at 192 kHz and the signal is put **off centre** so the frequency
 /// half is exercised too: a receiver that ran at DC would decode nothing.
+///
+/// **Unpinned mode E is best-effort, not the reliable path.** The plateau locates the
+/// carrier to only about ±50 Hz — it is a spectral search with no reference cells to
+/// refine against, and mode E's continuous-frequency tracking is disabled for the same
+/// reason (`framesync`: the mode defines no continuous pilots either). A residual of that
+/// size costs real frames: this in-process signal decodes, and so do several of the `refs/`
+/// recordings, but not all of them. Pinning (`--drm-plus`, or the GUI's mode picker) skips
+/// the estimate entirely and is what the recordings are decoded with in practice.
 #[test]
 fn mode_e_is_acquired_without_pinning() {
     let rate = WorkingRate::R192;
@@ -515,7 +523,7 @@ fn mode_e_is_acquired_without_pinning() {
     const DC_HZ: Real = 20_000.0;
     let mut sig = Vec::new();
     let mut msc = vec![0u8; cap.total_bits()];
-    for f in 0..60u64 {
+    for f in 0..200u64 {
         for (i, b) in msc.iter_mut().enumerate() {
             *b = (((f * 7 + i as u64) >> 3) & 1) as u8;
         }
