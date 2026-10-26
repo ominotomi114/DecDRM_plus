@@ -690,9 +690,14 @@ needs 120 or 192 kHz; the input is resampled to whatever the receiver is configu
   Still failing, in decreasing order of how well it is understood:
 
   1. **Real DRM+ recordings did not decode — fixed** (2026-10-25 and 2026-10-26). All
-     eleven 192 kHz DRM+ recordings in `refs/` now decode end to end, audio included
-     (`decdrm rx <file> --drm-plus --format iq`, after mixing the +20 kHz carrier down —
-     `--example mixwav`):
+     eleven 192 kHz DRM+ recordings in `refs/` now decode end to end, audio included:
+     `decdrm rx <file> --drm-plus --format iq --dc 20000` — the recordings carry their
+     carrier at +20 kHz, and `--dc` tells the pinned mixer where it is (`ReceiverConfig::
+     dc_hz`; the GUI's receiver options show the same field when a mode is pinned). Before
+     that field existed the carrier had to be mixed down by hand first (`--example mixwav`),
+     which is what `refs/m20k_20k_offset_4QAM_LPP0_192kHz.wav` is: the 4-QAM LPP0 recording
+     mixed down by +20 kHz, kept as a baseband copy for tools that cannot mix. It decodes
+     without `--dc`: FAC 310, SDC 77, MSC 302:
 
      | recording | MSC frames (ok) | audio frames ok |
      |---|---|---|
@@ -886,10 +891,20 @@ needs 120 or 192 kHz; the input is resampled to whatever the receiver is configu
   back, so the choice silently did not apply); the multiplex bar computed kbit/s with a
   hardcoded 400 ms frame, so mode E showed 4× too low; mode E showed a one-item bandwidth
   selector instead of the fixed 100 kHz it is defined at. The channel rows now also follow the
-  mode's own rules — MSC 16-QAM only in DecDRM's DRM+, SDC 4-QAM, long interleaving, no
-  hierarchical layer — greying out what the mode removes and repairing a document that holds
-  one, since the station's own validation accepts those. See "What robustness mode E changes
-  in the rest of the form" in `tx_form.rs`.
+  mode's own rules — MSC 16-QAM or 4-QAM, SDC 4-QAM, long interleaving, no hierarchical
+  layer — greying out what the mode removes and repairing a document that holds one, since
+  the station's own validation accepts those. See "What robustness mode E changes in the rest
+  of the form" in `tx_form.rs`.
+
+  *Both of mode E's constellations now encode, at all four of its levels each* (2026-10-26).
+  The transmitter capped 16-QAM at level 1 in every mode (the DRM30 table 30 cap), and the
+  form hid 4-QAM for mode E on the grounds that its rates were not encodable. §7.5.1 gives
+  mode E four levels of each — table 31 for 16-QAM (0.33, 0.41, 0.5, 0.62) and table 29 for
+  4-QAM (0.25, 0.33, 0.4, 0.5) — and mode E's tables are in `tables`, so both sides only had
+  to stop assuming DRM30's. The cap is now the mode's: 0–1 for 16-QAM in A–D, 0–3 in E, and a
+  DRM30 station still refuses level 2 (asserted in `tests/mode_e_tx.rs`). The eight
+  constellation/level pairs are each checked against annex J table J.5's MSC input bits per
+  frame — 3 727 to 18 635.
 
   Still open: the transmit side underruns badly at 192 kHz (4× the samples of 48 kHz).
 
