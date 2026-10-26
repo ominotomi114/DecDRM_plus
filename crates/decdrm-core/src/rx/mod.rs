@@ -122,6 +122,12 @@ pub struct ReceiverConfig {
     /// the mode and the centre frequency are known. A pinned receiver runs at DC with no
     /// frequency search, so a signal pinned while off centre decodes nothing.
     pub pinned: Option<(RobustnessMode, SpectrumOccupancy)>,
+    /// DC carrier frequency of the input, Hz, for a **pinned** receiver: the mixer runs at
+    /// this offset instead of at 0. A pinned receiver does not search for the signal, and a
+    /// DRM+ recording whose carrier is off centre (the reference recordings carry +20 kHz)
+    /// would otherwise decode nothing. Ignored while searching — the scan finds the carrier
+    /// itself — and refined from there by the tracking loop once the FAC arrives.
+    pub dc_hz: Real,
 }
 
 /// The default MSC soft metric: the Huber shape with Dream's amplitude weighting and a
@@ -146,6 +152,7 @@ impl Default for ReceiverConfig {
             diversity_branch: false,
             working_rate: WorkingRate::R48,
             pinned: None,
+            dc_hz: 0.0,
         }
     }
 }
@@ -486,7 +493,10 @@ impl Receiver {
         self.acq = None;
         self.acq_power = None;
         self.conj = false;
-        self.dc_hz = 0.0;
+        // A pinned receiver was told where the signal is, which includes how far its carrier
+        // is from DC (`ReceiverConfig::dc_hz`). The tracking loop refines it once the FAC
+        // arrives; this is what gets the first FAC.
+        self.dc_hz = self.cfg.dc_hz;
         self.track_hz = 0.0;
         // Stay in `Acquisition`, NOT `Tracking`: pinning says where the signal is, not where
         // the frame boundary is. The receiver still has to find symbol 0 of the frame (FrameSync

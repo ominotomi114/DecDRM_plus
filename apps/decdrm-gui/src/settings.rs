@@ -437,6 +437,10 @@ pub struct Settings {
     pub receiver_mode: ReceiverMode,
     /// Pace recordings to real time (otherwise decode as fast as possible).
     pub realtime: bool,
+    /// DC carrier frequency of the input, Hz, for a pinned receiver (see
+    /// [`ReceiverConfig::dc_hz`]). A pinned receiver does not search for the carrier, so a
+    /// DRM+ recording whose carrier is off centre needs this.
+    pub dc_hz: f64,
     pub play_audio: bool,
     /// Sound-card output by name (`None` = system default).
     pub output_device: Option<String>,
@@ -497,6 +501,7 @@ impl Default for Settings {
             auto_flip: true,
             receiver_mode: ReceiverMode::Auto,
             realtime: true,
+            dc_hz: 0.0,
             play_audio: true,
             output_device: None,
             volume: 100.0,
@@ -590,6 +595,7 @@ impl Settings {
                 // offers no other mode to pin: A–D are expressed by the FAC and found by
                 // the search, so there is nothing to gain by pinning them.
                 pinned: self.receiver_mode.pinned(),
+                dc_hz: self.dc_hz,
                 ..ReceiverConfig::default()
             },
             play_audio: self.play_audio,
@@ -785,6 +791,7 @@ mod tests {
             auto_flip: false,
             receiver_mode: ReceiverMode::ModeE,
             realtime: false,
+            dc_hz: 20_000.0,
             play_audio: false,
             output_device: Some("Speakers".into()),
             volume: 35.0,

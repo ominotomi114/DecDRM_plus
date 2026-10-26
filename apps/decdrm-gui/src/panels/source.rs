@@ -191,6 +191,21 @@ pub fn show(
                 ui.checkbox(&mut settings.realtime, "Real time")
                     .on_hover_text("Pace the recording to real time instead of decoding it as fast as possible.");
             }
+            // The DC offset only matters for a *pinned* receiver: an unpinned one searches
+            // for the carrier, and pinning is the only reason to say where it is.
+            if settings.receiver_mode != ReceiverMode::Auto {
+                ui.add(
+                    egui::DragValue::new(&mut settings.dc_hz)
+                        .speed(50.0)
+                        .range(-96_000.0..=96_000.0)
+                        .suffix(" Hz"),
+                )
+                .on_hover_text(concat!(
+                    "DC carrier frequency of the input. A pinned receiver does not search for ",
+                    "the signal, so a DRM+ recording whose carrier is off centre (the ",
+                    "reference recordings carry +20 kHz) decodes nothing without it."
+                ));
+            }
             ui.separator();
             ui.checkbox(&mut settings.play_audio, "Audio").on_hover_text("Play the decoded audio.");
             if settings.play_audio {

@@ -83,13 +83,18 @@ struct RxArgs {
     /// or 192, because its 213 carriers reach ±47.11 kHz.
     #[arg(long, value_name = "KHZ", default_value_t = 48)]
     sample_rate: u32,
-    /// Decode robustness mode E (DRM+) instead of searching for one. The automatic search
-    /// cannot find DRM+ (its FAC cannot express the mode and the frequency scan is built for
-    /// 48 kHz), so a DRM+ signal must be named; it also has to be tuned to the centre of the
-    /// input (a pinned receiver runs at DC, without a frequency search). Implies the rate
-    /// mode E needs if --sample-rate is left at its default.
+    /// Decode robustness mode E (DRM+) instead of searching for one. Pinning is the reliable
+    /// way to receive DRM+ (the automatic search finds the signal but estimates its carrier
+    /// only to a few tens of Hz, which costs multiplex frames); it runs at DC with no
+    /// frequency search, so a signal whose carrier is off centre needs --dc too. Implies the
+    /// rate mode E needs if --sample-rate is left at its default.
     #[arg(long)]
     drm_plus: bool,
+    /// DC carrier frequency of the input in Hz, for a pinned receiver: the mixer runs here
+    /// instead of at 0. A DRM+ recording whose carrier is off centre cannot be pinned
+    /// without it. Ignored while searching for a signal.
+    #[arg(long, value_name = "HZ", default_value_t = 0.0)]
+    dc: f64,
     /// Pace file decoding to real time.
     #[arg(long)]
     realtime: bool,
@@ -252,6 +257,7 @@ fn rx(a: RxArgs) -> Result<()> {
         auto_flip: !a.no_auto_flip,
         working_rate,
         pinned,
+        dc_hz: a.dc,
         ..Default::default()
     };
     let engine = Engine::start(EngineConfig {
