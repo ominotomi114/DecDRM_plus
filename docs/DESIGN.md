@@ -1153,15 +1153,22 @@ needs 120 or 192 kHz; the input is resampled to whatever the receiver is configu
   128 of ~1.5 M output samples clipped, though: the real-IF output at 192 kHz peaks just over
   full scale (the same station without a simulator clips too), which wants a level check.
 
-  Not yet done: the form's `[simulate]` section still offers only the annex B presets, and mode
-  E's station audio is unverified end to end — its audio super frame should be 200 ms
-  (§5.3.1.0), while the station's pipeline is written around 400 ms frames. The DRM+ loopback
-  tests decode the multiplex through the receiver, but they bypass the station.
+  *The form offers them* (2026-11-01). The `[simulate]` card's picker now lists the six annex B
+  models and the three VHF presets; choosing a VHF one swaps `channel` for `vhf` plus Speed and
+  Band rows (0 km/h = parked, 200 MHz = Band III by default), and choosing an HF model removes
+  those keys again — `[simulate]` is `deny_unknown_fields`, so a leftover key would either fail
+  to load or describe a model that is not in use. `the_vhf_presets_replace_the_hf_channel_number`
+  checks the swap, the round trip through the station's parser, and that the speed and band
+  survive switching between VHF profiles.
 
-  Next: the GUI presets, the tuning pass on `params(E)`/`freq_wiener_len(E)`, and the mode E
-  audio-super-frame question above. MDI for DRM+ is separate: `robm` is two bits and cannot
-  name mode E — the receive side could take the mode from the FAC's RM flag, but `push_mdi`
-  still adds 400 ms of samples per frame, wrong for mode E's 100 ms.
+  Not yet done: mode E's station audio is unverified end to end — its audio super frame should
+  be 200 ms (§5.3.1.0), while the station's pipeline is written around 400 ms frames. The DRM+
+  loopback tests decode the multiplex through the receiver, but they bypass the station.
+
+  Next: the tuning pass on `params(E)`/`freq_wiener_len(E)`, and the mode E audio-super-frame
+  question above. MDI for DRM+ is separate: `robm` is two bits and cannot name mode E — the
+  receive side could take the mode from the FAC's RM flag, but `push_mdi` still adds 400 ms of
+  samples per frame, wrong for mode E's 100 ms.
 
 ## Conventions
 

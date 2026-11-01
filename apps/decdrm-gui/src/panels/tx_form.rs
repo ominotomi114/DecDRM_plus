@@ -1811,7 +1811,35 @@ const CHANNEL_MODELS: &[(&str, &str)] = &[
     ("4", "4 — CCIR poor"),
     ("5", "5 — severe Doppler"),
     ("6", "6 — severe Doppler and delay"),
+    ("ra", "VHF RA — rural (COST 207)"),
+    ("tu6", "VHF TU6 — typical urban"),
+    ("ht", "VHF HT — hilly terrain"),
 ];
+
+/// Apply a propagation-model choice to `[simulate]`. The VHF presets are a different shape
+/// from the annex B number: they replace `channel` with `vhf` plus a speed and a band, so
+/// the keys the chosen model does not use are removed rather than left stale (the station's
+/// `deny_unknown_fields` would accept them, but they would silently describe another model).
+fn set_simulation_model(sim: &mut dyn TableLike, choice: &str) {
+    match choice {
+        "ra" | "tu6" | "ht" => {
+            remove(sim, "channel");
+            set(sim, "vhf", choice);
+            if get_num(sim, "speed_kmh").is_none() {
+                set(sim, "speed_kmh", 0.0);
+            }
+            if get_num(sim, "carrier_mhz").is_none() {
+                set(sim, "carrier_mhz", 200.0);
+            }
+        }
+        number => {
+            remove(sim, "vhf");
+            remove(sim, "speed_kmh");
+            remove(sim, "carrier_mhz");
+            set(sim, "channel", number.parse::<i64>().unwrap_or(1));
+        }
+    }
+}
 
 fn simulator(ui: &mut Ui, doc: &mut DocumentMut) -> bool {
     let mut changed = false;
@@ -1832,13 +1860,31 @@ fn simulator(ui: &mut Ui, doc: &mut DocumentMut) -> bool {
     }
     let sim = section(doc, "simulate");
     grid(ui, "tx_form_sim", |ui| {
-        row_label(ui, "Channel model");
-        let model = get_int(sim, "channel").unwrap_or(1).to_string();
-        if let Some(v) = combo(ui, "tx_sim_model", &model, CHANNEL_MODELS, 240.0) {
-            set(sim, "channel", v.parse::<i64>().unwrap_or(1));
+        row_label(ui, "Propagation");
+        let model = get_str(sim, "vhf").unwrap_or_else(|| get_int(sim, "channel").unwrap_or(1).to_string());
+        if let Some(v) = combo(ui, "tx_sim_model", &model, CHANNEL_MODELS, 260.0) {
+            set_simulation_model(sim, &v);
             changed = true;
         }
         ui.end_row();
+        if get_str(sim, "vhf").is_some() {
+            // VHF: the profile's shape depends on the speed (0 = parked, no fading) and on
+            // the band (the Doppler shift is v·f/c).
+            row_label(ui, "Speed");
+            let mut speed = get_num(sim, "speed_kmh").unwrap_or(0.0);
+            if ui.add(egui::DragValue::new(&mut speed).range(0.0..=300.0).speed(1.0).suffix(" km/h")).changed() {
+                set(sim, "speed_kmh", speed);
+                changed = true;
+            }
+            ui.end_row();
+            row_label(ui, "Band");
+            let mut mhz = get_num(sim, "carrier_mhz").unwrap_or(200.0);
+            if ui.add(egui::DragValue::new(&mut mhz).range(40.0..=300.0).speed(1.0).suffix(" MHz")).changed() {
+                set(sim, "carrier_mhz", mhz);
+                changed = true;
+            }
+            ui.end_row();
+        }
         row_label(ui, "Noise");
         let mut noisy = sim.contains_key("snr_db");
         ui.horizontal(|ui| {
@@ -2289,9 +2335,50 @@ hierarchical = true
             RobustnessMode::E, decdrm_core::params::SpectrumOccupancy::SO_3).is_none());
     }
 
+    /// A VHF preset replaces the annex B channel number with the profile plus its speed and
+    /// band, and choosing an HF model again removes them: `[simulate]` is
+    /// `deny_unknown_fields`, so a key left behind is either a load error or a stale lie.
     #[test]
-    fn names_match_like_the_station_does() {
-        assert_eq!(canon("64-QAM"), canon("QAM64"));
+    fn the_vhf_presets_replace_the_hf_channel_number() {
+        let mut doc = DocumentMut::new();
+        let sim = section(&mut doc, "simulate");
+        set(sim, "channel", 3i64);
+        set_simulation_model(sim, "tu6");
+        assert_eq!(get_str(sim, "vhf").as_deref(), Some("tu6"));
+        assert!(sim.get("channel").is_none(), "the HF number is removed");
+        assert_eq!(get_num(sim, "speed_kmh"), Some(0.0), "parked by default");
+        assert_eq!(get_num(sim, "carrier_mhz"), Some(200.0), "Band III by default");
+
+        // The speed and band are kept when switching between VHF profiles; only a missing
+        // one gets a default.
+        set(sim, "speed_kmh", 100.0);
+        set(sim, "carrier_mhz", 98.0);
+        set_simulation_model(sim, "ra");
+        assert_eq!(get_str(sim, "vhf").as_deref(), Some("ra"));
+        assert_eq!(get_num(sim, "speed_kmh"), Some(100.0));
+        assert_eq!(get_num(sim, "carrier_mhz"), Some(98.0));
+
+        set_simulation_model(sim, "4");
+        assert_eq!(get_int(sim, "channel"), Some(4));
+        for key in ["vhf", "speed_kmh", "carrier_mhz"] {
+            assert!(sim.get(key).is_none(), "{key} left behind");
+        }
+
+        // What the form writes is what the station parses.
+        let mut doc = DocumentMut::new();
+        let sim = section(&mut doc, "simulate");
+        set_simulation_model(sim, "tu6");
+        set(sim, "speed_kmh", 100.0);
+        let text = doc.to_string();
+        let cfg = decdrm_station::StationConfig::from_toml_str(&text)
+            .unwrap_or_else(|e| panic!("the form's VHF section must parse: {e}\n{text}"));
+        let sim = cfg.simulate.expect("the section survives");
+        assert_eq!(sim.vhf, Some(decdrm_station::VhfProfile::Tu6));
+        assert_eq!(sim.speed_kmh, 100.0);
+    }
+
+    #[test]
+    fn names_match_like_the_station_does() {        assert_eq!(canon("64-QAM"), canon("QAM64"));
         assert_eq!(canon("64qam"), "64qam");
         assert_eq!(canon("HE-AAC v2"), canon("he_aac_v2"));
         assert_ne!(canon("16-QAM"), canon("64-QAM"));
