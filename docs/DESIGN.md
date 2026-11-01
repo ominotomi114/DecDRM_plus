@@ -263,6 +263,128 @@ needs 120 or 192 kHz; the input is resampled to whatever the receiver is configu
       the monitor on; through VB-Audio cable A (ignored test, inaudible) an I/Q file of
       1 kHz on I and 3 kHz on Q came back 1 kHz left and 3 kHz right at the input's
       level, paced in real time.
+- [x] **App icon** (2026-10-25) — DecDRM had none. Original artwork in `assets/icon/`:
+      a DRM OFDM spectrum (teal carriers, three boosted amber gain pilots), the middle
+      pilot sending radio waves, on a rounded dark-blue square. `decdrm.svg` (32 px and
+      up) and `decdrm-small.svg` (16/24 px, drawn on a 16-pixel grid);
+      `scripts/make-icon.py` renders `png/decdrm-{16..256}.png` with resvg's CLI
+      (`cargo install resvg`) and packs them into `decdrm.ico` (PNG entries). The GUI
+      sets the 256 px PNG as window/taskbar icon (`ViewportBuilder::with_icon`, compiled
+      in); `build.rs` in both apps embeds the .ico and version information in the
+      Windows exes (`winresource`, only when the target is Windows, so Linux builds
+      skip it). Checked: Explorer's icon of both exes, `WM_GETICON` of the GUI window.
+- [x] **DAC joint stereo** (2026-10-25) — the user asked for joint stereo in the DAC
+      codec (someone else showed "DAC joint stereo, 12 kbit/s mid + 1.5 kbit/s side,
+      24 kHz" without sharing code; written here from scratch).
+      *Measured first* (stereo music: an Opus test transmission decoded to WAV, 36 s,
+      side 8–10 dB below mid; whole-signal DAC, 16-codebook mid): left/right
+      log-spectral distance 5.2 dB with no side (mono), 2.8 with a 2-codebook side
+      (1.5 kbit/s), 2.3 with 4, 1.8 with 8. Raising the side's level by 6 or 12 dB
+      before coding did not help (6 dB: the same, 12 dB: worse), so no side gain.
+      *Done:* `DacConfig::side` (`SideCoding`), signalled as a second parameter byte
+      after the first (`\0DAC1 pp ss`, same layout; format 1 receivers ignore it and
+      play the mid signal). Super frame = the mid block exactly as a mono super frame,
+      then the side block with its own CRC regions and repetition
+      (`framing::pack_super_frame` / `unpack_super_frame`). Planner
+      `choose_stereo_config`: side = an eighth of the mid's rate, at least 1.5
+      kbit/s (`default_side`), the largest mid that fits with it, spare bytes to the
+      mid's framing first. `DacDrmEncoder` takes interleaved stereo and codes M/S with
+      two encoder states under `rayon::join`; `DacDecoder` keeps a `Channel` (network
+      state + concealment memory) per signal, decodes them side by side, outputs
+      L = M + S, R = M − S. A lost mid frame drops its side frame too; a side lost
+      alone is concealed (bridged, faded), which fades to mono. Station: `stereo =
+      true` with DAC, `side_bandwidth_kbps`; GUI form *Joint stereo* + *Side bit
+      rate*; engine shows "DAC joint stereo, 12 kbit/s mid + 1.5 kbit/s side, 24 kHz"
+      and a Stereo tag. The SDC's audio mode stays 00 (rfa for coding 10).
+      *CPU:* this machine is a Ryzen 7 4800H laptop (the RTFs above were a 9800X3D):
+      mono 12 kbit/s decode RTF ≈ 0.6, joint stereo ≈ 0.95–1.0, encode 0.35 / 0.54.
+      Stacking both signals' rows into one matrix product was no faster than
+      `rayon::join` (micro-benchmark per layer shape), so no batching. The matrix
+      products are about two thirds of decode time; the decoder's first transposed
+      convolution (30 rows × 1536 × 12288 per super frame) is now computed as
+      (Wᵀ·xᵀ)ᵀ: 23 → 6.5 ms, identical output (decode RTF 0.63 → 0.58 here).
+      Tests: config/framing/plan units (round trips, a mono reader of a stereo super
+      frame, side errors leave the mid alone, planner monotonic), model test
+      `joint_stereo_round_trip` (tones on their sides, 18 dB separation at 12 + 3;
+      a mono decoder gets exactly (L + R) / 2 from the same super frames; garbage side
+      blocks → 60 side frames concealed, mono at full level), station planning and
+      `dac_joint_stereo_mode_b_loopback` (mode B 64-QAM, 12 + 3 kbit/s: tones at
+      ~23 dB separation, no frame concealed). With a 1.5 kbit/s side the same two
+      steady tones separated by only ~6 dB: low side rates suit music better than
+      test tones.
+- [x] **RSS feeds as Journaline pages** (2026-10-25) — someone's DecDRM fork carries
+      RSS feeds in Journaline and does not share its code; the user asked for the same
+      feature, written here from a 60 s recording of its transmission only.
+      *The recording* (`drm_station.wav`, mono 48 kHz real IF, DC carrier 10 kHz,
+      decoded with `decdrm rx` and the new diagnostic `--example jmldump` of
+      decdrm-engine, which prints every Journaline data group with its NML codes
+      shown): mode B, SO3, 16-QAM, long interleaving, a DAC audio service "WWWW" and a
+      data service "Data 2", id 0xD0D002 (the GUI's defaults for a new data service),
+      Journaline in packet mode, packet id 0, 45-byte packets (DecDRM's default), 4.80
+      kbit/s (4800 bit/s requested is exactly 5 packets per frame). Their GUI shows
+      the root "News feeds" with three feeds and 34 pages, as ours does.
+      Page tree, object ids given out in order: 0 = menu "News feeds", one entry per
+      feed, the entry text the channel's `<title>` ("BBC News", "NBC News Top
+      Stories", "TIME"); then for each feed its menu (title = channel title, one entry
+      per item, the item's title in full) followed by its items' pages: BBC menu 1,
+      items 2–11; NBC menu 12, items 13–22; TIME menu 23, items 24–33. Ten items per
+      feed (all three feeds have more). Each item is a plain-text object (type 2):
+      title = item title, body = description, two NML line breaks (0x10 0x10), the
+      item's link; an item without a link has the description alone. No dates, no
+      title-only pages, no list objects, no links other than menu links. Text is
+      UTF-8 as in the feeds (typographic quotes, dashes, "…" kept), entities and
+      CDATA resolved, no HTML left, white space trimmed; nothing was shortened (titles
+      up to 103 bytes, descriptions up to 303, pages up to 527 bytes, menus up to
+      882). Transport exactly as DecDRM's own `JournalineEncoder`: type-0 MSC data
+      groups with CRC, no extension, segment or user access field, one object each,
+      continuity counter per group, objects in id order (34 objects, a cycle of 23.3
+      s), uncompressed, static flag 0, no extended header, revision 0 throughout (no
+      update within the 60 s, so the refresh period is not observable). Nothing on
+      the air departs from TS 102 979 or from what DecDRM already sends; the link is
+      plain text in the body. One oddity: on the NBC feed each page's title belongs
+      to the item before (its description and link agree with each other, the title
+      not), and titles repeat — apparently their parser's doing on that feed's markup
+      (probably namespaced `media:` elements); not reproduced: here title,
+      description and link always come from the same item, and only plain or Atom
+      elements directly inside the item count (`media:title` etc. are ignored).
+      *Done:* `decdrm_station::feeds` — parser (quick-xml, the GUI's version) for
+      RSS 2.0, RSS 1.0/RDF and Atom: item title, description (Atom summary; else
+      `content:encoded` / Atom content), link (Atom `link` without `rel` or
+      `alternate`; else a permalink `guid`); documents declared ISO-8859-1 /
+      windows-1252, or not UTF-8, converted; damage after the first items keeps
+      those. Text: HTML tags removed (`<br>`, block ends → line breaks in
+      descriptions), XML and common HTML entities decoded, control characters
+      dropped, white space collapsed. `feed_pages` builds the recording's tree; a
+      title or entry is clipped at 200 bytes, a description shortened with "…" to
+      keep the page within 4092 bytes, a menu that would not fit loses its last
+      items. Ids are positional, as in the recording: an item keeps its page while it
+      keeps its place, and a new item at the top changes the pages after it (each
+      with the next revision, sent first by the carousel). `FeedWatch`: the first
+      fetch in `Station::new` (none of the feeds fetched = the station's error, some
+      failing = logged, tried again with the others), then a thread fetches every
+      `feed_refresh` seconds (webstream's HTTP/1.1 + rustls client, at most 4 MiB a
+      feed, the stop flag on drop) and the frame loop loads each finished fetch into
+      the carousel with `replace_all` (the *Live Journaline updates* path); a feed
+      that fails keeps its pages. `JournalineWatch` takes a page file or feeds;
+      `reload_journaline()` (GUI *Update*) asks for a fetch now. Config on the
+      Journaline application: `feeds = [...]` (instead of `path`), `feed_refresh`
+      (default 600 s, at least 60), `feed_items` (default 10, 1–50), `feed_title`
+      (default "News feeds"); at most 20 feeds. Status `JournalineStatus::feeds`
+      (`FeedStatus`: URL, title, items, error), the feeds' errors as the
+      application's error. GUI: the Journaline row's *Page file / RSS feeds* switch,
+      the URLs one per line, *Every … min*, *… items*, the root title; the
+      Transmitter tab shows "N pages from K feeds" with each feed in the tooltip. CLI
+      status lines say "from K feeds". The receiver needed nothing new. Tests (all
+      on 127.0.0.1): parser units (RSS with `media:title` and an `<image>` title,
+      Atom with several links and XHTML content, RDF, Latin-1, damage, HTML), the
+      page tree and its bytes against the recording's, size limits, `FeedWatch`
+      (schedule, a failing feed keeps its items, fetch on request, nothing fetched
+      fails), `JournalineWatch` with feeds (log, status, revisions), the GUI form,
+      and `journaline_feeds_loopback` (an RSS and an Atom feed, mode B 16-QAM 4.8
+      kbit/s like the recording, a new item while transmitting: the receiver gets
+      the tree, then the changed pages with revision 1 and the new page). Checked
+      by hand: `decdrm tx` with feeds from a local server, `jmldump` of its output
+      shows the recording's layout.
 - [x] **Corrupt xHE-AAC frames concealed; Smooth SBR** (2026-10-07) — from the overnight
       CNR survey (2026-10-06/07: 6030 and 13835 kHz on Korean, Japanese and Taiwanese
       Kiwis, decoded by FDK-AAC and an instrumented libxaac). (1) The session handed

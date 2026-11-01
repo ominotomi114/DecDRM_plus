@@ -507,6 +507,11 @@ pub struct AudioSettings {
     /// important codebooks).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bandwidth_kbps: Option<f64>,
+    /// DAC with `stereo = true` (joint stereo) only: bit rate of the side signal's
+    /// codes, kbit/s — 1.5, 3, 6, 12 or 24. Default: an eighth of the mid signal's
+    /// (`bandwidth_kbps`), at least 1.5.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub side_bandwidth_kbps: Option<f64>,
 }
 
 fn default_share() -> f64 {
@@ -529,6 +534,7 @@ impl AudioSettings {
             part: Part::B,
             hierarchical: false,
             bandwidth_kbps: None,
+            side_bandwidth_kbps: None,
         }
     }
 }
@@ -672,6 +678,20 @@ pub struct AppSettings {
     /// EPG: programmes of the schedule (`[[service.data.programme]]`).
     #[serde(rename = "programme", default)]
     pub programmes: Vec<EpgProgramme>,
+    /// Journaline: RSS or Atom feed URLs (`http://` or `https://`), instead of a page
+    /// file: a root menu of the feeds, each feed a menu of its items, each item a page
+    /// with its description and link; fetched again every `feed_refresh` seconds.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub feeds: Vec<String>,
+    /// Journaline feeds: seconds between fetches (default 600, at least 60).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub feed_refresh: Option<u32>,
+    /// Journaline feeds: items per feed, the first ones of each (default 10, 1-50).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub feed_items: Option<usize>,
+    /// Journaline feeds: title of the root menu (default "News feeds").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub feed_title: Option<String>,
 }
 
 fn default_app_bitrate() -> u32 {
@@ -699,6 +719,10 @@ impl AppSettings {
             segment_size: None,
             compress: false,
             programmes: Vec::new(),
+            feeds: Vec::new(),
+            feed_refresh: None,
+            feed_items: None,
+            feed_title: None,
         }
     }
 
