@@ -229,7 +229,7 @@ impl ChannelSimulator {
         let map = CellMap::new(layout.mode, layout.occupancy).expect("a ChannelLayout is always valid");
         let fs = Real::from(SAMPLE_RATE);
         let system_bw = map.num_carriers as Real * fs / layout.mode.fft_size() as Real;
-        Self::with_reference(map.avg_power_per_symbol, layout.occupancy.bandwidth_khz() * 1000.0, system_bw, cfg)
+        Self::with_reference(map.avg_power_per_symbol, layout.bandwidth_khz() * 1000.0, system_bw, cfg)
     }
 
     /// Simulator for an arbitrary complex signal of mean power `signal_power` whose

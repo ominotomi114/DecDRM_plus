@@ -896,6 +896,45 @@ needs 120 or 192 kHz; the input is resampled to whatever the receiver is configu
   the station's own validation accepts those. See "What robustness mode E changes in the rest
   of the form" in `tx_form.rs`.
 
+  *Fixed in the receiver's displays* (2026-10-26): the three readouts that come from the
+  channel parameters were all wrong for mode E, and all three for the same reason — each
+  read a mode E value with a DRM30 table, exactly as the FAC parser had. §6.3.3 says the
+  spectrum-occupancy parameter's interpretation "is dependent on the value of the RM flag",
+  and table 48 gives value `0` two meanings: 4.5 kHz for modes A–D and **100 kHz** for mode E.
+  `SpectrumOccupancy::bandwidth_khz` had no mode argument, so it always answered 4.5. Each
+  fault is measured against the pre-fix binary on the same 4-QAM LPP0 recording pinned with
+  `--drm-plus --format iq --dc 20000`, whose decoding is identical before and after (FAC 309,
+  SDC 77, MSC 307, 566 audio frames, 0 concealed):
+
+  - **The bandwidth read 4.5 kHz.** The CLI's status line and the GUI's "BW" field printed
+    `SO0 (4.5 kHz)`; they now print `SO0 (100 kHz)`. The mode now reaches the bandwidth
+    through `bandwidth_khz(mode)` and `ChannelLayout::bandwidth_khz()`, and
+    `SpectrumOccupancy`'s own `Display` names only the parameter (`SO0`) since it cannot know
+    the mode. Callers updated: the CLI status line, the GUI status strip, the CSV logger's
+    `bandwidth_khz` column, and the station's plan/modulator summaries.
+  - **The SNR read 13.5 dB too high** — 54.4 dB instead of 40.9 dB on that recording. The
+    channel estimator refers its SNR from the system bandwidth to the nominal one
+    (`sys_to_nom_bw`); with the DRM30 reading the ratio is 94 667/4 500 ≈ 21× (+13.2 dB)
+    where it should be 94 667/100 000 ≈ 0.95 (−0.24 dB), so the printed figure was inflated
+    by 10·log10(100 000/4 500) = **13.47 dB**. Measured on the same signal: 53.7/54.4/54.4 dB
+    before, 40.3/40.8/40.9 dB after — the same 13.5 dB drop at every status line, while MER,
+    WMER, Doppler and the FAC/SDC/MSC counts are unchanged. That field feeds only
+    `stats.snr_db` and the per-carrier SNR plot, never the equaliser or any decision, so this
+    is a display correction and cannot move a decode.
+  - **The bit rate read 4× too low.** `stream_bitrate` divided by a hardcoded 400 ms, but
+    §8.1 gives mode E **100 ms** logical frames ("the logical frames are each 100 ms long";
+    its 200 ms audio super frame spans two of them). The duration now comes from
+    `RobustnessMode::frame_ms()`, so DRM+ streams report 4× the old figure. The transmit
+    side's multiplex bar already had this fix; this is the receive side's `stream_bitrate`,
+    which feeds `ServiceView::audio_bitrate` and each application's `stream_bitrate` — the
+    service bars in the GUI. *Verified end to end:* the recording delivers 307 multiplex
+    frames in 31.2 s, i.e. 101.6 ms per frame, confirming the 100 ms geometry.
+
+  The receive-side and transmit-side fixes are the same three misreadings, so a DRM+ station
+  now agrees with the receiver that decodes it. Not changed: `Source::position_s` keeps its
+  400 ms for MDI input — MDI's `robm` field is 2 bits (§ "robm", 0–3 = A–D) and cannot carry
+  mode E, so a 400 ms frame there is correct.
+
   *Both of mode E's constellations now encode, at all four of its levels each* (2026-10-26).
   The transmitter capped 16-QAM at level 1 in every mode (the DRM30 table 30 cap), and the
   form hid 4-QAM for mode E on the grounds that its rates were not encodable. §7.5.1 gives

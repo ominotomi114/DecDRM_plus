@@ -177,7 +177,7 @@ fn metrics_row(signal_s: f64, session: &Session, snap: &Snapshot) -> Vec<Value> 
         Value::Num(Some(signal_s), 2),
         Value::Str(format!("{:?}", rx.state)),
         Value::Str(rx.mode.map(|m| m.to_string()).unwrap_or_default()),
-        Value::Num(rx.occupancy.map(|o| o.bandwidth_khz()), 1),
+        Value::Num(rx.mode.zip(rx.occupancy).map(|(m, o)| o.bandwidth_khz(m)), 1),
         Value::Num(rx.dc_frequency_hz, 1),
         Value::Num(Some(rx.sro_hz), 3),
         Value::Num(rx.snr_db, 1),

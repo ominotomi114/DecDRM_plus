@@ -335,22 +335,33 @@ impl SpectrumOccupancy {
         self.0 as usize
     }
 
-    /// Nominal channel bandwidth in kHz.
-    pub const fn bandwidth_khz(self) -> f64 {
-        match self.0 {
-            0 => 4.5,
-            1 => 5.0,
-            2 => 9.0,
-            3 => 10.0,
-            4 => 18.0,
-            _ => 20.0,
+    /// Nominal channel bandwidth in kHz **for `mode`** (§8.3, table 48).
+    ///
+    /// The occupancy parameter is not enough on its own: §6.3.3 says its interpretation
+    /// "is dependent on the value of the RM flag". With RM = 0 (modes A–D), value `0` is
+    /// 4.5 kHz; with RM = 1 (**mode E**) it is **100 kHz**, the DRM+ raster. Mode E defines
+    /// occupancy 0 only, so any other value with mode E is undefined and reported as 100 kHz
+    /// — `carrier_range` is `None` for it, so no `ChannelLayout` can hold one.
+    pub const fn bandwidth_khz(self, mode: RobustnessMode) -> f64 {
+        match mode {
+            RobustnessMode::E => 100.0,
+            _ => match self.0 {
+                0 => 4.5,
+                1 => 5.0,
+                2 => 9.0,
+                3 => 10.0,
+                4 => 18.0,
+                _ => 20.0,
+            },
         }
     }
 }
 
 impl fmt::Display for SpectrumOccupancy {
+    /// Just the parameter: `SO0`. The bandwidth it stands for depends on the robustness
+    /// mode (§6.3.3), so it is [`SpectrumOccupancy::bandwidth_khz`]'s job, not this one's.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "SO{} ({} kHz)", self.0, self.bandwidth_khz())
+        write!(f, "SO{}", self.0)
     }
 }
 
@@ -466,11 +477,19 @@ impl ChannelLayout {
         let (kmin, kmax) = self.carrier_range();
         (kmax - kmin + 1) as usize
     }
+
+    /// Nominal channel bandwidth in kHz (§8.3, table 48) — the mode-aware form of
+    /// [`SpectrumOccupancy::bandwidth_khz`], which this layout's mode and occupancy fix.
+    pub const fn bandwidth_khz(self) -> f64 {
+        self.occupancy.bandwidth_khz(self.mode)
+    }
 }
 
 impl fmt::Display for ChannelLayout {
+    /// The bandwidth needs the mode (§6.3.3), so this is the place to name both: e.g.
+    /// `mode B / SO3 (10 kHz)`, `mode E / SO0 (100 kHz)`.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "mode {} / {}", self.mode, self.occupancy)
+        write!(f, "mode {} / {} ({} kHz)", self.mode, self.occupancy, self.bandwidth_khz())
     }
 }
 
@@ -572,6 +591,38 @@ mod tests {
         assert_eq!(unused_carriers(RobustnessMode::A), &[-1, 0, 1]);
         assert_eq!(unused_carriers(RobustnessMode::B), &[0]);
         assert_eq!(unused_carriers(RobustnessMode::D), &[0]);
+    }
+
+    /// §6.3.3: the occupancy parameter's meaning "is dependent on the value of the RM
+    /// flag". Value 0 is 4.5 kHz for modes A–D and 100 kHz for mode E (table 48), so a
+    /// bandwidth taken from the occupancy alone is wrong for DRM+ — which is what the
+    /// receiver used to display (4.5 kHz) and what skewed its SNR by ~21x in power.
+    #[test]
+    fn occupancy_zero_means_100_khz_for_mode_e() {
+        let so0 = SpectrumOccupancy::SO_0;
+        assert_eq!(so0.bandwidth_khz(RobustnessMode::A), 4.5);
+        assert_eq!(so0.bandwidth_khz(RobustnessMode::B), 4.5);
+        assert_eq!(so0.bandwidth_khz(RobustnessMode::D), 4.5);
+        assert_eq!(so0.bandwidth_khz(RobustnessMode::E), 100.0, "table 48, RM = 1");
+        // The mode-aware layout form agrees.
+        let e = ChannelLayout::new(RobustnessMode::E, so0).unwrap();
+        assert_eq!(e.bandwidth_khz(), 100.0);
+        assert_eq!(e.to_string(), "mode E / SO0 (100 kHz)");
+        // A–D keep their table 48 values through both forms.
+        for (so, khz) in [
+            (SpectrumOccupancy::SO_0, 4.5),
+            (SpectrumOccupancy::SO_1, 5.0),
+            (SpectrumOccupancy::SO_2, 9.0),
+            (SpectrumOccupancy::SO_3, 10.0),
+            (SpectrumOccupancy::SO_4, 18.0),
+            (SpectrumOccupancy::SO_5, 20.0),
+        ] {
+            assert_eq!(so.bandwidth_khz(RobustnessMode::B), khz, "{so}");
+            assert_eq!(ChannelLayout::new(RobustnessMode::B, so).unwrap().bandwidth_khz(), khz);
+        }
+        // Display names just the parameter; the bandwidth needs the mode.
+        assert_eq!(so0.to_string(), "SO0");
+        assert_eq!(SpectrumOccupancy::SO_3.to_string(), "SO3");
     }
 
     #[test]

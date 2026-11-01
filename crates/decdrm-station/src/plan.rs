@@ -284,7 +284,7 @@ impl MultiplexPlan {
             s,
             "mode {} / {} kHz (SO {}), MSC {} {prot}{hier}, SDC {}, {} interleaving",
             t.mode,
-            t.occupancy.bandwidth_khz(),
+            t.occupancy.bandwidth_khz(t.mode),
             t.occupancy.value(),
             crate::config::MscModeSetting(t.msc_mode),
             crate::config::SdcModeSetting(t.sdc_mode),

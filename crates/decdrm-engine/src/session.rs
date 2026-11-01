@@ -915,15 +915,16 @@ impl Session {
     /// is described as that audio (not decodable).
     pub fn service_views(&self) -> Vec<crate::snapshot::ServiceView> {
         let lengths = self.ens.stream_lengths();
+        let mode = self.mode();
         self.ens
             .services()
             .map(|s| {
-                let mut v = service_view(s, &lengths);
+                let mut v = service_view(s, &lengths, mode);
                 if v.audio.is_none()
                     && let Some(c) = self.evs.iter().find(|c| c.short_id == s.short_id && c.locked())
                 {
                     v.audio = Some(evs_view(c));
-                    v.audio_bitrate = stream_bitrate(&lengths, c.app.stream_id);
+                    v.audio_bitrate = stream_bitrate(&lengths, c.app.stream_id, mode);
                     v.decodable = false;
                     v.warning = Some(EVS_WARNING.into());
                 }
@@ -978,12 +979,17 @@ fn evs_view(c: &EvsChannel) -> crate::snapshot::AudioCodingView {
     }
 }
 
-/// Bit rate of a stream of `lengths` (bytes per 400 ms multiplex frame), bit/s.
-fn stream_bitrate(lengths: &[StreamLengths], stream: u8) -> Option<f64> {
-    lengths.get(usize::from(stream)).map(|l| (l.part_a + l.part_b) as f64 * 8.0 / 0.4)
+/// Bit rate of a stream of `lengths` (bytes per *logical* frame of `mode`), bit/s.
+///
+/// A logical frame is 400 ms in modes A–D but **100 ms in mode E** (§8.1: "the logical
+/// frames are each 100 ms long"), so the duration has to come from the mode — a fixed
+/// 400 ms reports every DRM+ stream at a quarter of its real rate.
+fn stream_bitrate(lengths: &[StreamLengths], stream: u8, mode: RobustnessMode) -> Option<f64> {
+    let frame_s = f64::from(mode.frame_ms()) / 1000.0;
+    lengths.get(usize::from(stream)).map(|l| (l.part_a + l.part_b) as f64 * 8.0 / frame_s)
 }
 
-fn service_view(s: &ServiceInfo, lengths: &[StreamLengths]) -> crate::snapshot::ServiceView {
+fn service_view(s: &ServiceInfo, lengths: &[StreamLengths], mode: RobustnessMode) -> crate::snapshot::ServiceView {
     let audio_stream = s.audio.as_ref().map(|a| a.stream_id);
     let audio_lengths = audio_stream.and_then(|id| lengths.get(usize::from(id)));
     let fac_language = s.fac.filter(|f| f.language != 0).and_then(|_| s.fac_language());
@@ -999,7 +1005,7 @@ fn service_view(s: &ServiceInfo, lengths: &[StreamLengths]) -> crate::snapshot::
             .or_else(|| s.language_code.clone().filter(|c| !c.is_empty() && c != "---"))
             .unwrap_or_default(),
         audio: s.audio.as_ref().map(audio_view),
-        audio_bitrate: audio_stream.and_then(|id| stream_bitrate(lengths, id)),
+        audio_bitrate: audio_stream.and_then(|id| stream_bitrate(lengths, id, mode)),
         audio_part_a_percent: audio_lengths
             .filter(|l| l.part_a + l.part_b > 0)
             .map(|l| 100.0 * l.part_a as f64 / (l.part_a + l.part_b) as f64),
@@ -1014,7 +1020,7 @@ fn service_view(s: &ServiceInfo, lengths: &[StreamLengths]) -> crate::snapshot::
                     stream_id: a.stream_id,
                     packet_mode: a.packet_mode,
                     packet_id: a.packet_id,
-                    stream_bitrate: stream_bitrate(lengths, a.stream_id),
+                    stream_bitrate: stream_bitrate(lengths, a.stream_id, mode),
                 }
             })
             .collect(),
@@ -1349,7 +1355,7 @@ mod tests {
             applications: vec![app(1, 0, 0x002)],
             conditional_access: Vec::new(),
         };
-        let v = service_view(&audio, &lengths);
+        let v = service_view(&audio, &lengths, RobustnessMode::B);
         let a = v.audio.as_ref().unwrap();
         assert_eq!((a.codec.as_str(), a.sbr, a.parametric_stereo, a.stereo), ("AAC", true, true, false));
         assert_eq!((a.sample_rate_hz, a.output_rate_hz, a.text), (24_000, 48_000, true));
@@ -1369,11 +1375,27 @@ mod tests {
             applications: vec![app(1, 1, 0x44A), app(1, 2, 0x123)],
             ..Default::default()
         };
-        let v = service_view(&data, &lengths);
+        let v = service_view(&data, &lengths, RobustnessMode::B);
         assert!(v.audio.is_none() && v.audio_bitrate.is_none() && !v.decodable && v.ca);
         let names: Vec<&str> = v.apps.iter().map(|a| a.name.as_str()).collect();
         assert_eq!(names, ["Journaline", "application 0x123"]);
         assert_eq!(v.programme_type, None);
         assert_eq!(v.language, "", "no FAC language and no SDC code");
+    }
+
+    /// A logical frame is 400 ms in modes A–D but 100 ms in mode E (§8.1), so the same
+    /// bytes per frame mean four times the bit rate in DRM+. Reporting a DRM+ stream at
+    /// its mode A rate is the bug this pins.
+    #[test]
+    fn stream_bitrate_uses_the_modes_frame_duration() {
+        let lengths = [StreamLengths { part_a: 100, part_b: 500 }, StreamLengths { part_a: 0, part_b: 60 }];
+        assert_eq!(stream_bitrate(&lengths, 0, RobustnessMode::B), Some(12_000.0), "600 B / 400 ms");
+        assert_eq!(stream_bitrate(&lengths, 0, RobustnessMode::E), Some(48_000.0), "600 B / 100 ms");
+        assert_eq!(stream_bitrate(&lengths, 1, RobustnessMode::E), Some(4_800.0), "60 B / 100 ms");
+        // A–D all keep the 400 ms frame; only E is shorter.
+        for m in [RobustnessMode::A, RobustnessMode::C, RobustnessMode::D] {
+            assert_eq!(stream_bitrate(&lengths, 0, m), Some(12_000.0), "mode {m} frame is 400 ms");
+        }
+        assert_eq!(stream_bitrate(&lengths, 2, RobustnessMode::E), None, "no such stream");
     }
 }

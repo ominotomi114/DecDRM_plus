@@ -383,8 +383,8 @@ impl Modulator {
                 let g = MscGeometry { vspp_bits: cap.vspp_bits, hpp_bits: cap.hpp_bits, lpp_bits: cap.lpp_bits };
                 let channel = format!(
                     "mode {}, {} kHz, {}, {} interleaving",
-                    ["A", "B", "C", "D"][mode.index()],
-                    ch.occupancy.bandwidth_khz(),
+                    mode,
+                    ch.occupancy.bandwidth_khz(mode),
                     crate::config::MscModeSetting(ch.msc_mode),
                     crate::config::InterleavingSetting(ch.interleaving)
                 );

@@ -150,7 +150,11 @@ impl ChannelEstimator {
         let ns = map.symbols_per_frame;
         let sym_rate = Real::from(rate.hz()) / map.mode().symbol_len_at(rate) as Real;
         let sys_bw = n_car as Real / map.mode().fft_size_at(rate) as Real * Real::from(rate.hz());
-        let nom_bw = map.occupancy().bandwidth_khz() * 1000.0;
+        // The nominal bandwidth is the mode's, not the occupancy's alone: §6.3.3 gives
+        // occupancy 0 a second meaning for mode E (100 kHz, not 4.5), and this ratio is
+        // how the SNR is referred from the system bandwidth to the nominal one. Using the
+        // DRM30 reading here would scale a DRM+ SNR by ~21x (+13.5 dB).
+        let nom_bw = map.layout.bandwidth_khz() * 1000.0;
         let mut est = Self {
             n_car,
             x,

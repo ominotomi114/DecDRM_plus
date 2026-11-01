@@ -77,10 +77,10 @@ pub fn show(ui: &mut Ui, rx: &RxSession) {
         ui.label(RichText::new(state).strong());
         let mode = r.mode.map_or_else(|| "–".to_string(), |m| m.to_string());
         value(ui, "Mode", mode);
-        let bw = r.occupancy.map_or_else(
-            || "–".to_string(),
-            |o| format!("{} kHz (SO{})", o.bandwidth_khz(), o.value()),
-        );
+        let bw = match (r.mode, r.occupancy) {
+            (Some(m), Some(o)) => format!("{} kHz (SO{})", o.bandwidth_khz(m), o.value()),
+            _ => "–".to_string(),
+        };
         value(ui, "BW", bw);
         if r.inverted {
             ui.label(RichText::new("inverted").italics())

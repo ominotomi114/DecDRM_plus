@@ -374,7 +374,10 @@ fn print_status(s: &decdrm_engine::Snapshot) {
         s.input.position_s,
         r.state,
         r.mode.map(|m| m.to_string()).unwrap_or_else(|| "-".into()),
-        r.occupancy.map(|o| o.to_string()).unwrap_or_default(),
+        match (r.mode, r.occupancy) {
+            (Some(m), Some(o)) => format!("{o} ({} kHz)", o.bandwidth_khz(m)),
+            _ => String::new(),
+        },
         f1(r.dc_frequency_hz),
         f1(r.snr_db),
         f1(r.mer_db),
