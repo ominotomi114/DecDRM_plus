@@ -8,7 +8,8 @@ milestone checklist (keep it current).
 - `crates/decdrm-core` — pure-Rust PHY/FEC/multiplex: `params`, `tables`, `cellmap`,
   `fec/` (CRC, dispersal, interleavers, conv code, Viterbi, QAM metrics, MLC),
   `interleave` (MSC cell interleaver), `fac`, `rx/` (receiver chain; `rx::diversity`
-  combines two receivers' MSC cells), `tx/`, `channel/`,
+  combines two receivers' MSC cells), `tx/`, `channel/` (annex B HF and COST 207 VHF
+  models, at any working rate),
   `mux/` (SDC, service info, MSC demux, audio super frames, text messages), `dsp/`.
 - `crates/decdrm-codecs` (+ `decdrm-fdk-sys`, `decdrm-opus-sys`, `decdrm-xaac-sys`) —
   FDK-AAC / libopus / libxaac (xHE-AAC encoder, patched at build time) FFI.

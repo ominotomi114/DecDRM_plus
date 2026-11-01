@@ -1079,6 +1079,46 @@ needs 120 or 192 kHz; the input is resampled to whatever the receiver is configu
   192 kHz DRM+ receiver are now drawn where they belong rather than on a 48 kHz axis. A rate
   change restarts the waterfall's history (the axis and bin width change with it).
 
+- [ ] **VHF multipath simulation** (started 2026-11-01) — the channel simulator ran the
+  HF models of ES 201 980 annex B at a fixed 48 kHz. DRM+ runs at 120/192 kHz on VHF
+  (Band I/II/III), where the impairments are different in kind: its guard interval is
+  **250 µs** (`Tg = 3T = 250 µs`), so COST 207's rural and urban profiles sit *deep*
+  inside it and the interesting echoes are the long ones (an SFN, a mountain), and a car
+  sees Doppler shifts an order of magnitude above annex B's — 9.3 Hz at 100 km/h on
+  100 MHz, 18.5 Hz at 200 MHz.
+
+  *Rate-aware, with true sub-sample delays.* `ChannelSimulator::new_at(layout, rate, cfg)`
+  converts the paths, the Doppler steps and the noise reference at the working rate;
+  `new` stays the 48 kHz case for A–D. The SNR definition is unchanged (in the nominal
+  channel bandwidth, which for mode E is the 100 kHz of table 48), so at 192 kHz the noise
+  power is `P·192 000/(SNR·100 000)` and the system bandwidth is 213·192 000/432 =
+  94.67 kHz. Delays are **not** rounded to whole samples: at 192 kHz COST 207's taps are
+  sub-sample (0.2 µs = 0.038 samples), so each path adds a 16-tap Hamming-windowed sinc
+  interpolation and the model carries a fixed 7-sample latency, keeping relative delays
+  exact. Rounding would merge TU6's six taps into a single one-sample echo and move every
+  null — `path_delays_exact` measures the real thing: 0, 0.0384, 0.096, 0.3072, 0.4416,
+  0.96 samples.
+
+  *VHF models beside annex B's.* `channel::vhf` adds COST 207 **RA** (rural, 4 taps to
+  0.6 µs) and **TU6** (typical urban, 6 taps to 5 µs), each tap fading with a *classical
+  (Jakes)* Doppler spectrum at `f_d = v·f_c/c`; `speed_kmh = 0` gives the static case
+  (multipath, no fading). Jakes fading is a 32-sinusoid random-angle sum — a fixed angle
+  grid repeats `cos θ`, whose equal-frequency sinusoids beat instead of averaging and
+  biased the tap power by 17 % until the angles were drawn at random. `sfn_echo(delay,
+  level)` models the case COST 207 does not: one echo, possibly beyond the guard. HT and
+  BU are left out until their tables are checked against the source.
+
+  Verified by 23 unit tests in `channel::`: Jakes unit power and `J₀(2π f_d τ)`
+  autocorrelation, mode E noise and system bandwidth at 192 kHz, delay scaling at 120 and
+  192 kHz, a sub-sample delay passing a 3 kHz tone to 2·10⁻², TU6 fading in motion and
+  not when parked, and the frequency response of a static two-path channel at 192 kHz.
+
+  Next: the engine/source hook (`--channel`), a seeded mode E loopback sweep (SNR ×
+  speed), and using it to turn mode E's placeholder `params(E)`/`freq_wiener_len(E)` into
+  measured values. MDI for DRM+ is the separate question: `robm` is two bits and cannot
+  name mode E — the receive side could take the mode from the FAC's RM flag, but
+  `push_mdi` still adds 400 ms of samples per frame, wrong for mode E's 100 ms.
+
 ## Conventions
 
 * Cite the spec in doc comments: `ES 201 980 §7.3.2`. When an algorithm is borrowed from
