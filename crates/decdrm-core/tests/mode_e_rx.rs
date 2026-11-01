@@ -7,6 +7,7 @@
 //! The receiver has to be told the working rate (there is no way to infer it from the
 //! signal), and mode E is only accepted at 120/192 kHz.
 
+use decdrm_core::channel::{ChannelConfig, ChannelSimulator, vhf};
 use decdrm_core::fac::{ChannelParams, Fac, Interleaving, MscMode, SdcMode, ServiceParams};
 use decdrm_core::fec::mlc::MscProtection;
 use decdrm_core::params::{RobustnessMode, SpectrumOccupancy, WorkingRate};
@@ -73,10 +74,22 @@ fn run(rate: WorkingRate, seconds: Real) -> (usize, usize, usize) {
 /// the filter: the loop parked the FFT window outside the guard, and whether the residual
 /// timing error pushed it far enough to matter depended on the filter's group delay.
 fn run_with_band_limit(rate: WorkingRate, seconds: Real, band_limit: bool) -> (usize, usize, usize) {
+    run_impaired(rate, seconds, band_limit, None)
+}
+
+/// Like [`run_with_band_limit`], but the transmit baseband goes through `channel` before
+/// the output stage: the DRM+ equivalent of `loopback.rs`'s impaired scenarios.
+fn run_impaired(
+    rate: WorkingRate,
+    seconds: Real,
+    band_limit: bool,
+    channel: Option<ChannelConfig>,
+) -> (usize, usize, usize) {
     let cfg = tx_config(rate);
     let mut tx = Transmitter::new(cfg).expect("mode E transmitter");
     tx.set_fixed_fac_identity(Some(3));
     let layout = tx.layout();
+    let mut channel = channel.map(|c| ChannelSimulator::new_at(layout, rate, c));
     let frame_samples = tx.samples_per_frame();
     assert_eq!(frame_samples, (0.1 * f64::from(rate.hz())) as usize, "100 ms per frame");
 
@@ -106,6 +119,7 @@ fn run_with_band_limit(rate: WorkingRate, seconds: Real, band_limit: bool) -> (u
     let mut msc = vec![0u8; cap.total_bits()];
     let (mut fac_ok, mut sdc_ok, mut msc_ok, mut sdc_bad) = (0, 0, 0, 0);
     let mut pcm: Vec<f32> = Vec::new();
+    let mut impaired: Vec<Cplx> = Vec::new();
     for f in 0..frames {
         for (i, b) in msc.iter_mut().enumerate() {
             *b = (((f * 7 + i) >> 3) & 1) as u8;
@@ -113,7 +127,14 @@ fn run_with_band_limit(rate: WorkingRate, seconds: Real, band_limit: bool) -> (u
         let sdc = (tx.frame_index() == 0).then(|| vec![0u8; tx.sdc_capacity_bytes()]);
         let baseband = tx.transmit_frame(&test_fac(), &msc, sdc.as_deref()).expect("transmit");
         pcm.clear();
-        out.process(&baseband, &mut pcm);
+        match channel.as_mut() {
+            Some(ch) => {
+                impaired.clear();
+                ch.process(&baseband, &mut impaired);
+                out.process(&impaired, &mut pcm);
+            }
+            None => out.process(&baseband, &mut pcm),
+        }
         for ev in rx.push(&pcm) {
             match ev {
                 ReceiverEvent::Fac(_) => fac_ok += 1,
@@ -566,4 +587,30 @@ fn mode_e_is_acquired_without_pinning() {
     assert!(found, "coarse acquisition did not find the mode E signal");
     assert!(mode_e, "the receiver did not identify the signal as mode E");
     assert!(fac_ok > 0, "no FAC decoded from an unpinned mode E signal");
+}
+
+/// Mode E through a VHF mobile channel: COST 207 TU6 at 100 km/h on 200 MHz (18.5 Hz
+/// maximum Doppler), 20 dB SNR, 192 kHz. The first end-to-end use of the VHF models, and
+/// the first look at mode E's channel estimation at a realistic Doppler — its
+/// `params(E)`/`freq_wiener_len(E)` are placeholders copied from modes C/D.
+#[test]
+fn mode_e_decodes_through_a_moving_vhf_channel() {
+    // Knobs for the sweep the milestone records (a car at 100 km/h on Band III is the
+    // default); the assertions only require that *something* decodes.
+    let knobs = |name: &str, default: Real| {
+        std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+    };
+    let snr = knobs("DECDRM_ME_CH_SNR", 20.0);
+    let speed = knobs("DECDRM_ME_CH_SPEED", 100.0);
+    let ch = ChannelConfig {
+        snr_db: Some(snr),
+        model: vhf::cost207_tu6(speed, 200e6),
+        seed: 3,
+        ..Default::default()
+    };
+    let (fac, sdc, msc) = run_impaired(WorkingRate::R192, 8.0, true, Some(ch));
+    eprintln!("[me] TU6 {speed} km/h 200 MHz {snr} dB: FAC {fac}, SDC {sdc}, MSC {msc}");
+    assert!(fac > 0, "no FAC through TU6 (FAC {fac})");
+    assert!(sdc > 0, "no CRC-valid SDC through TU6 (SDC {sdc})");
+    assert!(msc > 0, "no multiplex frame through TU6 (MSC {msc})");
 }

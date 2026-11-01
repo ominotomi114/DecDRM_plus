@@ -1100,24 +1100,47 @@ needs 120 or 192 kHz; the input is resampled to whatever the receiver is configu
   0.96 samples.
 
   *VHF models beside annex B's.* `channel::vhf` adds COST 207 **RA** (rural, 4 taps to
-  0.6 µs) and **TU6** (typical urban, 6 taps to 5 µs), each tap fading with a *classical
-  (Jakes)* Doppler spectrum at `f_d = v·f_c/c`; `speed_kmh = 0` gives the static case
-  (multipath, no fading). Jakes fading is a 32-sinusoid random-angle sum — a fixed angle
-  grid repeats `cos θ`, whose equal-frequency sinusoids beat instead of averaging and
-  biased the tap power by 17 % until the angles were drawn at random. `sfn_echo(delay,
-  level)` models the case COST 207 does not: one echo, possibly beyond the guard. HT and
-  BU are left out until their tables are checked against the source.
+  0.6 µs), **TU6** (typical urban, 6 taps to 5 µs) and **HT** (hilly terrain, 8 taps in two
+  clusters out to 17.2 µs), each tap fading with a *classical (Jakes)* Doppler spectrum at
+  `f_d = v·f_c/c`; `speed_kmh = 0` gives the static case (multipath, no fading). Jakes
+  fading is a 32-sinusoid random-angle sum — a fixed angle grid repeats `cos θ`, whose
+  equal-frequency sinusoids beat instead of averaging and biased the tap power by 17 %
+  until the angles were drawn at random. `sfn_echo(delay, level)` models the case COST 207
+  does not: one echo, possibly beyond the guard. BU (bad urban, twelve taps) is left out
+  until its table is checked against the source. Even HT's 17.2 µs is 7 % of the guard, so
+  every COST 207 profile is flat as far as mode E's ISI is concerned — what they cost is
+  channel-estimation accuracy, not inter-symbol interference.
 
-  Verified by 23 unit tests in `channel::`: Jakes unit power and `J₀(2π f_d τ)`
+  Verified by 24 unit tests in `channel::`: Jakes unit power and `J₀(2π f_d τ)`
   autocorrelation, mode E noise and system bandwidth at 192 kHz, delay scaling at 120 and
-  192 kHz, a sub-sample delay passing a 3 kHz tone to 2·10⁻², TU6 fading in motion and
-  not when parked, and the frequency response of a static two-path channel at 192 kHz.
+  192 kHz, a sub-sample delay passing a 3 kHz tone to 2·10⁻², HT's second cluster keeping
+  its 2.88–3.30-sample delays, TU6 fading in motion and not when parked, and the frequency
+  response of a static two-path channel at 192 kHz.
 
-  Next: the engine/source hook (`--channel`), a seeded mode E loopback sweep (SNR ×
-  speed), and using it to turn mode E's placeholder `params(E)`/`freq_wiener_len(E)` into
-  measured values. MDI for DRM+ is the separate question: `robm` is two bits and cannot
-  name mode E — the receive side could take the mode from the FAC's RM flag, but
-  `push_mdi` still adds 400 ms of samples per frame, wrong for mode E's 100 ms.
+  *End to end: mode E decodes through a moving VHF channel* (2026-11-01).
+  `mode_e_rx.rs`'s `mode_e_decodes_through_a_moving_vhf_channel` sends 8 s of mode E
+  (80 frames) at 192 kHz through TU6 at 200 MHz and decodes it. Measured, FAC / SDC / MSC
+  frames of 80:
+
+  | channel | FAC | SDC | MSC |
+  |---|---|---|---|
+  | TU6, parked, 20 dB | 77 | 18 | 66 |
+  | TU6, 100 km/h (18.5 Hz), 20 dB | 37 | 6 | 48 |
+  | TU6, 200 km/h (37 Hz), 20 dB | 12 | 2 | 6 |
+  | TU6, 100 km/h, 10 dB | 31 | 5 | 48 |
+
+  The limit is **Doppler, not noise**: dropping 10 dB at 100 km/h barely moves the counts,
+  while doubling the speed collapses them. That is exactly where the placeholder
+  `params(E)`/`freq_wiener_len(E)` (copied from modes C/D, whose signals see a few Hz)
+  would be expected to give way, and this sweep is now the measurement to tune them
+  against — at 37 Hz the Wiener filter is being asked to track fades ten times faster than
+  the filters it inherited.
+
+  Next: the engine/source hook (`--channel`), which would let a recording or a live SDR be
+  driven through these models from the CLI and GUI, and the tuning pass above. MDI for
+  DRM+ is the separate question: `robm` is two bits and cannot name mode E — the receive
+  side could take the mode from the FAC's RM flag, but `push_mdi` still adds 400 ms of
+  samples per frame, wrong for mode E's 100 ms.
 
 ## Conventions
 
