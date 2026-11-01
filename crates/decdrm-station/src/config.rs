@@ -298,8 +298,43 @@ impl MdiSettings {
     }
 }
 
-/// receiver clock error and white noise before it reaches the outputs — a test signal
-/// for receivers. See [`decdrm_core::channel`].
+/// A VHF propagation preset for DRM+ (mode E): the COST 207 delay profiles of
+/// [`decdrm_core::channel::vhf`], every tap fading with a classical Doppler spectrum at
+/// `speed_kmh` on `carrier_mhz` — and not fading at all when parked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum VhfProfile {
+    /// Rural area: four taps within 0.6 µs.
+    Ra,
+    /// Typical urban: six taps over 5 µs.
+    Tu6,
+    /// Hilly terrain: eight taps in two clusters out to 17.2 µs.
+    Ht,
+}
+
+impl VhfProfile {
+    pub const ALL: [Self; 3] = [Self::Ra, Self::Tu6, Self::Ht];
+
+    /// Name as written in a station file (and offered by the form).
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Ra => "ra",
+            Self::Tu6 => "tu6",
+            Self::Ht => "ht",
+        }
+    }
+}
+
+impl std::fmt::Display for VhfProfile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
+/// The channel simulator (`[simulate]`): the signal passes through a channel model — ES
+/// 201 980 annex B's HF models, or the COST 207 VHF ones for DRM+ — with a frequency
+/// offset, a receiver clock error and white noise before it reaches the outputs: a test
+/// signal for receivers. See [`decdrm_core::channel`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SimulateSettings {
@@ -321,6 +356,19 @@ pub struct SimulateSettings {
     /// Seed of the fading and noise generators (the same seed gives the same signal).
     #[serde(default = "default_seed")]
     pub seed: u64,
+    /// A VHF propagation preset (DRM+). When set, `channel` is ignored and the taps come
+    /// from COST 207 for `speed_kmh` on `carrier_mhz` — the profiles mode E's guard and
+    /// bandwidth were designed against. Leave unset for the annex B HF models.
+    #[serde(default)]
+    pub vhf: Option<VhfProfile>,
+    /// Speed of the simulated receiver, km/h; 0 (the default) is parked: multipath but no
+    /// fading. Only used with `vhf`.
+    #[serde(default)]
+    pub speed_kmh: f64,
+    /// Carrier frequency of the simulated VHF band, MHz — Band I 47–68, Band II 87.5–108,
+    /// Band III 174–230. Only used with `vhf`.
+    #[serde(default = "default_carrier_mhz")]
+    pub carrier_mhz: f64,
 }
 
 fn default_channel_model() -> u8 {
@@ -331,16 +379,45 @@ fn default_seed() -> u64 {
     1
 }
 
+fn default_carrier_mhz() -> f64 {
+    200.0
+}
+
 impl SimulateSettings {
     /// A simulation of DRM channel `channel` at `snr_db` (none: no noise).
     pub fn new(channel: u8, snr_db: Option<f64>) -> Self {
-        Self { channel, snr_db, frequency_offset_hz: 0.0, sample_rate_offset_ppm: 0.0, seed: default_seed() }
+        Self {
+            channel,
+            snr_db,
+            frequency_offset_hz: 0.0,
+            sample_rate_offset_ppm: 0.0,
+            seed: default_seed(),
+            vhf: None,
+            speed_kmh: 0.0,
+            carrier_mhz: default_carrier_mhz(),
+        }
+    }
+
+    /// A VHF (COST 207) simulation at `speed_kmh` on `carrier_mhz`, at `snr_db`.
+    pub fn vhf(profile: VhfProfile, speed_kmh: f64, carrier_mhz: f64, snr_db: Option<f64>) -> Self {
+        Self { vhf: Some(profile), speed_kmh, carrier_mhz, ..Self::new(1, snr_db) }
     }
 
     /// The simulator's settings; `None` for an invalid channel model number.
     pub fn channel_config(&self) -> Option<decdrm_core::channel::ChannelConfig> {
+        let model = match self.vhf {
+            Some(profile) => {
+                let carrier_hz = self.carrier_mhz * 1e6;
+                match profile {
+                    VhfProfile::Ra => decdrm_core::channel::vhf::cost207_ra(self.speed_kmh, carrier_hz),
+                    VhfProfile::Tu6 => decdrm_core::channel::vhf::cost207_tu6(self.speed_kmh, carrier_hz),
+                    VhfProfile::Ht => decdrm_core::channel::vhf::cost207_ht(self.speed_kmh, carrier_hz),
+                }
+            }
+            None => decdrm_core::channel::ChannelModel::drm(self.channel)?,
+        };
         Some(decdrm_core::channel::ChannelConfig {
-            model: decdrm_core::channel::ChannelModel::drm(self.channel)?,
+            model,
             snr_db: self.snr_db,
             freq_offset_hz: self.frequency_offset_hz,
             sample_rate_offset_ppm: self.sample_rate_offset_ppm,
@@ -348,13 +425,20 @@ impl SimulateSettings {
         })
     }
 
-    /// One-line description, e.g. `DRM channel 3 (US Consortium), SNR 15.0 dB`.
+    /// One-line description, e.g. `DRM channel 3 (US Consortium), SNR 15.0 dB` or
+    /// `VHF tu6 (COST 207), 100 km/h at 200 MHz, SNR 20.0 dB`.
     pub fn describe(&self) -> String {
-        let mut s = format!(
-            "DRM channel {} ({})",
-            self.channel,
-            decdrm_core::channel::ChannelModel::drm_name(self.channel)
-        );
+        let mut s = match self.vhf {
+            Some(profile) => format!(
+                "VHF {profile} (COST 207), {:.0} km/h at {:.0} MHz",
+                self.speed_kmh, self.carrier_mhz
+            ),
+            None => format!(
+                "DRM channel {} ({})",
+                self.channel,
+                decdrm_core::channel::ChannelModel::drm_name(self.channel)
+            ),
+        };
         match self.snr_db {
             Some(snr) => s += &format!(", SNR {snr:.1} dB"),
             None => s += ", no noise",

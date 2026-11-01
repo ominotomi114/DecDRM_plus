@@ -342,7 +342,13 @@ impl Station {
 
         let output_file = cfg.output.file.as_ref().map(|f| cfg.resolve(f));
         let simulator = cfg.simulate.as_ref().and_then(|s| s.channel_config()).map(|c| {
-            ChannelSimulator::new(plan.layout, decdrm_core::channel::ChannelConfig { sample_rate_offset_ppm: 0.0, ..c })
+            // The delays, Doppler and noise are per working-rate sample: a mode E station
+            // runs at 120/192 kHz, not the 48 kHz `new` assumes.
+            ChannelSimulator::new_at(
+                plan.layout,
+                plan.output.working_rate,
+                decdrm_core::channel::ChannelConfig { sample_rate_offset_ppm: 0.0, ..c },
+            )
         });
         let clock = cfg
             .simulate
@@ -501,7 +507,7 @@ impl Station {
         let msc = multiplex(&refs, &self.plan.multiplex, self.plan.geometry())?;
 
         let sdc = if self.tx.frame_index() == 0 {
-            let now = self.start_unix + self.status.frames as f64 * FRAME_SECONDS;
+            let now = self.start_unix + self.status.frames as f64 * self.plan.frame_seconds();
             Some(self.sdc.next_block(now.floor() as i64)?)
         } else {
             None
@@ -656,7 +662,7 @@ impl Station {
 
     fn update_status(&mut self) {
         let st = &mut self.status;
-        st.seconds = st.frames as f64 * FRAME_SECONDS;
+        st.seconds = st.frames as f64 * self.plan.frame_seconds();
         st.clipped_samples = self.output.clipped_samples();
         st.device = self.device.as_ref().map(|d| d.name().to_string());
         st.device_underruns = self.device.as_ref().map_or(0, DeviceSink::underruns);

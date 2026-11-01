@@ -78,7 +78,9 @@ use decdrm_io::Container;
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
-/// Seconds per multiplex frame.
+/// Seconds per multiplex frame: 400 ms in modes A–D, **100 ms in mode E** (§8.1). Kept as
+/// a constant for the mode A–D arithmetic that predates DRM+ support; anything that knows
+/// its layout should use `layout.mode.frame_ms()` (or [`MultiplexPlan::frame_seconds`]).
 pub const FRAME_SECONDS: f64 = 0.4;
 
 /// Highest fraction of the AAC payload the encoder's bit rate is set to (see the
@@ -252,6 +254,12 @@ pub struct AppPlan {
 }
 
 impl MultiplexPlan {
+    /// Length of one multiplex frame in this plan's mode: 400 ms in modes A–D, **100 ms in
+    /// mode E** (§8.1) — the unit its stream lengths, bit rates and status clock use.
+    pub fn frame_seconds(&self) -> f64 {
+        f64::from(self.layout.mode.frame_ms()) / 1000.0
+    }
+
     /// The MSC geometry for [`decdrm_core::mux::msc::multiplex`].
     pub fn geometry(&self) -> MscGeometry {
         MscGeometry { vspp_bits: self.capacity.vspp_bits, hpp_bits: self.capacity.hpp_bits, lpp_bits: self.capacity.lpp_bits }
@@ -576,8 +584,18 @@ fn check_output(cfg: &StationConfig, p: &mut Problems) {
 /// Checks of `[simulate]`.
 fn check_simulate(cfg: &StationConfig, p: &mut Problems) {
     if let Some(sim) = &cfg.simulate {
-        if !(1..=6).contains(&sim.channel) {
+        // `channel` only applies to the annex B HF models; a VHF preset picks its taps
+        // instead and leaves the number unused.
+        if sim.vhf.is_none() && !(1..=6).contains(&sim.channel) {
             p.push(format!("simulate: channel {} is not a DRM channel model (1-6)", sim.channel));
+        }
+        if sim.vhf.is_some() {
+            if !(0.0..=300.0).contains(&sim.speed_kmh) {
+                p.push(format!("simulate: speed_kmh {} is outside 0..300 km/h", sim.speed_kmh));
+            }
+            if !(40.0..=300.0).contains(&sim.carrier_mhz) {
+                p.push(format!("simulate: carrier_mhz {} is outside 40..300 MHz", sim.carrier_mhz));
+            }
         }
         if let Some(snr) = sim.snr_db
             && !(-20.0..=80.0).contains(&snr)

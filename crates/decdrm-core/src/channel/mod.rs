@@ -247,6 +247,80 @@ fn fractional_taps(frac: Real) -> Vec<Real> {
     taps
 }
 
+/// Parse a channel specification, as the CLI's `--channel` and the GUI's field take it.
+///
+/// ```text
+/// awgn                              noise only (no SNR: noise off)
+/// ra:<speed>@<mhz>                  COST 207 rural, e.g. ra:0@200 (static) or ra:100@200
+/// tu6:<speed>@<mhz>                 COST 207 typical urban
+/// ht:<speed>@<mhz>                  COST 207 hilly terrain
+/// sfn:<delay_us>@<level_db>         one echo, e.g. sfn:300@-6 (beyond mode E's guard)
+/// static:<delay>/<db>;<delay>/<db>  measured profile, e.g. static:0/0;5/-6;15/-12
+/// ```
+///
+/// followed by any of `,snr=<db>`, `,seed=<n>`, `,foff=<hz>`, `,sro=<ppm>`.
+pub fn parse_spec(text: &str) -> Result<ChannelConfig, String> {
+    let mut cfg = ChannelConfig::default();
+    let mut parts = text.split(',');
+    let head = parts.next().unwrap_or("").trim();
+    let (name, args) = match head.split_once(':') {
+        Some((n, a)) => (n.trim(), Some(a.trim())),
+        None => (head, None),
+    };
+    cfg.model = match name {
+        "awgn" | "" => ChannelModel::awgn(),
+        "ra" | "tu6" | "ht" => {
+            let (speed, mhz) = pair(args, name)?;
+            let carrier_hz = mhz * 1e6;
+            match name {
+                "ra" => vhf::cost207_ra(speed, carrier_hz),
+                "tu6" => vhf::cost207_tu6(speed, carrier_hz),
+                _ => vhf::cost207_ht(speed, carrier_hz),
+            }
+        }
+        "sfn" => {
+            let (delay_us, level_db) = pair(args, name)?;
+            vhf::sfn_echo(delay_us, level_db)
+        }
+        "static" => {
+            let list = args.ok_or("static needs delay_us/level_db pairs, e.g. static:0/0;5/-6")?;
+            let mut taps = Vec::new();
+            for tap in list.split(';').filter(|t| !t.trim().is_empty()) {
+                let (delay, level) = tap.split_once('/').ok_or_else(|| format!("bad tap {tap:?} (delay/dB)"))?;
+                taps.push((parse_num(delay, "delay")?, parse_num(level, "level")?));
+            }
+            if taps.is_empty() {
+                return Err("static needs at least one tap".into());
+            }
+            vhf::static_multipath(&taps)
+        }
+        other => {
+            return Err(format!("unknown channel profile {other:?} (awgn, ra, tu6, ht, sfn, static)"));
+        }
+    };
+    for option in parts {
+        let (key, value) = option.split_once('=').ok_or_else(|| format!("bad option {option:?} (key=value)"))?;
+        match key.trim() {
+            "snr" => cfg.snr_db = Some(parse_num(value, "snr")?),
+            "seed" => cfg.seed = parse_num(value, "seed")? as u64,
+            "foff" => cfg.freq_offset_hz = parse_num(value, "foff")?,
+            "sro" => cfg.sample_rate_offset_ppm = parse_num(value, "sro")?,
+            other => return Err(format!("unknown channel option {other:?}")),
+        }
+    }
+    Ok(cfg)
+}
+
+fn pair(args: Option<&str>, name: &str) -> Result<(Real, Real), String> {
+    let text = args.ok_or_else(|| format!("{name} needs <a>@<b>, e.g. {name}:100@200"))?;
+    let (a, b) = text.split_once('@').ok_or_else(|| format!("{name} needs <a>@<b>, got {text:?}"))?;
+    Ok((parse_num(a, name)?, parse_num(b, name)?))
+}
+
+fn parse_num(text: &str, what: &str) -> Result<Real, String> {
+    text.trim().parse::<Real>().map_err(|e| format!("{what} {text:?}: {e}"))
+}
+
 /// Run-time state of one path.
 #[derive(Debug, Clone)]
 struct PathState {
@@ -637,6 +711,35 @@ mod tests {
         let max = blocks.iter().copied().fold(0.0, Real::max);
         let min = blocks.iter().copied().fold(Real::INFINITY, Real::min);
         assert!(max / min > 2.0, "block powers do not fade: {min}..{max}");
+    }
+
+    /// The CLI/GUI channel string maps to the expected models, and bad text is rejected
+    /// with an explanation rather than silently ignored.
+    #[test]
+    fn channel_spec_covers_the_profiles() {
+        let tu6 = parse_spec("tu6:100@200,snr=20").unwrap();
+        assert_eq!(tu6.snr_db, Some(20.0));
+        assert_eq!(tu6.model.paths.len(), 6);
+        assert!((tu6.model.paths[3].delay_ms - 0.0016).abs() < 1e-12, "TU6's fourth tap is 1.6 µs");
+        assert!(tu6.model.paths.iter().all(|p| p.doppler_spread_hz > 0.0), "100 km/h fades");
+
+        let parked = parse_spec("ra:0@200").unwrap();
+        assert_eq!(parked.snr_db, None);
+        assert!(parked.model.paths.iter().all(|p| p.doppler_spread_hz == 0.0), "0 km/h is static");
+
+        let sfn = parse_spec("sfn:300@-6,seed=7,foff=12.5,sro=3").unwrap();
+        assert_eq!((sfn.seed, sfn.freq_offset_hz, sfn.sample_rate_offset_ppm), (7, 12.5, 3.0));
+        assert!((sfn.model.paths[1].delay_ms - 0.3).abs() < 1e-12);
+
+        let custom = parse_spec("static:0/0;5/-6;15/-12").unwrap();
+        assert_eq!(custom.model.paths.len(), 3);
+        assert!((custom.model.paths[2].gain - 10f64.powf(-12.0 / 20.0)).abs() < 1e-12);
+
+        assert!(parse_spec("awgn,snr=10").is_ok());
+        assert!(parse_spec("tu6:100").unwrap_err().contains('@'));
+        assert!(parse_spec("nope:1@2").unwrap_err().contains("unknown channel profile"));
+        assert!(parse_spec("tu6:100@200,snr=x").is_err());
+        assert!(parse_spec("tu6:100@200,wat=1").unwrap_err().contains("unknown channel option"));
     }
 
     /// Mode E at 192 kHz: the SNR is referred to its 100 kHz channel (table 48), and the

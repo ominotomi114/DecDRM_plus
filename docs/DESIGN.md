@@ -1136,11 +1136,32 @@ needs 120 or 192 kHz; the input is resampled to whatever the receiver is configu
   against — at 37 Hz the Wiener filter is being asked to track fades ten times faster than
   the filters it inherited.
 
-  Next: the engine/source hook (`--channel`), which would let a recording or a live SDR be
-  driven through these models from the CLI and GUI, and the tuning pass above. MDI for
-  DRM+ is the separate question: `robm` is two bits and cannot name mode E — the receive
-  side could take the mode from the FAC's RM flag, but `push_mdi` still adds 400 ms of
-  samples per frame, wrong for mode E's 100 ms.
+  *Reachable from the station* (2026-11-01). The simulator already lived in `[simulate]`,
+  with annex B's HF presets; it takes a VHF preset too now — `vhf = "ra" | "tu6" | "ht"` with
+  `speed_kmh` and `carrier_mhz` — so a DRM+ station can transmit through a car or a hilly
+  profile. Two bugs had to go with it:
+
+  - The station built the simulator with `ChannelSimulator::new`, the 48 kHz entry point. A
+    mode E station runs at 192 kHz, so delays, Doppler steps and the noise power were all
+    scaled for the wrong rate; it now uses `new_at` with the plan's working rate.
+  - `StationStatus::seconds` and the SDC clock counted 400 ms per frame whatever the mode, so
+    a DRM+ transmission reported four times its length — 2 s of signal printed as 8 s.
+    `MultiplexPlan::frame_seconds()` now takes the duration from the mode.
+
+  Measured: `drm_plus_transmits_through_a_vhf_channel` sends 2 s of mode E at 192 kHz through
+  TU6 at 100 km/h on 200 MHz at 20 dB, and the file and status carry the right rate and time.
+  128 of ~1.5 M output samples clipped, though: the real-IF output at 192 kHz peaks just over
+  full scale (the same station without a simulator clips too), which wants a level check.
+
+  Not yet done: the form's `[simulate]` section still offers only the annex B presets, and mode
+  E's station audio is unverified end to end — its audio super frame should be 200 ms
+  (§5.3.1.0), while the station's pipeline is written around 400 ms frames. The DRM+ loopback
+  tests decode the multiplex through the receiver, but they bypass the station.
+
+  Next: the GUI presets, the tuning pass on `params(E)`/`freq_wiener_len(E)`, and the mode E
+  audio-super-frame question above. MDI for DRM+ is separate: `robm` is two bits and cannot
+  name mode E — the receive side could take the mode from the FAC's RM flag, but `push_mdi`
+  still adds 400 ms of samples per frame, wrong for mode E's 100 ms.
 
 ## Conventions
 

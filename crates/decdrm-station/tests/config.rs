@@ -595,3 +595,41 @@ fn modulator_section() {
     assert!(problems("[mdi]\ninput = \"8000\"\n").iter().any(|x| x.contains("output: set")));
     assert!(problems("[output]\nfile = \"o.wav\"\n[mdi]\ninput = \"nonsense\"\n").iter().any(|x| x.starts_with("mdi: input")));
 }
+
+/// The VHF presets (`[simulate] vhf = ...`): COST 207 taps for DRM+, with the speed and
+/// band validated and the annex B `channel` number left unused.
+#[test]
+fn vhf_simulation_presets() {
+    let cfg = parse(&format!(
+        "{}\n[simulate]\nvhf = \"tu6\"\nspeed_kmh = 100\ncarrier_mhz = 200\nsnr_db = 20\n",
+        base()
+    ));
+    let sim = cfg.simulate.clone().unwrap();
+    assert_eq!(sim.vhf, Some(decdrm_station::VhfProfile::Tu6));
+    let c = sim.channel_config().unwrap();
+    assert_eq!(c.model.paths.len(), 6, "TU6 has six taps");
+    assert!(c.model.paths.iter().all(|p| p.doppler_spread_hz > 0.0), "100 km/h fades");
+    assert_eq!(c.snr_db, Some(20.0));
+    let text = sim.describe();
+    assert!(text.contains("VHF tu6") && text.contains("100 km/h"), "{text}");
+
+    // Parked: the multipath stays, the fading goes.
+    let parked = parse(&format!("{}\n[simulate]\nvhf = \"ht\"\n", base()));
+    let c = parked.simulate.unwrap().channel_config().unwrap();
+    assert_eq!(c.model.paths.len(), 8, "HT has eight taps");
+    assert!(c.model.paths.iter().all(|p| p.doppler_spread_hz == 0.0));
+
+    // A VHF preset ignores `channel`, so a stale number is not an error; speed and band are
+    // checked.
+    let stale = parse(&format!(
+        "{}\n[simulate]\nchannel = 9\nvhf = \"ra\"\nspeed_kmh = 400\ncarrier_mhz = 10\n",
+        base()
+    ));
+    let p = match stale.validate() {
+        Err(e) => e.problems().to_vec(),
+        Ok(_) => panic!("expected problems"),
+    };
+    assert!(p.iter().any(|x| x.contains("speed_kmh 400")), "{p:?}");
+    assert!(p.iter().any(|x| x.contains("carrier_mhz 10")), "{p:?}");
+    assert!(!p.iter().any(|x| x.contains("channel 9")), "a VHF preset does not use channel: {p:?}");
+}

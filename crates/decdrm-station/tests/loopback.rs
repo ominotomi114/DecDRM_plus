@@ -15,7 +15,7 @@
 
 use decdrm_core::fac::{Interleaving, MscMode, SdcMode};
 use decdrm_core::mux::service::AudioParams;
-use decdrm_core::params::SpectrumOccupancy;
+use decdrm_core::params::{RobustnessMode, SpectrumOccupancy};
 use decdrm_data::DataEvent;
 use decdrm_data::journaline::{NmlBody, ObjectStatus};
 use decdrm_engine::{InputFormat, RealChannel, ReceiverConfig, Session, SessionEvent};
@@ -985,6 +985,39 @@ fn finite_input_file_ends() {
     assert!(status.services[0].audio.as_ref().unwrap().input_finished);
     let written = FileReader::open(dir.path().join("out.wav")).unwrap().total_frames().unwrap();
     assert!((frames * 19_200..frames * 19_200 + 2_000).contains(&written), "{written} frames in the file");
+}
+
+/// A DRM+ station through a VHF channel: the simulator must be built at the station's own
+/// rate (192 kHz), where COST 207's sub-microsecond taps still exist as sub-sample delays
+/// — at 48 kHz they would round away, and the noise reference would be 4× too low.
+#[test]
+fn drm_plus_transmits_through_a_vhf_channel() {
+    let dir = tempfile::tempdir().unwrap();
+    let toml = r#"
+        [channel]
+        mode = "E"
+        occupancy = 0
+        working_sample_rate = "192"
+        [output]
+        file = "vhf.wav"
+        [[service]]
+        label = "VHF"
+        id = 0x00A001
+        [service.audio]
+        codec = "he-aac"
+        input = { tone_hz = 800.0 }
+        [simulate]
+        vhf = "tu6"
+        speed_kmh = 100
+        carrier_mhz = 200
+        snr_db = 20
+    "#;
+    let (_, plan, status) = transmit(dir.path(), toml, 20);
+    assert_eq!(plan.layout.mode, RobustnessMode::E);
+    assert_eq!(plan.output.working_rate, decdrm_core::params::WorkingRate::R192);
+    assert!(status.seconds > 1.9, "{} s", status.seconds);
+    let bytes = std::fs::metadata(dir.path().join("vhf.wav")).unwrap().len();
+    assert!(bytes > 300_000, "{bytes} bytes of 192 kHz signal");
 }
 
 /// Sound-card output: 3 s to a (virtual) device. Never run automatically.
