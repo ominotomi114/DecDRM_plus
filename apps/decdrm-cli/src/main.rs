@@ -83,16 +83,17 @@ struct RxArgs {
     /// or 192, because its 213 carriers reach ±47.11 kHz.
     #[arg(long, value_name = "KHZ", default_value_t = 48)]
     sample_rate: u32,
-    /// Decode robustness mode E (DRM+) instead of searching for one. Pinning is the reliable
-    /// way to receive DRM+ (the automatic search finds the signal but estimates its carrier
-    /// only to a few tens of Hz, which costs multiplex frames); it runs at DC with no
-    /// frequency search, so a signal whose carrier is off centre needs --dc too. Implies the
-    /// rate mode E needs if --sample-rate is left at its default.
+    /// Decode robustness mode E (DRM+) instead of searching for one. Not needed to receive
+    /// DRM+ any more: the search finds the signal's spectrum, and the guard interval refines
+    /// the carrier to within a few Hz, so the automatic path decodes it too. Pinning skips
+    /// both and runs at DC, which is useful on a weak signal if the carrier is known; being
+    /// a few tens of Hz off is still corrected by the guard interval. Implies the rate mode E
+    /// needs if --sample-rate is left at its default.
     #[arg(long)]
     drm_plus: bool,
     /// DC carrier frequency of the input in Hz, for a pinned receiver: the mixer runs here
-    /// instead of at 0. A DRM+ recording whose carrier is off centre cannot be pinned
-    /// without it. Ignored while searching for a signal.
+    /// instead of at 0. Ignored while searching for a signal, which finds the carrier itself
+    /// (the reference DRM+ recordings carry +20 kHz).
     #[arg(long, value_name = "HZ", default_value_t = 0.0)]
     dc: f64,
     /// Pace file decoding to real time.

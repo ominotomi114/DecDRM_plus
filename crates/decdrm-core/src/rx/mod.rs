@@ -48,10 +48,10 @@ use timesync::{TimeSync, TimeSyncEvent};
 const MAX_SYMBOLS_WITHOUT_FAC: usize = 150;
 /// [`MAX_SYMBOLS_WITHOUT_FAC`] in seconds, which is what mode E needs instead of a count:
 /// its symbols are 2.5 ms, so 150 of them is only 0.375 s — far too little for a mode E
-/// signal whose carrier the mixer has only roughly on frequency to pull in (§8.4.2 gives
-/// the mode no frequency reference cells to refine it against, so acquisition is the only
-/// chance to get close). Modes A-D keep the symbol count, which is what their tests were
-/// tuned against.
+/// signal whose carrier the mixer has only roughly on frequency (§8.4.2 gives the mode no
+/// frequency reference cells, so the guard-interval tracker has to pull the carrier in and
+/// the frame alignment has to be found, which takes a second or so). Modes A-D keep the
+/// symbol count, which is what their tests were tuned against.
 const FAC_WAIT_S: Real = 4.0;
 /// A frequency acquisition that no FAC has confirmed yet is dropped at once when the
 /// input power rises this many times (10 dB) above its level during the search: the
@@ -77,6 +77,13 @@ const CP_POWER_RATIO: Real = 0.5;
 /// once instead of after `MAX_BAD_FACS_LOCKED`.
 const CP_LOSS_SYMBOLS: usize = 8;
 const CP_LOSS_BAD_FACS: usize = 2;
+/// Symbols per fine carrier estimate for mode E (see [`Receiver::track_cp_frequency`]): 16
+/// symbols are 40 ms there, and the block averages the guard correlation's phase noise
+/// (a few Hz per symbol) down to about a hertz.
+const CP_TRACK_SYMBOLS: usize = 16;
+/// Guard correlations weaker than this are not used for the carrier estimate: below it the
+/// phase is noise (a collapse at a timing jump, or a deep fade).
+const CP_TRACK_MIN_RHO: Real = 0.35;
 /// Good FACs before switching timing to impulse-response tracking.
 const DELAYED_TRACKING_FACS: usize = 2;
 /// Limit of the sample-rate offset correction, Hz.
@@ -119,11 +126,13 @@ pub struct ReceiverConfig {
     /// [`WorkingRate::R120`] or more, because its 213 carriers reach ±47.11 kHz.
     pub working_rate: WorkingRate,
     /// Decode this robustness mode instead of searching for one, at this spectrum
-    /// occupancy (see [`Receiver::set_mode`]). Pinning is no longer *required* for mode E
-    /// (DRM+): the frequency scan finds its spectrum plateau itself (see [`freqacq`]) and
-    /// the time sync identifies the mode, at 120/192 kHz. It remains a shortcut when both
-    /// the mode and the centre frequency are known. A pinned receiver runs at DC with no
-    /// frequency search, so a signal pinned while off centre decodes nothing.
+    /// occupancy (see [`Receiver::set_mode`]). Pinning is no longer needed for mode E
+    /// (DRM+): the frequency scan finds its spectrum plateau, the time sync identifies the
+    /// mode, and the guard interval refines the carrier (see [`Receiver::track_cp_frequency`]),
+    /// at 120/192 kHz. It remains a shortcut when both the mode and the centre frequency are
+    /// known, and skips the second or so the search takes. A pinned receiver runs at DC with
+    /// no frequency search, so a signal pinned while off centre by more than the guard
+    /// interval's ±222 Hz decodes nothing.
     pub pinned: Option<(RobustnessMode, SpectrumOccupancy)>,
     /// DC carrier frequency of the input, Hz, for a **pinned** receiver: the mixer runs at
     /// this offset instead of at 0. A pinned receiver does not search for the signal, and a
@@ -351,6 +360,11 @@ pub struct Receiver {
     /// Timing health: fast/slow averages of the cyclic-prefix correlation and of the
     /// window power, reference samples, symbols with a collapsed correlation.
     cp: TimingHealth,
+    /// Mode E's fine carrier estimate: the cyclic-prefix correlations of the symbols since
+    /// the last correction, summed (their common phase is the frequency error), and how many
+    /// there are. See [`Self::track_cp_frequency`].
+    cp_sum: Cplx,
+    cp_symbols: usize,
     /// Pilot-slope SRO acquisition: estimates seen, and the previous block's.
     sro_reports: usize,
     sro_prev: Option<Real>,
@@ -407,6 +421,8 @@ impl Receiver {
             delayed_cnt: DELAYED_TRACKING_FACS,
             delayed_done: false,
             cp: TimingHealth::default(),
+            cp_sum: Cplx::new(0.0, 0.0),
+            cp_symbols: 0,
             sro_reports: 0,
             sro_prev: None,
             msc_config: None,
@@ -479,11 +495,11 @@ impl Receiver {
     /// Restart acquisition from scratch (e.g. after retuning).
     /// Pin the robustness mode and spectrum occupancy instead of searching for them.
     ///
-    /// The mode search cannot be relied on for mode E (DRM+): its 2-bit FAC field cannot
-    /// express the mode, and its geometry is out of the acquisition scan's 48 kHz design.
-    /// A caller that already knows the mode (decoding a recording, say) sets it here; the
-    /// receiver then does not try to detect it and does not re-derive the occupancy from
-    /// the FAC.
+    /// Pinning is not needed for mode E (DRM+) any more — the search finds it and the guard
+    /// interval tracks its carrier — but it saves the second or so acquisition takes, and it
+    /// is what a caller who already knows the mode (a recording decoded at a known carrier)
+    /// wants. The receiver then does not try to detect the mode and does not re-derive the
+    /// occupancy from the FAC.
     pub fn set_mode(&mut self, mode: RobustnessMode, occupancy: SpectrumOccupancy) {
         self.pinned = Some((mode, occupancy));
         self.mode = mode;
@@ -547,6 +563,8 @@ impl Receiver {
         self.delayed_cnt = DELAYED_TRACKING_FACS;
         self.delayed_done = false;
         self.cp = TimingHealth::default();
+        self.cp_sum = Cplx::new(0.0, 0.0);
+        self.cp_symbols = 0;
         self.fac_config = None;
         self.fac_pending = None;
         let (ok, bad, sok, sbad) = (self.status.fac_ok, self.status.fac_bad, self.status.sdc_ok, self.status.sdc_bad);
@@ -685,7 +703,49 @@ impl Receiver {
         }
     }
 
+    /// Fine carrier correction for mode E from the phase of the guard-interval correlation.
+    ///
+    /// A residual offset `df` rotates every sample by `2π·df·t`, so the correlation between
+    /// the cyclic prefix and the copy of it at the end of the symbol has the phase
+    /// `−2π·df·Tu`. Tu is the useful symbol length, 27T = 2.25 ms in mode E, so the estimate
+    /// is unambiguous within ±1/(2Tu) = ±222 Hz — wider than the spectrum search's error —
+    /// and it is independent of the channel (both samples pass through the same taps) and of
+    /// where in the guard the window sits. Averaging [`CP_TRACK_SYMBOLS`] symbols takes the
+    /// per-symbol phase noise down to about a hertz.
+    ///
+    /// This is what makes unpinned mode E decode. Nothing else refines the spectrum
+    /// search's estimate (measured: 14–62 Hz of scatter per window, and up to 220 Hz from
+    /// the receiver's own restarts), and mode E loses most of its multiplex frames beyond
+    /// about ±50 Hz while ±20 Hz decodes cleanly — measured by shifting a pinned receiver's
+    /// mixer over the reference recording.
+    fn track_cp_frequency(&mut self, win: &timesync::SymbolWindow) {
+        let (Some(rho), Some(phase)) = (win.guard_corr, win.guard_phase) else {
+            return;
+        };
+        if rho < CP_TRACK_MIN_RHO {
+            return;
+        }
+        self.cp_sum += Cplx::from_polar(rho, phase);
+        self.cp_symbols += 1;
+        if self.cp_symbols < CP_TRACK_SYMBOLS {
+            return;
+        }
+        let tu_s = self.mode.fft_size_at(self.cfg.working_rate) as Real / Real::from(self.fs());
+        let residual = -self.cp_sum.arg() / (2.0 * PI * tu_s);
+        self.cp_sum = Cplx::new(0.0, 0.0);
+        self.cp_symbols = 0;
+        // The estimate is the mixer's *current* residual, which is why it is added rather
+        // than integrated: the block after this one measures what is left.
+        self.track_hz += residual;
+    }
+
     fn process_window(&mut self, win: timesync::SymbolWindow) {
+        // Mode E cannot track its carrier from pilots — §8.4.2 gives it no frequency
+        // reference cells and it has no continuous pilots either, so `framesync` disables
+        // its frequency tracking outright. The guard interval does it instead.
+        if self.mode == RobustnessMode::E {
+            self.track_cp_frequency(&win);
+        }
         if self.chain.is_none() {
             // Mode E exists at occupancy 0 only (§8.1), so an unpinned receiver that mode
             // detection has just switched to E must not be given the DRM30 default: the
@@ -891,6 +951,8 @@ impl Receiver {
         self.delayed_cnt = DELAYED_TRACKING_FACS;
         self.delayed_done = false;
         self.cp = TimingHealth::default();
+        self.cp_sum = Cplx::new(0.0, 0.0);
+        self.cp_symbols = 0;
         self.status.state = RxState::Acquisition;
     }
 }

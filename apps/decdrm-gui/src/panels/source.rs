@@ -203,7 +203,8 @@ pub fn show(
                 .on_hover_text(concat!(
                     "DC carrier frequency of the input. A pinned receiver does not search for ",
                     "the signal, so a DRM+ recording whose carrier is off centre (the ",
-                    "reference recordings carry +20 kHz) decodes nothing without it."
+                    "reference recordings carry +20 kHz) needs it — within a few tens of Hz ",
+                    "is enough, the guard interval corrects the rest."
                 ));
             }
             ui.separator();
@@ -494,18 +495,17 @@ fn rate_picker(ui: &mut Ui, settings: &mut Settings) {
             "Working sample rate of the receiver: what the OFDM chain demodulates at, and what the input is \
              resampled to. Modes A–D are received at 48 kHz; robustness mode E (DRM+) carries 213 carriers \
              reaching ±47.11 kHz and needs 120 kHz or more (96 kHz leaves only 0.89 kHz of Nyquist margin). \
-             A rate above 48 kHz does not by itself find DRM+: the automatic search cannot detect mode E, so \
-             a DRM+ signal also needs the mode chosen beside this.",
+             Set 120 or 192 kHz to receive DRM+: Auto finds it there.",
         );
 }
 
-/// The robustness mode to decode: automatic search for DRM30, or mode E (DRM+) pinned.
+/// The robustness mode to decode: automatic search, or mode E (DRM+) pinned.
 ///
-/// Only mode E needs pinning. The automatic search covers modes A–D and reads their
-/// spectrum occupancy from the FAC; it cannot find mode E, whose 2-bit FAC field cannot
-/// express the mode and whose geometry is outside the scan's 48 kHz design. Pinning also
-/// tells the receiver the signal is at DC — it does not search for a frequency — so the
-/// input must already be tuned to the DRM+ carrier centre.
+/// Pinning is optional now. The automatic search covers modes A–D and reads their spectrum
+/// occupancy from the FAC; at 120/192 kHz it also finds mode E's spectrum, identifies the
+/// mode and tracks the carrier from the guard interval. Pinning skips that second of
+/// searching, but it also tells the receiver the signal is at DC (it does not search for a
+/// frequency), so the input must already be tuned to the DRM+ carrier centre.
 fn mode_picker(ui: &mut Ui, settings: &mut Settings) {
     ComboBox::from_id_salt("receiver_mode")
         .selected_text(settings.receiver_mode.label())
@@ -528,10 +528,10 @@ fn mode_picker(ui: &mut Ui, settings: &mut Settings) {
         })
         .response
         .on_hover_text(
-            "Robustness mode. Auto searches for a DRM30 signal (modes A–D) and reads its spectrum \
-             occupancy from the FAC. Mode E (DRM+) cannot be found by that search and must be chosen \
-             here; its signal has to sit at the receiver's centre frequency (tune to the DRM+ carrier \
-             centre) and needs a working rate of 120 or 192 kHz.",
+            "Robustness mode. Auto searches for the signal and reads the mode from it: DRM30 \
+             modes A–D, and DRM+ (mode E) as well when the working rate is 120 or 192 kHz. \
+             Mode E (DRM+) pinned skips that search and runs at DC, so the input has to sit on \
+             the DRM+ carrier centre; it needs the same rate.",
         );
 }
 

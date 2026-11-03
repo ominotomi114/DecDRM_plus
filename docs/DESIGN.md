@@ -8,7 +8,7 @@ and the milestone plan. Keep the milestone checklist current.
 
 | Topic | Decision |
 |---|---|
-| Standard scope | DRM30 robustness modes **A, B, C, D**; all spectrum occupancies (0–5, 4.5–20 kHz); 4/16/64-QAM; SM, HMsym, HMmix; short & long interleaving; all protection levels. **DRM+ (mode E)** added 2026-10-23: transmit works, receive is partial — see the milestone at the end of this document. No analog AM/SSB/FM, no AMSS. |
+| Standard scope | DRM30 robustness modes **A, B, C, D**; all spectrum occupancies (0–5, 4.5–20 kHz); 4/16/64-QAM; SM, HMsym, HMmix; short & long interleaving; all protection levels. **DRM+ (mode E)** added 2026-10-23: transmit and receive both work, including reception without pinning the mode — see the milestone at the end of this document. No analog AM/SSB/FM, no AMSS. |
 | Purpose | Personal / hobby. |
 | Relationship to Dream | Spec-first idiomatic Rust, freely translating Dream's proven algorithms (sync, Wiener channel estimation, MLC decoding). Licence therefore **GPL-2.0-or-later**. Reference: Dream `branches/dream-mjf` r1548. |
 | Receiver performance | Match or beat Dream on weak/fading signals (Wiener channel estimation, soft-decision Viterbi, iterative MLC, sample-rate-offset tracking). |
@@ -953,21 +953,17 @@ needs 120 or 192 kHz; the input is resampled to whatever the receiver is configu
      list of measurements ruling out the equaliser) now passes unignored. The upsampling
      note above is therefore no longer needed as a workaround, though it remains a valid
      design choice — JvanKatwijk's decoder runs at 192 kHz only.
-  4. **`freqacq.rs` finds mode E, best-effort** (2026-10-26), so a DRM+ signal need not be
-     pinned. This is a *convenience*, not the reliable path — see the caveat at the end of
-     this item before relying on it. The pilot detector cannot do it — it hunts for the three DRM30 frequency
-     reference pilots at 750/2250/3000 Hz, and mode E defines none (§8.4.2) — so
-     `FreqAcquisition::detect_plateau` searches for the signal's **spectrum plateau**
-     instead: the widest run of bins above six times the PSD's 20th percentile, whose edges
-     are then taken at half the band's own median power (a low threshold finds the run
-     reliably but its edges smear ~1 kHz outward; the half-power points cancel that
-     symmetrically, since a mode E spectrum is symmetric about its DC carrier). The plateau
-     is only searched above 48 kHz, where a 95 kHz DRM30 signal cannot exist.
-     Measured on the reference recording whose carrier is at +20 kHz: `SignalFound` at
-     **20 000 Hz** exactly, `ModeDetected E`, and a full decode **unpinned**
-     (`decdrm rx <file> --sample-rate 192 --format iq`: FAC 261, MSC 265 (123 ok),
-     461 audio frames, no manual mixing). The FFT length, hop and analysis span now scale
-     with the working rate, keeping the 7.8 Hz bin the detection threshold was set for.
+  4. **`freqacq.rs` finds mode E, and the guard interval tracks its carrier** (2026-10-26,
+     completed 2026-11-03), so a DRM+ signal need not be pinned. The pilot detector cannot
+     find it — it hunts for the three DRM30 frequency reference pilots at 750/2250/3000 Hz,
+     and mode E defines none (§8.4.2) — so `FreqAcquisition::detect_plateau` searches for
+     the signal's **spectrum plateau** instead: the window of the band's own width (213
+     carriers, ±47.11 kHz) whose mean power most exceeds the mean outside it. That is a
+     matched filter, so it needs only that the band be *relatively* stronger than its
+     surroundings — no absolute threshold, which an edge test cannot avoid and which made
+     the noisiest recordings unfindable. It runs only above 48 kHz, where a 95 kHz DRM30
+     signal cannot exist, and the FFT length, hop and analysis span scale with the working
+     rate, keeping the 7.8 Hz bin the threshold was set for.
 
      Two things the unpinned path needed besides the detector: an unpinned receiver that
      mode detection has switched to E must build its chain at **occupancy 0** (mode E has
@@ -976,21 +972,29 @@ needs 120 or 192 kHz; the input is resampled to whatever the receiver is configu
      thing (`mode_e_is_acquired_without_pinning`, with the signal put off centre on
      purpose).
 
-     It was also 48 kHz-calibrated (fixed 6144-point FFT, `HOP`, `NUM_AVERAGE`); those
-     scale with the rate now.
+     **The carrier is what was missing** (2026-11-03), and it is found in two stages. The
+     ratio's peak is flat — the window is as wide as the band — so the crest centroid that
+     first located it wandered: measured over ten 0.47 s windows of each reference
+     recording, 14–62 Hz of standard deviation, and up to 220 Hz between the receiver's own
+     re-acquisitions. A band **edge** is far better conditioned, so the centre now comes
+     from an antisymmetric kernel (the derivative of a Gaussian) on the spectrum smoothed
+     by one carrier spacing: each edge becomes an extremum, a parabola puts it at a fraction
+     of a bin, and the two are averaged — which also cancels a symmetric transmit-filter
+     rolloff. Measured the same way: **4.5–14 Hz, bias under 5 Hz**. Then
+     `Receiver::track_cp_frequency` refines it in the time domain: mode E has no pilots, but
+     the guard interval is a copy of the symbol's tail, and the phase of its correlation is
+     `−2π·Δf·Tu` — unambiguous within ±222 Hz (Tu = 2.25 ms), independent of the channel
+     (both samples pass through the same taps), and averaged over 16 symbols (40 ms) down to
+     about a hertz.
 
-     **The caveat, measured.** The plateau locates the carrier to about **±50 Hz**, and
-     there is nothing to refine it with: mode E defines no frequency reference cells
-     (§8.4.2) *and* no continuous pilots, so `framesync` disables frequency tracking for the
-     mode outright ("skip it entirely rather than reading carrier 0 three times as if it
-     were a pilot"). At 213 carriers and a 444⁴⁄₉ Hz spacing, ±50 Hz is about ±12 % of a
-     carrier — enough to cost real multiplex frames. On the recordings, unpinned: two of the
-     eleven decode fully (16-QAM LPP0, 4-QAM LPP3 and LPP0-with-AWGN in some runs, run to
-     run), the rest lose most or all of their multiplex frames, while **all eleven decode
-     fully pinned**. Getting the carrier inside a few Hz without reference cells needs a
-     data-directed estimate from the FAC/MSC decisions, which is future work. Use
-     `--drm-plus` (or the GUI's mode picker) for real reception; unpinned mode E is there so
-     the signal is *found* and identified, which it now is.
+     **Measured.** Shifting a pinned receiver's mixer over a reference recording: the FAC
+     and MSC decode fully within **±20 Hz** of the carrier, partially at ±50 Hz (30–54 FAC
+     of 311), and not at all at ±100 Hz. With both stages **all fourteen recordings decode
+     unpinned**, within two multiplex frames of their pinned counts and without
+     re-acquiring; before, two did, and the receiver restarted every four seconds with a
+     fresh (bad) estimate. The pinned path gets the same refinement, so `--dc` only has to
+     be within a few tens of Hz.
+
      *Reachable from the GUI and CLI now* (2026-10-25): `ReceiverConfig::pinned` carries a
      mode/occupancy to decode instead of searching, so `Receiver::new` pins it without a
      caller having to reach in with `set_mode`. The GUI's source bar has a **mode picker**
@@ -1291,11 +1295,12 @@ needs 120 or 192 kHz; the input is resampled to whatever the receiver is configu
   workspace's path make `cl` fail with D8050 ("cannot execute c1xx.dll ... debug record").
   The portable binaries do not need debug info.
 
-  Not yet done: the DRM+ acquisition path (pinning mode E is the reliable way in); the GUI's
-  diversity history still assumes 400 ms frames (receiver side, mode E diversity is untested).
+  Not yet done: the GUI's diversity history still assumes 400 ms frames (receiver-side mode E
+  diversity is untested); mode E has no MDI output role (not asked for).
 
-  Next: the mode E acquisition path (finding DRM+ without pinning). The tuning pass on
-  `params(E)` is done (above).
+  Next: nothing on the DRM+ list — the acquisition path is the last item (item 4 above), and
+  the `params(E)` tuning was done before it. What remains untested is listed on the line
+  above.
 
   *PAPR reduction, measured* (2026-11-03). There was none: the output stage clipped at ±1 and
   that was the whole story, so a mode B signal (10.7 dB crest; 12.8 dB for the real part at the

@@ -1027,9 +1027,10 @@ fn drm_plus_transmits_through_a_vhf_channel() {
 }
 
 /// A DRM+ station's audio, end to end at 192 kHz: mode E writes 4 s of I/Q, and a receiver
-/// pinned to mode E (the only reliable way in without the DRM+ acquisition path) decodes
-/// the tone. This is the audio super frame the station used to get wrong: 200 ms over two
-/// 100 ms logical frames (§5.3.1.0), split at the FAC's frame identities.
+/// pinned to mode E decodes the tone. (Pinned for a deterministic start — unpinned
+/// acquisition is `mode_e_rx.rs`'s and works here too.) This is the audio super frame the
+/// station used to get wrong: 200 ms over two 100 ms logical frames (§5.3.1.0), split at
+/// the FAC's frame identities.
 fn drm_plus_audio_roundtrip(audio: &str, min_frames: u64) -> (u64, f64) {
     let dir = tempfile::tempdir().unwrap();
     let toml = format!(

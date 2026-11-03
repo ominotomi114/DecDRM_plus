@@ -26,8 +26,10 @@ milestone checklist (keep it current).
   the deframer finds its phase from the DAC framing CRCs, `set_whole_check`). AAC runs at
   24/48 kHz there and the MSC uses 16- or 4-QAM only (a 64-QAM setting maps to 16-QAM; the
   SDC is 4-QAM).
-  Receiver of the station's own signal: `Session` (from decdrm-engine) with
-  `ReceiverConfig::pinned` for mode E.
+  Receiver of the station's own signal: `Session` (from decdrm-engine). Mode E is found
+  unpinned too: above 48 kHz `rx::freqacq` matches the 95 kHz spectrum plateau (its two
+  edges put the carrier within a few Hz) and `rx::Receiver::track_cp_frequency` refines it
+  from the guard interval, so `ReceiverConfig::pinned` is a shortcut, not a requirement.
 - `crates/decdrm-schedule` — DRM broadcast schedules (Dream's DRMDX `DRMSchedule.ini`,
   EiBi CSV): what is on the air now; GUI Schedule tab, `decdrm schedule`. Downloads only
   on the user's request (curl/wget); `src/eibi_tables.rs` is generated from Dream.

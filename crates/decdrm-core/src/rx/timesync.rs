@@ -91,6 +91,11 @@ pub struct SymbolWindow {
     /// right, near zero after a timing jump (e.g. samples lost by the input). `None`
     /// when the guard samples are no longer buffered.
     pub guard_corr: Option<Real>,
+    /// Phase of that guard correlation, radians. A residual carrier offset `df` rotates the
+    /// whole signal, and with it the product of the prefix and its copy, by `-2π·df·Tu`
+    /// (Tu = 27T = 2.25 ms): the receiver turns this into a frequency estimate for mode E,
+    /// which defines no pilots to track one from (see `Receiver::track_cp_frequency`).
+    pub guard_phase: Option<Real>,
     /// Mean power of the window samples.
     pub power: Real,
 }
@@ -565,7 +570,9 @@ impl TimeSync {
             return None;
         }
         let samples = self.buf[rel..rel + self.fft_len].to_vec();
-        let guard_corr = self.guard_correlation(rel);
+        let guard = self.guard_correlation(rel);
+        let guard_corr = guard.map(|(rho, _)| rho);
+        let guard_phase = guard.map(|(_, c)| c.arg());
         let power = samples.iter().map(|s| s.norm_sqr()).sum::<Real>() / samples.len().max(1) as Real;
         let shift = match self.last_start {
             Some(l) => start - (l + self.sym_len as i64),
@@ -580,15 +587,20 @@ impl TimeSync {
             self.buf.drain(..d);
             self.buf_base += d as i64;
         }
-        Some(SymbolWindow { samples, start, shift, guard_corr, power })
+        Some(SymbolWindow { samples, start, shift, guard_corr, guard_phase, power })
     }
 
     /// Best normalised cyclic-prefix correlation for the window at buffer index `rel`,
     /// over guard placements within ±G/2 of the window start (the timing loop may park
     /// the window anywhere in the guard, so the exact position is not a reference).
-    fn guard_correlation(&self, rel: usize) -> Option<Real> {
+    ///
+    /// Returns the coefficient and the complex correlation itself, whose phase carries the
+    /// residual carrier offset. The phase is the same for every placement that overlaps the
+    /// copy (the product is always between samples Tu apart), so the best-scoring placement
+    /// is a safe carrier of it.
+    fn guard_correlation(&self, rel: usize) -> Option<(Real, Cplx)> {
         let g = self.sym_len - self.fft_len;
-        let mut best: Option<Real> = None;
+        let mut best: Option<(Real, Cplx)> = None;
         for step in -4isize..=4 {
             let d = step * g as isize / 8;
             let first = rel as isize - g as isize + d;
@@ -604,7 +616,9 @@ impl TimeSync {
                 p += a.norm_sqr() + b.norm_sqr();
             }
             let rho = if p > 0.0 { 2.0 * c.norm() / p } else { 0.0 };
-            best = Some(best.map_or(rho, |b: Real| b.max(rho)));
+            if best.is_none_or(|(b, _)| rho > b) {
+                best = Some((rho, c));
+            }
         }
         best
     }
@@ -625,4 +639,47 @@ fn decide(scores: &[Real; NMODES], threshold: Real) -> Option<(RobustnessMode, R
     let second = scores.iter().enumerate().filter(|&(i, _)| i != best).map(|(_, &v)| v).fold(0.0, Real::max);
     let rel = if second > 0.0 { max / second } else { Real::INFINITY };
     (rel > threshold).then(|| (RobustnessMode::ALL[best], rel))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::params::WorkingRate;
+
+    /// The guard correlation's phase is the residual carrier offset: with the input rotated
+    /// by `df`, the prefix and its copy differ by `-2π·df·Tu`, so the estimate is
+    /// `-arg(c)/(2π·Tu)`.
+    ///
+    /// The sign matters. The receiver *adds* the estimate to its mixer frequency
+    /// (`Receiver::track_cp_frequency`), so a flipped sign would double the error instead of
+    /// cancelling it — and the loop would look plausible while never locking.
+    #[test]
+    fn the_guard_correlation_phase_carries_the_carrier_offset() {
+        for (rate, df) in [(WorkingRate::R192, 60.0), (WorkingRate::R120, -75.0), (WorkingRate::R192, -180.0)] {
+            let mode = RobustnessMode::E;
+            let sym = mode.symbol_len_at(rate);
+            let fft = mode.fft_size_at(rate);
+            let g = sym - fft;
+            // One symbol: a useful part, with the guard a copy of its last g samples.
+            let useful: Vec<Cplx> = (0..fft)
+                .map(|i| Cplx::new(((i * 37) % 11) as Real - 5.0, ((i * 53) % 13) as Real - 6.0))
+                .collect();
+            let mut samples = Vec::with_capacity(sym);
+            samples.extend_from_slice(&useful[fft - g..]);
+            samples.extend_from_slice(&useful);
+            let w = 2.0 * std::f64::consts::PI * df / f64::from(rate.hz());
+            for (n, s) in samples.iter_mut().enumerate() {
+                *s *= Cplx::from_polar(1.0, w * n as Real);
+            }
+            let mut ts = TimeSync::new_at(mode, rate);
+            ts.stop_timing_acquisition();
+            ts.stop_mode_detection();
+            ts.push(&samples);
+            let (rho, c) = ts.guard_correlation(g).expect("the guard samples are buffered");
+            assert!(rho > 0.99, "{rate}: cyclic-prefix correlation {rho}");
+            let tu_s = fft as Real / f64::from(rate.hz());
+            let est = -c.arg() / (2.0 * std::f64::consts::PI * tu_s);
+            assert!((est - df).abs() < 0.5, "{rate}: estimated {est} Hz, expected {df}");
+        }
+    }
 }

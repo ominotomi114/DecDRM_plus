@@ -353,13 +353,13 @@ pub enum Page {
 /// Which robustness mode the receiver decodes.
 ///
 /// The automatic search covers the DRM30 modes A–D and reads their spectrum occupancy from
-/// the FAC. Mode E (DRM+) cannot be found: its FAC's 2-bit mode field cannot express it, and
-/// the frequency scan is built for 48 kHz geometry. So DRM+ must be chosen, and choosing it
-/// also means the signal must be tuned to the receiver's centre frequency.
+/// the FAC. At 120/192 kHz it finds DRM+ (mode E) too: the plateau of its spectrum, then the
+/// mode, then its carrier from the guard interval. Pinning mode E is a shortcut — it skips
+/// that search, at the price of having to know where the carrier is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ReceiverMode {
-    /// Search for a DRM30 signal (modes A–D, any occupancy).
+    /// Search for a signal (modes A–D any occupancy, and mode E at 120/192 kHz).
     #[default]
     Auto,
     /// Pin mode E (DRM+); its occupancy is always 0.
@@ -431,15 +431,17 @@ pub struct Settings {
     /// Also accept spectrally inverted signals during acquisition.
     pub auto_flip: bool,
     /// Decode this robustness mode instead of searching for one (see
-    /// [`ReceiverConfig::pinned`]). Mode E (DRM+) cannot be found by the automatic search,
-    /// so a DRM+ signal needs this. The other modes are found (and their occupancy read
-    /// from the FAC), so there is nothing to pin for them.
+    /// [`ReceiverConfig::pinned`]). Not needed for mode E (DRM+): at 120/192 kHz the search
+    /// finds it, identifies it and tracks its carrier from the guard interval. Pinning skips
+    /// that, which is a shortcut on a weak signal. Modes A–D are found (and their occupancy
+    /// read from the FAC) anyway, so there is nothing to pin for them.
     pub receiver_mode: ReceiverMode,
     /// Pace recordings to real time (otherwise decode as fast as possible).
     pub realtime: bool,
     /// DC carrier frequency of the input, Hz, for a pinned receiver (see
     /// [`ReceiverConfig::dc_hz`]). A pinned receiver does not search for the carrier, so a
-    /// DRM+ recording whose carrier is off centre needs this.
+    /// DRM+ recording whose carrier is off centre needs it; the guard interval then corrects
+    /// a few tens of Hz of residual.
     pub dc_hz: f64,
     pub play_audio: bool,
     /// Sound-card output by name (`None` = system default).

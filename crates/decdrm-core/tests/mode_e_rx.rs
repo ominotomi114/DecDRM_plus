@@ -526,13 +526,16 @@ fn a_pinned_configuration_reaches_mode_e_without_set_mode() {
 /// The transmitter runs at 192 kHz and the signal is put **off centre** so the frequency
 /// half is exercised too: a receiver that ran at DC would decode nothing.
 ///
-/// **Unpinned mode E is best-effort, not the reliable path.** The plateau locates the
-/// carrier to only about ±50 Hz — it is a spectral search with no reference cells to
-/// refine against, and mode E's continuous-frequency tracking is disabled for the same
-/// reason (`framesync`: the mode defines no continuous pilots either). A residual of that
-/// size costs real frames: this in-process signal decodes, and so do several of the `refs/`
-/// recordings, but not all of them. Pinning (`--drm-plus`, or the GUI's mode picker) skips
-/// the estimate entirely and is what the recordings are decoded with in practice.
+/// **Two estimates make it work without pinning.** The spectrum search puts the carrier
+/// within 4.5–14 Hz (standard deviation over ten 0.47 s windows of each reference
+/// recording): a band's *edges* are far better conditioned than the band ratio's flat top.
+/// The guard interval then refines it — the phase of its correlation is `−2π·Δf·Tu`,
+/// unambiguous within ±222 Hz, and a block of 16 symbols averages it to about a hertz (see
+/// `Receiver::track_cp_frequency`). Nothing else could: mode E defines no frequency
+/// reference cells *and* no continuous pilots, so `framesync` tracks no frequency for it.
+/// Measured on the reference recordings, all fourteen decode unpinned now, within two
+/// frames of the pinned count and without re-acquiring, where before only two did and the
+/// receiver restarted every four seconds looking for another estimate.
 #[test]
 fn mode_e_is_acquired_without_pinning() {
     let rate = WorkingRate::R192;
@@ -567,14 +570,18 @@ fn mode_e_is_acquired_without_pinning() {
         ..Default::default()
     });
     let (mut found, mut mode_e, mut fac_ok) = (false, false, 0usize);
+    let mut acquisitions = 0usize;
     for chunk in sig.chunks(rate.hz() as usize / 10 * 2) {
         for ev in rx.push(chunk) {
             match ev {
                 ReceiverEvent::SignalFound { dc_hz, .. } => {
                     found = true;
-                    // Coarse: the plateau's edges put the carrier within a kHz.
+                    acquisitions += 1;
+                    // The edges of the spectrum put the carrier within a few tens of Hz (the
+                    // crest centroid this replaces was off by up to 220 Hz); the guard-phase
+                    // tracker then closes the rest, which is why the frames below decode.
                     assert!(
-                        (dc_hz - DC_HZ).abs() < 1500.0,
+                        (dc_hz - DC_HZ).abs() < 60.0,
                         "found the signal at {dc_hz:.0} Hz, expected about {DC_HZ:.0}"
                     );
                 }
@@ -586,7 +593,62 @@ fn mode_e_is_acquired_without_pinning() {
     }
     assert!(found, "coarse acquisition did not find the mode E signal");
     assert!(mode_e, "the receiver did not identify the signal as mode E");
-    assert!(fac_ok > 0, "no FAC decoded from an unpinned mode E signal");
+    // One acquisition, and the frames then decode for the rest of the run. Before the
+    // guard-phase tracker the search's estimate was too far off for any FAC, so the
+    // receiver restarted every four seconds and only ever decoded by luck.
+    assert_eq!(acquisitions, 1, "acquisition restarted ({acquisitions} times)");
+    assert!(fac_ok > 170, "only {fac_ok} FAC of 200 decoded unpinned");
+}
+
+/// A pinned receiver told a carrier frequency that is **wrong** still locks: the guard-phase
+/// tracker pulls it in. This is the same mechanism that makes the unpinned path decode, seen
+/// from the other side — and it is what a `--dc` guess within a few tens of Hz needs.
+///
+/// The error is 80 Hz on purpose: measured on a reference recording, the FAC/MSC decode
+/// cleanly within ±20 Hz of the carrier, partially at ±50 Hz, and not at all at ±100 Hz.
+/// The guard-phase estimate is unambiguous within ±222 Hz, so this is well inside it.
+#[test]
+fn a_pinned_mode_e_receiver_pulls_in_a_wrong_dc() {
+    let rate = WorkingRate::R192;
+    let cfg = tx_config(rate);
+    let mut tx = Transmitter::new(cfg).expect("transmitter");
+    let layout = tx.layout();
+    let mut out = OutputStage::new(layout, OutputConfig::iq_at(0.0, rate)).expect("output stage");
+    let mut rx = Receiver::new(ReceiverConfig {
+        input: InputFormat::Iq { swap: false },
+        channels: 2,
+        working_rate: rate,
+        pinned: Some((RobustnessMode::E, SpectrumOccupancy::SO_0)),
+        // The signal is at DC but the receiver is told to mix at +80 Hz.
+        dc_hz: 80.0,
+        ..Default::default()
+    });
+    rx.set_msc_config(Some(MscConfig {
+        mode: cfg.msc_mode,
+        protection: cfg.protection,
+        part_a_bytes: 0,
+        interleaving: cfg.interleaving,
+    }));
+
+    let cap = tx.msc_capacity();
+    let mut msc = vec![0u8; cap.total_bits()];
+    let mut pcm: Vec<f32> = Vec::new();
+    let mut fac_ok = 0;
+    for f in 0..120 {
+        for (i, b) in msc.iter_mut().enumerate() {
+            *b = (((f * 7 + i) >> 3) & 1) as u8;
+        }
+        let sdc = (tx.frame_index() == 0).then(|| vec![0u8; tx.sdc_capacity_bytes()]);
+        let baseband = tx.transmit_frame(&test_fac(), &msc, sdc.as_deref()).expect("transmit");
+        pcm.clear();
+        out.process(&baseband, &mut pcm);
+        for ev in rx.push(&pcm) {
+            if let ReceiverEvent::Fac(_) = ev {
+                fac_ok += 1;
+            }
+        }
+    }
+    assert!(fac_ok > 100, "only {fac_ok} FAC of 120 decoded with the carrier 80 Hz off");
 }
 
 /// Mode E through a VHF mobile channel: COST 207 TU6 at 100 km/h on 200 MHz (18.5 Hz

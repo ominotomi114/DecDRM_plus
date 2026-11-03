@@ -4,6 +4,10 @@
 //!
 //! Improvement over Dream: the mirrored pilot pattern is searched as well, so a
 //! spectrally inverted signal (e.g. LSB reception) is detected automatically.
+//!
+//! Above 48 kHz the pilots are not enough: mode E (DRM+) defines no frequency reference
+//! cells at all (§8.4.2), so there the search matches the signal's **spectrum plateau**
+//! instead (see [`FreqAcquisition::detect_plateau`]).
 
 use crate::dsp::fft::Fft;
 use crate::dsp::hamming;
@@ -315,11 +319,13 @@ impl FreqAcquisition {
         for start in lo..=(hi + 1 - w) {
             best = best.max(score_at(start));
         }
-        // The ratio's own peak is flat — the band, the pilots and the DC notch ripple it —
-        // so its argmax wanders over tens of bins: that is a carrier error of several
-        // hundred Hz, which is enough to keep the tracking loop from ever pulling in (it
-        // restarts instead, without end). Take the **centre of the region that is nearly
-        // maximal** instead, which for a signal wider than the ripples is the band's centre.
+        if best < MIN_BAND_RATIO {
+            return None;
+        }
+        // Where the band is, to sub-bin precision. The ratio's own peak is flat — the band
+        // is as wide as the window — so its argmax wanders over tens of bins; the band's two
+        // *edges* are far better conditioned. Fall back to the crest centroid below if the
+        // edges cannot be found (a search span too narrow for the kernel's margins).
         let (mut first, mut last) = (usize::MAX, 0usize);
         for start in lo..=(hi + 1 - w) {
             if score_at(start) >= CREST * best {
@@ -327,29 +333,28 @@ impl FreqAcquisition {
                 last = last.max(start);
             }
         }
-        if best < MIN_BAND_RATIO || first == usize::MAX {
-            return None;
-        }
-        // The crest's *centre*, to sub-bin precision: `(first + last) / 2` is quantised to
-        // whole bins and moves with the crest's asymmetry, which at 7.8 Hz a bin is already
-        // a few percent of a carrier spacing. The weighted centroid of the crest region is
-        // stable against both.
-        let (mut num, mut den) = (0.0 as Real, 0.0 as Real);
-        for start in first..=last {
-            let weight = score_at(start) - CREST * best;
-            num += weight * start as Real;
-            den += weight;
-        }
-        let centroid = if den > 0.0 { num / den } else { (first + last) as Real / 2.0 };
+        let centroid = if first != usize::MAX {
+            let (mut num, mut den) = (0.0 as Real, 0.0 as Real);
+            for start in first..=last {
+                let weight = score_at(start) - CREST * best;
+                num += weight * start as Real;
+                den += weight;
+            }
+            if den > 0.0 { num / den } else { (first + last) as Real / 2.0 }
+        } else {
+            (lo + hi) as Real / 2.0
+        };
         let best_start = centroid as usize;
+        let center_bin = match self.edge_centre(psd, lo, hi, bin_hz) {
+            Some(c) => c,
+            None => centroid + w as Real / 2.0 - 0.5,
+        };
         if std::env::var_os("DECDRM_ACQDBG").is_some() {
-            eprintln!("ACQ w {w} best {best:.2} span {first}..{last} centroid {centroid:.1}");
+            eprintln!(
+                "ACQ w {w} best {best:.2} span {first}..{last} centroid {centroid:.1} \
+                 edge-centre {center_bin:.2}"
+            );
         }
-        // The carrier is the centre of the matched window: the band is symmetric about it
-        // by construction, so no edge measurement is needed. (The `best_start` above is
-        // already the centre of the region scoring near the maximum, not the bare argmax,
-        // which wanders over the ratio's flat top.)
-        let center_bin = centroid + w as Real / 2.0 - 0.5;
         let dc = (center_bin - half as Real) * bin_hz;
         if dc < self.search.min_hz || dc > self.search.max_hz {
             return None;
@@ -358,4 +363,128 @@ impl FreqAcquisition {
         Some(Acquisition { dc_hz: dc, inverted: false, score, power })
     }
 
+    /// The band's centre from its two edges, as a fractional bin index into `psd`.
+    ///
+    /// A band edge is a step in the spectrum, and an antisymmetric kernel (the derivative of
+    /// a Gaussian) turns a step into an extremum whose slope is as steep as the smoothing
+    /// allows — the position is then well conditioned, unlike the flat top of the band-ratio
+    /// the detector maximises. The kernel is the same at both edges, so a symmetric
+    /// transmit-filter rolloff cancels in their midpoint, and the midpoint is the carrier.
+    ///
+    /// Measured on the 13 reference recordings (10 windows each, 0.47 s): a standard
+    /// deviation of 4.5–14 Hz and a bias under 5 Hz, against 14–62 Hz and up to 70 Hz for
+    /// the crest centroid this replaces.
+    fn edge_centre(&self, psd: &[Real], lo: usize, hi: usize, bin_hz: Real) -> Option<Real> {
+        // Smooth over one carrier spacing (57 bins at the 7.8125 Hz bin every rate keeps):
+        // the subcarrier ripple has that period, so this averages it out and leaves the band
+        // edge, which is a few tens of Hz wide.
+        let spacing_bins = (RobustnessMode::E.carrier_spacing_at(self.rate) / bin_hz).round() as usize;
+        let smooth = spacing_bins.max(3) | 1;
+        let sigma = (smooth as Real / 4.0).max(2.0);
+        let radius = (4.0 * sigma).ceil() as usize;
+        let margin = radius + smooth / 2 + 1;
+        if hi <= lo + 2 * margin {
+            return None;
+        }
+        let mut prefix = vec![0.0; psd.len() + 1];
+        for (i, &v) in psd.iter().enumerate() {
+            prefix[i + 1] = prefix[i] + v;
+        }
+        let mean_at = |i: usize| -> Real {
+            let a = i.saturating_sub(smooth / 2);
+            let b = (i + smooth / 2 + 1).min(psd.len());
+            let sum = prefix[b] - prefix[a];
+            if b > a { sum / (b - a) as Real } else { 0.0 }
+        };
+        let smoothed: Vec<Real> = (lo..=hi).map(mean_at).collect();
+        // Antisymmetric kernel: positive where the power rises, negative where it falls. Its
+        // normalisation does not affect the position (both extrema use the same kernel).
+        let kern: Vec<Real> = (0..=2 * radius)
+            .map(|j| {
+                let x = j as Real - radius as Real;
+                x * (-x * x / (2.0 * sigma * sigma)).exp()
+            })
+            .collect();
+        let len = smoothed.len();
+        let mut d = vec![0.0; len];
+        let (mut kr, mut kv) = (0usize, Real::NEG_INFINITY);
+        let (mut kf, mut low) = (0usize, Real::INFINITY);
+        for k in margin..len - margin {
+            let mut v = 0.0;
+            for (j, &kj) in kern.iter().enumerate() {
+                v += kj * smoothed[k + j - radius];
+            }
+            d[k] = v;
+            if v > kv {
+                (kr, kv) = (k, v);
+            }
+            if v < low {
+                (kf, low) = (k, v);
+            }
+        }
+        if kr >= kf || kv <= 0.0 || low >= 0.0 {
+            return None;
+        }
+        // Three-point parabola through each extremum: a fraction of a bin, which at 7.8 Hz a
+        // bin is a few percent of a carrier spacing.
+        let refine = |k: usize| -> Real {
+            let (y0, y1, y2) = (d[k - 1], d[k], d[k + 1]);
+            let den = y0 - 2.0 * y1 + y2;
+            if den != 0.0 { k as Real + 0.5 * (y0 - y2) / den } else { k as Real }
+        };
+        Some(0.5 * (refine(kr) + refine(kf)) + lo as Real)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A mode E band `width_hz` wide at `centre_hz` on a floor 20 dB lower, with a linear
+    /// rolloff `roll_hz` at each edge and a deterministic ±10 % ripple, as a stand-in for
+    /// the subcarrier ripple of a real signal.
+    fn band_psd(n: usize, rate: WorkingRate, centre_hz: Real, width_hz: Real, roll_hz: Real) -> Vec<Real> {
+        let bin = f64::from(rate.hz()) / n as Real;
+        let mut seed = 0x2545_F491_4F6C_DD1Du64;
+        let mut ripple = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            0.9 + 0.2 * ((seed >> 11) as Real / (1u64 << 53) as Real)
+        };
+        (0..n)
+            .map(|i| {
+                let f = (i as isize - (n / 2) as isize) as Real * bin;
+                let d = (f - centre_hz).abs();
+                let half = width_hz / 2.0;
+                let inside = if d <= half - roll_hz {
+                    1.0
+                } else if d >= half {
+                    0.0
+                } else {
+                    1.0 - (d - (half - roll_hz)) / roll_hz
+                };
+                ripple() * (0.01 + inside)
+            })
+            .collect()
+    }
+
+    /// The band's two edges locate the carrier to a few Hz — a band narrower by 100 Hz or a
+    /// centre off by 100 Hz is a different, wrong answer, and would cost mode E most of its
+    /// multiplex frames (it has no pilots to refine the estimate with).
+    #[test]
+    fn the_edge_centre_locates_the_band_within_a_few_hz() {
+        let rate = WorkingRate::R192;
+        let acq = FreqAcquisition::new_at(false, false, rate);
+        let n = fft_len_at(rate);
+        let bin = f64::from(rate.hz()) / n as Real;
+        let half = (n / 2) as isize;
+        let (lo, hi) = ((half - 12_000) as usize, (half + 12_000) as usize);
+        for centre in [0.0, 20_000.0, -15_500.0, 41_000.0] {
+            let psd = band_psd(n, rate, centre, 94_700.0, 250.0);
+            let c = acq.edge_centre(&psd, lo, hi, bin).expect("the band edges");
+            let est = (c - half as Real) * bin;
+            assert!((est - centre).abs() < 10.0, "band at {centre}: got {est:.1} Hz");
+        }
+    }
 }
