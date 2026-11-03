@@ -1253,11 +1253,31 @@ needs 120 or 192 kHz; the input is resampled to whatever the receiver is configu
     −21 dBFS with `papr_db = 6` and asserts no clipped samples: 0 in 30 s measured, where the
     old default clipped 1973.
 
-  *The form follows the mode* (2026-11-03). The transmitter form's audio card now knows the
-  mode: for mode E it greys out xHE-AAC and DAC (no mode E super frame yet) with the reason on
-  hover, offers the mode's core rates (24 kHz, and 48 kHz without SBR — §5.4.1; 12 kHz does
-  not exist in mode E), and repairs a rate the document still holds from the other mode, the
-  way the channel rows repair their fields. The receiver's Diversity tab used a hardcoded
+  *Mode E audio: xHE-AAC, DAC and Opus* (2026-11-03). The two codecs that were rejected in
+  mode E now work, and a third one turned out broken:
+
+  - **xHE-AAC**: its super frame in mode E is 200 ms (§5.3.1.0), and the encoder's rate
+    control assumed 400 ms everywhere (`bitrate = 20·bytes`, the 15-frame rule, the
+    163 920 bit/s ceiling, `frames_per_super_frame`). `XheAacConfig::super_frame_ms` now
+    carries the duration and everything scales with it (`with_super_frame_ms`); the station
+    plans a 200 ms super frame of two logical frames' bytes and the receiver already found
+    the pair from the super frame's header CRC (the DRM+ reference recordings decode that
+    way). Measured: 4 s of mode E xHE-AAC at 192 kHz decodes **70 frames**, none concealed.
+  - **DAC**: its super frame is 400 ms by construction (30 frames of 320 samples at 24 kHz),
+    so mode E cannot hold it in two 100 ms logical frames: it spans **four**. The station
+    splits the encoded 400 ms super frame into four parts and the receiver collects four
+    (`super_frames_for(Dac, E) = 4`). The FAC frame identity cannot give the phase over RF
+    (the interleaver's delay flips the parity), so `AudioDeframer::set_whole_check` lets the
+    engine hand the deframer the DAC framing's CRC check: a candidate that fails slides one
+    logical frame and tries again. Measured: 4 s of mode E DAC (24 kbit/s, 192 kHz) decodes
+    **7 super frames, 0 concealed**, the 440 Hz tone at 0.254 against 0.25.
+  - **Opus**: the station built the 400 ms format's twenty borders for mode E's 200 ms
+    super frame and so failed to encode it at all (`AacSuperFrameFormat::opus_for` with the
+    plan's packet count fixes it). Measured: 150 packets of 4 s, none concealed.
+
+  The transmitter form's audio card no longer greys out xHE-AAC or DAC in mode E; it still
+  offers mode E's AAC core rates (24 kHz, and 48 kHz without SBR — §5.4.1) and repairs a rate
+  the document holds from the other mode. The receiver's Diversity tab used a hardcoded
   400 ms per record for its time axis; `DiversityView::frame_seconds` now carries the mode's
   (0.1 s in mode E).
 
@@ -1269,12 +1289,11 @@ needs 120 or 192 kHz; the input is resampled to whatever the receiver is configu
   workspace's path make `cl` fail with D8050 ("cannot execute c1xx.dll ... debug record").
   The portable binaries do not need debug info.
 
-  Not yet done: xHE-AAC/DAC in mode E; the DRM+ acquisition path (pinning mode E is the reliable
-  way in); the GUI's diversity history still assumes 400 ms frames (receiver side, mode E
-  diversity is untested).
+  Not yet done: the DRM+ acquisition path (pinning mode E is the reliable way in); the GUI's
+  diversity history still assumes 400 ms frames (receiver side, mode E diversity is untested).
 
-  Next: xHE-AAC/DAC audio super frames for mode E. The tuning pass on `params(E)` is done
-  (above).
+  Next: the mode E acquisition path (finding DRM+ without pinning). The tuning pass on
+  `params(E)` is done (above).
 
   *PAPR reduction, measured* (2026-11-03). There was none: the output stage clipped at ±1 and
   that was the whole story, so a mode B signal (10.7 dB crest; 12.8 dB for the real part at the

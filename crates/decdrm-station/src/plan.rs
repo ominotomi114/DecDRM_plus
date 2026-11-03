@@ -411,12 +411,13 @@ fn default_core_rate(codec: Codec, mode: RobustnessMode) -> u32 {
     }
 }
 
-/// The xHE-AAC sampling rate for audio super frames of `super_frame_len` bytes when
-/// `sample_rate` is not set (see the module docs): 24 kHz up to 24 kbit/s, 32 kHz up to
-/// 48 kbit/s, 48 kHz above; 48 kHz for 4:1 SBR (a 12 kHz core) and at most 32 kHz
-/// without SBR (more frames than a super frame can list above that).
-pub fn default_xhe_rate(super_frame_len: usize, sbr: SbrRatio) -> u32 {
-    let bitrate = 20 * super_frame_len;
+/// The xHE-AAC sampling rate for audio super frames of `super_frame_len` bytes over
+/// `super_frame_ms` milliseconds when `sample_rate` is not set (see the module docs):
+/// 24 kHz up to 24 kbit/s, 32 kHz up to 48 kbit/s, 48 kHz above; 48 kHz for 4:1 SBR (a
+/// 12 kHz core) and at most 32 kHz without SBR (more frames than a super frame can list
+/// above that).
+pub fn default_xhe_rate(super_frame_len: usize, sbr: SbrRatio, super_frame_ms: u32) -> u32 {
+    let bitrate = (8_000 * super_frame_len as u32) / super_frame_ms.max(1);
     let rate = match bitrate {
         0..=24_000 => 24_000,
         24_001..=48_000 => 32_000,
@@ -1111,16 +1112,6 @@ fn check_audio(cfg: &StationConfig, name: &str, a: &crate::config::AudioSettings
     if a.codec.is_aac() && mode.is_drm_plus() && rate == 48_000 && a.codec.sbr() {
         p.push(format!("{name}: 48 kHz is only allowed without SBR in mode E (use a 24 kHz core)"));
     }
-    if mode.is_drm_plus() && matches!(a.codec, Codec::XheAac | Codec::Dac) {
-        p.push(format!(
-            "{name}: {} in mode E is not implemented yet (its audio super frame spans two logical frames); \
-             use codec = \"he-aac\" or \"aac\" for DRM+",
-            match a.codec {
-                Codec::XheAac => "xHE-AAC",
-                _ => "DAC",
-            }
-        ));
-    }
     if a.codec == Codec::Opus && rate != 48_000 {
         p.push(format!("{name}: Opus always runs at 48 kHz; remove core_rate"));
     }
@@ -1461,23 +1452,19 @@ fn xhe_plan(
     stream: &StreamPlan,
     mode: RobustnessMode,
 ) -> std::result::Result<AudioPlan, String> {
-    if mode.is_drm_plus() {
-        return Err(
-            "xHE-AAC in mode E is not implemented yet (its audio super frame spans two logical frames); use codec \
-             = \"he-aac\" or \"aac\" for DRM+"
-                .into(),
-        );
-    }
     let parts = decdrm_core::mux::audio::super_frames_per_logical(mode);
     let frame_s = f64::from(mode.frame_ms()) / 1000.0;
+    // The audio super frame is one logical frame in A–D (400 ms) and two in mode E (200 ms,
+    // §5.3.1.0); its duration is what the xHE encoder's rate control scales with.
+    let super_ms = (frame_s * parts as f64 * 1000.0).round() as u32;
     let text = has_text(a);
     let len = stream.bytes();
     let text_bytes = if text { TEXT_MESSAGE_BYTES } else { 0 };
-    let super_frame_len = len.saturating_sub(text_bytes);
+    let super_frame_len = len.saturating_sub(text_bytes) * parts;
     let sbr = a.sbr_ratio.unwrap_or_default();
-    let rate = a.sample_rate.unwrap_or_else(|| default_xhe_rate(super_frame_len, sbr));
+    let rate = a.sample_rate.unwrap_or_else(|| default_xhe_rate(super_frame_len, sbr, super_ms));
     let channels: u16 = if a.stereo { 2 } else { 1 };
-    let mut config = XheAacConfig::with_super_frame_bytes(rate, channels, super_frame_len);
+    let mut config = XheAacConfig::with_super_frame_ms(rate, channels, super_frame_len, super_ms);
     config.sbr = sbr.mode();
     let what = format!(
         "xHE-AAC {} at {} kHz{}",
@@ -1485,12 +1472,16 @@ fn xhe_plan(
         khz(rate),
         if sbr == SbrRatio::Auto { String::new() } else { format!(" with SBR ratio {sbr}") }
     );
-    let kbit = |bytes: usize| bytes as f64 * 8.0 / frame_s / 1000.0;
+    // Bit rates of the stream and of a super frame's payload (the text bytes come per
+    // logical frame, so `parts` of them per super frame).
+    let stream_kbit = stream.bitrate() / 1000.0;
+    let need_kbit = |sf_bytes: usize| {
+        (sf_bytes + text_bytes * parts) as f64 * 8.0 / (f64::from(super_ms) / 1000.0) / 1000.0
+    };
     let budget = config.budget().map_err(|e| match config.min_super_frame_bytes() {
         Some(min) if super_frame_len < min => format!(
-            "{:.1} kbit/s left for the audio stream; {what} needs at least {:.1} kbit/s ({})",
-            kbit(len),
-            kbit(min + text_bytes),
+            "{stream_kbit:.1} kbit/s left for the audio stream; {what} needs at least {:.1} kbit/s ({})",
+            need_kbit(min),
             stream_remedy(stream)
         ),
         _ => format!("{what}: {e}"),
@@ -1522,7 +1513,7 @@ fn xhe_plan(
         parts_per_super_frame: parts,
         frame_seconds: frame_s,
         super_frame_len,
-        payload_len: (budget.net_bitrate * frame_s / 8.0) as usize,
+        payload_len: (budget.net_bitrate * (f64::from(super_ms) / 1000.0) / 8.0) as usize,
         encoder_bitrate: budget.net_bitrate as u32,
         opus_packet_bytes: 0,
         params,
@@ -1570,15 +1561,15 @@ fn dac_plan(
     stream: &StreamPlan,
     mode: RobustnessMode,
 ) -> std::result::Result<AudioPlan, String> {
-    if mode.is_drm_plus() {
-        return Err("DAC in mode E is not implemented yet; use codec = \"he-aac\" or \"aac\" for DRM+".into());
-    }
-    let parts = decdrm_core::mux::audio::super_frames_per_logical(mode);
+    // DAC's audio super frame is 400 ms by construction (30 frames of 320 samples at
+    // 24 kHz), so in mode E it spans four 100 ms logical frames instead of two.
+    let parts = decdrm_core::mux::audio::super_frames_for(AudioCodec::Dac, mode);
     let frame_s = f64::from(mode.frame_ms()) / 1000.0;
+    let super_s = frame_s * parts as f64;
     let text = has_text(a);
     let len = stream.bytes();
     let text_bytes = if text { TEXT_MESSAGE_BYTES } else { 0 };
-    let super_frame_len = len.saturating_sub(text_bytes);
+    let super_frame_len = len.saturating_sub(text_bytes) * parts;
     let requested = a.bandwidth_kbps.and_then(decdrm_dac::Bandwidth::from_kbps);
     let chosen = if a.stereo {
         let side = a.side_bandwidth_kbps.and_then(decdrm_dac::Bandwidth::from_kbps);
@@ -1587,7 +1578,10 @@ fn dac_plan(
         decdrm_dac::choose_config(super_frame_len, requested)
     };
     let config = chosen.map_err(|e| {
-        let kbit = |bytes: usize| bytes as f64 * 8.0 / frame_s / 1000.0;
+        let stream_kbit = stream.bitrate() / 1000.0;
+        let need_kbit = |sf_bytes: usize| {
+            (sf_bytes + text_bytes * parts) as f64 * 8.0 / super_s / 1000.0
+        };
         let remedy = if stream.hierarchical {
             "the hierarchical stream's length is fixed by the channel: use a higher protection_hierarchical, \
              HMsym instead of HMmix, or a wider channel"
@@ -1600,10 +1594,9 @@ fn dac_plan(
             (false, false) => "",
         };
         format!(
-            "{:.1} kbit/s left for the audio stream; DAC {} needs at least {:.1} kbit/s ({lower}{remedy})",
-            kbit(len),
+            "{stream_kbit:.1} kbit/s left for the audio stream; DAC {} needs at least {:.1} kbit/s ({lower}{remedy})",
             e.rates(),
-            kbit(e.needed + text_bytes)
+            need_kbit(e.needed)
         )
     })?;
     let rate = decdrm_dac::SAMPLE_RATE;

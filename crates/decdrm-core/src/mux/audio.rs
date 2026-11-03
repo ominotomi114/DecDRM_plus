@@ -145,6 +145,17 @@ pub const fn super_frames_per_logical(mode: RobustnessMode) -> usize {
     }
 }
 
+/// [`super_frames_per_logical`] for a codec: DAC's audio super frame is 400 ms by
+/// construction (30 frames of 320 samples at 24 kHz), so mode E's 100 ms logical frames
+/// carry it over **four** of them. The standard codecs' mode E super frame is 200 ms, i.e.
+/// two logical frames.
+pub const fn super_frames_for(codec: AudioCodec, mode: RobustnessMode) -> usize {
+    match (codec, mode) {
+        (AudioCodec::Dac, RobustnessMode::E) => 4,
+        _ => super_frames_per_logical(mode),
+    }
+}
+
 /// Whether `sf` looks like an xHE-AAC audio super frame: its fixed header CRC checks out
 /// **and** every directory element repeats the header's frame border count (§5.3.1.1-2).
 /// An 8-bit CRC plus four bits per element is what makes the super frame boundary of
@@ -667,6 +678,20 @@ pub struct AudioDeframer {
     parts_per_super_frame: usize,
     /// Audio bytes of the parts of the super frame being collected.
     pending_parts: Vec<u8>,
+    /// Check of a *whole* super frame for a codec without a self-check (DAC's framing
+    /// CRCs): lets [`Self::push`] find the phase of a mode E super frame, which spans four
+    /// logical frames. `None`: any candidate is accepted.
+    whole_check: WholeCheck,
+}
+
+/// A boxed super frame check that keeps `AudioDeframer` cloneable and debuggable.
+#[derive(Clone, Default)]
+struct WholeCheck(Option<std::sync::Arc<dyn Fn(&[u8]) -> bool + Send + Sync>>);
+
+impl std::fmt::Debug for WholeCheck {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(if self.0.is_some() { "WholeCheck(Some)" } else { "WholeCheck(None)" })
+    }
 }
 
 impl AudioDeframer {
@@ -695,7 +720,7 @@ impl AudioDeframer {
             AudioCodec::Dac | AudioCodec::Encodec => (Deframer::Whole, Some(1)),
             AudioCodec::Reserved => return Err(AudioError::Unsupported("reserved audio coding")),
         };
-        let parts_per_super_frame = super_frames_per_logical(mode);
+        let parts_per_super_frame = super_frames_for(params.codec, mode);
         let text_bytes = if params.text_flag { TEXT_MESSAGE_BYTES } else { 0 };
         // The text message sits in each logical frame (§6.5), so every part contributes
         // its audio bytes alone.
@@ -707,7 +732,15 @@ impl AudioDeframer {
             super_frame_bytes: per_part * parts_per_super_frame,
             parts_per_super_frame,
             pending_parts: Vec::new(),
+            whole_check: WholeCheck::default(),
         })
+    }
+
+    /// Give the `Whole` deframer (DAC) a check of a candidate super frame, so that the
+    /// phase of a mode E super frame — four logical frames, whose first the caller may not
+    /// know — can be found from the bits. The engine sets this from the DAC framing's CRCs.
+    pub fn set_whole_check(&mut self, check: Box<dyn Fn(&[u8]) -> bool + Send + Sync>) {
+        self.whole_check = WholeCheck(Some(std::sync::Arc::from(check)));
     }
 
     /// Forget state carried between super frames (xHE-AAC).
@@ -716,6 +749,12 @@ impl AudioDeframer {
         if let Deframer::Xhe(x) = &mut self.deframer {
             x.reset();
         }
+    }
+
+    /// Logical frames one audio super frame spans: 1 in modes A–D; 2 in mode E, or **4 for
+    /// DAC**, whose super frame is 400 ms by construction (see [`super_frames_for`]).
+    pub fn parts_per_super_frame(&self) -> usize {
+        self.parts_per_super_frame
     }
 
     /// Process the logical frame (part A + part B bytes) of one multiplex frame.
@@ -794,13 +833,15 @@ impl AudioDeframer {
     /// Whether the collected bytes start with a valid audio super frame: xHE-AAC checks
     /// its header CRC and directory; AAC (and Dream's Opus, whose packets carry a CRC)
     /// has no super frame CRC but its frame borders must increase and fill the payload, so
-    /// a parse of the wrong pair fails. DAC is one whole super frame — nothing to check.
+    /// a parse of the wrong pair fails. DAC is one whole super frame: its framing CRCs come
+    /// from [`Self::set_whole_check`] (core cannot parse them itself), or any candidate is
+    /// accepted.
     fn super_frame_looks_valid(&self) -> bool {
         let candidate = &self.pending_parts[..self.super_frame_bytes];
         match &self.deframer {
             Deframer::Xhe(_) => xhe_super_frame_ok(candidate),
             Deframer::Aac(fmt) => parse_aac_super_frame(candidate, fmt).is_ok(),
-            Deframer::Whole => true,
+            Deframer::Whole => self.whole_check.0.as_ref().is_none_or(|check| check(candidate)),
         }
     }
 

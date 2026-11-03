@@ -357,13 +357,13 @@ fn config(channel: &str, audio: &str) -> StationConfig {
 fn xhe_configuration_rate_policy() {
     use decdrm_station::plan::default_xhe_rate;
     use decdrm_station::config::SbrRatio;
-    assert_eq!(default_xhe_rate(1000, SbrRatio::Auto), 24_000); // 20 kbit/s
-    assert_eq!(default_xhe_rate(1200, SbrRatio::Auto), 24_000); // 24 kbit/s
-    assert_eq!(default_xhe_rate(1201, SbrRatio::Auto), 32_000);
-    assert_eq!(default_xhe_rate(2400, SbrRatio::Auto), 32_000); // 48 kbit/s
-    assert_eq!(default_xhe_rate(2401, SbrRatio::Auto), 48_000);
-    assert_eq!(default_xhe_rate(400, SbrRatio::Ratio4To1), 48_000);
-    assert_eq!(default_xhe_rate(3000, SbrRatio::None), 32_000);
+    assert_eq!(default_xhe_rate(1000, SbrRatio::Auto, 400), 24_000); // 20 kbit/s
+    assert_eq!(default_xhe_rate(1200, SbrRatio::Auto, 400), 24_000); // 24 kbit/s
+    assert_eq!(default_xhe_rate(1201, SbrRatio::Auto, 400), 32_000);
+    assert_eq!(default_xhe_rate(2400, SbrRatio::Auto, 400), 32_000); // 48 kbit/s
+    assert_eq!(default_xhe_rate(2401, SbrRatio::Auto, 400), 48_000);
+    assert_eq!(default_xhe_rate(400, SbrRatio::Ratio4To1, 400), 48_000);
+    assert_eq!(default_xhe_rate(3000, SbrRatio::None, 400), 32_000);
 
     // Mode B, 10 kHz, 64-QAM, protection 3 (≈27 kbit/s): 32 kHz.
     let cfg = config("mode = \"B\"\nmsc_mode = \"64-QAM\"\nprotection_b = 3", "stereo = true\ntext = [\"Hi\"]");

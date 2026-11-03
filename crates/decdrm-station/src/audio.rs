@@ -720,7 +720,9 @@ impl OpusEncoder {
         let enc = OpusDrmEncoder::new(OpusEncoderConfig::new(plan.input_channels, plan.opus_packet_bytes))?;
         Ok(Self {
             enc,
-            fmt: AacSuperFrameFormat::opus(stream),
+            // 20 packets per 400 ms super frame, 10 per mode E's 200 ms one: the count the
+            // plan computed for the mode, not the DRM30 constant.
+            fmt: AacSuperFrameFormat::opus_for(stream, plan.frames_per_super_frame),
             granule: decdrm_codecs::OPUS_FRAME_LEN * plan.input_channels,
             encoder_errors: 0,
         })
@@ -922,8 +924,9 @@ pub(crate) struct AudioChain {
     /// The title currently in the text message cycle.
     title: Option<String>,
     stream_len: usize,
-    /// The second logical frame of a mode E audio super frame, waiting for its turn.
-    pending: Option<Vec<u8>>,
+    /// The remaining logical frames of the current audio super frame, in order (mode E:
+    /// two, or **four for DAC**, whose super frame is 400 ms by construction).
+    pending: VecDeque<Vec<u8>>,
     pcm: Vec<f32>,
     pub counters: AudioCounters,
 }
@@ -964,7 +967,7 @@ impl AudioChain {
             titles: settings.input.sends_titles(),
             title: None,
             stream_len: stream.total(),
-            pending: None,
+            pending: VecDeque::new(),
             pcm: Vec::new(),
             counters: AudioCounters::default(),
         })
@@ -994,7 +997,7 @@ impl AudioChain {
     /// frames** (§5.3.1.0), so every second call returns the other half of the super frame
     /// the previous call encoded (`pending`).
     pub fn next_logical_frame(&mut self, service_name: &str) -> Result<Vec<u8>> {
-        if let Some(part) = self.pending.take() {
+        if let Some(part) = self.pending.pop_front() {
             return Ok(self.finish_logical_frame(part));
         }
         // One audio super frame at the encoder's input rate.
@@ -1040,10 +1043,17 @@ impl AudioChain {
         self.counters.super_frames += 1;
         // One super frame, `parts` logical frames: return the first part and keep the rest.
         sf.resize(len, 0);
-        if self.plan.parts_per_super_frame > 1 {
-            let per_part = len / self.plan.parts_per_super_frame;
-            let rest = sf.split_off(per_part);
-            self.pending = Some(rest);
+        let parts = self.plan.parts_per_super_frame.max(1);
+        if parts > 1 {
+            let per_part = len / parts;
+            let mut start = 0;
+            for i in 0..parts {
+                // The last part takes any remainder (the plan makes the length divisible).
+                let end = if i + 1 == parts { len } else { start + per_part };
+                self.pending.push_back(sf[start..end].to_vec());
+                start = end;
+            }
+            sf = self.pending.pop_front().expect("the super frame has at least one part");
         }
         Ok(self.finish_logical_frame(sf))
     }

@@ -725,8 +725,8 @@ fn apply_shares(list: &mut ArrayOfTables, weights: &[Option<f64>]) {
 fn services(ui: &mut Ui, doc: &mut DocumentMut, ctx: &mut FormCtx) -> bool {
     let mut changed = false;
     let protection_b = doc.get("channel").and_then(Item::as_table_like).and_then(|ch| get_int(ch, "protection_b")).unwrap_or(1);
-    // The audio settings depend on the mode (core rates, allowed codecs), and the channel
-    // card ran before this, so the document has the mode the rows below draw.
+    // The audio settings depend on the mode (AAC core rates), and the channel card ran
+    // before this, so the document has the mode the rows below draw.
     let mode =
         doc.get("channel").and_then(Item::as_table_like).and_then(|ch| get_str(ch, "mode")).unwrap_or_else(|| "B".into());
     let mut parts = Parts { protection_b, shared: Vec::new(), turned_on: false };
@@ -945,12 +945,6 @@ fn core_rates(mode_e: bool, sbr: bool) -> &'static [(&'static str, &'static str)
     }
 }
 
-/// Whether `codec` can be used in robustness mode `mode`: xHE-AAC and DAC have no mode E
-/// audio super frame yet (their super frames are still one logical frame long).
-fn codec_allowed(mode: &str, codec: &str) -> bool {
-    canon(mode) != "e" || !matches!(canon(codec).as_str(), "xheaac" | "dac")
-}
-
 const XHE_RATES: &[(&str, &str)] = &[
     ("auto", "Automatic (from the bit rate)"),
     ("9600", "9.6 kHz"),
@@ -1019,16 +1013,7 @@ fn audio_settings(
         CODECS.iter().copied().filter(|(v, _)| *v != "dac" || cfg!(feature = "dac") || canon(v) == c).collect();
     grid(ui, ("tx_form_audio", i), |ui| {
         row_label(ui, "Codec");
-        let picked = combo_where(
-            ui,
-            ("tx_codec", i),
-            &codec,
-            &codecs,
-            280.0,
-            |v| codec_allowed(mode, v),
-            "xHE-AAC and DAC have no mode E audio super frame yet; use AAC or HE-AAC for DRM+",
-        );
-        if let Some(v) = picked {
+        if let Some(v) = combo(ui, ("tx_codec", i), &codec, &codecs, 280.0) {
             set(audio, "codec", v);
             // Keys of the old codec that the new one does not take.
             let aac = matches!(canon(v).as_str(), "aac" | "heaac" | "heaacv2");
@@ -2329,8 +2314,7 @@ hierarchical = true
     }
 
     /// The audio choices follow the mode: mode E's 200 ms AAC super frame has 5 or 10
-    /// frames at 24 or 48 kHz (§5.4.1, 48 kHz without SBR only), and xHE-AAC/DAC have no
-    /// mode E super frame yet.
+    /// frames at 24 or 48 kHz (§5.4.1, 48 kHz without SBR only).
     #[test]
     fn audio_choices_follow_the_mode() {
         let values =
@@ -2339,9 +2323,6 @@ hierarchical = true
         assert_eq!(values(core_rates(false, true)), ["12000", "24000"]);
         assert_eq!(values(core_rates(true, true)), ["24000"], "SBR: 48 kHz is not allowed");
         assert_eq!(values(core_rates(true, false)), ["24000", "48000"]);
-        assert!(codec_allowed("E", "he-aac") && codec_allowed("E", "aac") && codec_allowed("E", "opus"));
-        assert!(!codec_allowed("E", "xhe-aac") && !codec_allowed("E", "dac"));
-        assert!(codec_allowed("B", "xhe-aac") && codec_allowed("B", "dac"));
     }
 
     /// The mode E rules must not touch a document already in order.

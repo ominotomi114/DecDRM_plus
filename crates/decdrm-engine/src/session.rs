@@ -826,13 +826,15 @@ impl Session {
         // Content checks of this multiplex frame (passed, failed).
         let (mut good, mut bad) = (0u64, 0u64);
 
-        // Mode E's audio super frame spans two logical frames, and the DRM super frame's
-        // frame identities say which pair: 0 and 2 begin one (§8.1). That holds for MDI,
-        // whose frames carry their own FAC. A receiver's MSC event can arrive after the
-        // FAC of a later frame, so there the deframer finds the phase from the audio
-        // frame structure itself.
+        // Mode E's audio super frame spans two logical frames (four for DAC, whose super
+        // frame is 400 ms by construction), and the DRM super frame's frame identities say
+        // which pair: 0 and 2 begin one (§8.1). That holds for MDI, whose frames carry
+        // their own FAC. A receiver's MSC event can arrive after the FAC of a later frame,
+        // so there the deframer finds the phase from the audio frame structure itself.
         let mdi = matches!(self.rx, Rx::Mdi(_));
-        let starts_super_frame = self.last_channel.is_none_or(|c| c.frame_index.is_multiple_of(2));
+        let parts = self.audio.as_ref().map_or(1, |a| a.deframer.parts_per_super_frame());
+        let starts_super_frame =
+            self.last_channel.is_none_or(|c| (c.frame_index as usize) % parts.max(1) == 0);
 
         if let Some(a) = self.audio.as_mut()
             && let Some(Some(lf)) = logical.get(a.stream_id as usize)
@@ -1123,7 +1125,17 @@ fn build_audio(
         AudioCodec::Encodec => return Err(decdrm_dac::ConfigError::Encodec.to_string()),
         AudioCodec::Reserved => return Err("reserved audio coding (CELP/HVXC are not supported)".into()),
     };
-    let deframer = AudioDeframer::new_at(params, stream, mode).map_err(|e| e.to_string())?;
+    let mut deframer = AudioDeframer::new_at(params, stream, mode).map_err(|e| e.to_string())?;
+    if params.codec == AudioCodec::Dac
+        && let Ok(cfg) = decdrm_dac::DacConfig::from_codec_config(&params.codec_config)
+    {
+        // DAC's super frame has no structural check in core, and a mode E one spans four
+        // logical frames whose first the receiver may not know: its framing CRCs tell a
+        // real super frame from an assembly that started one logical frame late.
+        deframer.set_whole_check(Box::new(move |sf: &[u8]| {
+            decdrm_dac::unpack_super_frame(cfg, sf).is_ok_and(|(p, _)| p.failed == 0)
+        }));
+    }
     let decoder = match coding {
         Some(coding) => open_decoder(coding, &params.type9_bytes).map_err(|e| e.to_string())?,
         None => open_dac(params)?,

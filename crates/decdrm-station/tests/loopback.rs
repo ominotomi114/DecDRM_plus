@@ -1030,10 +1030,10 @@ fn drm_plus_transmits_through_a_vhf_channel() {
 /// pinned to mode E (the only reliable way in without the DRM+ acquisition path) decodes
 /// the tone. This is the audio super frame the station used to get wrong: 200 ms over two
 /// 100 ms logical frames (§5.3.1.0), split at the FAC's frame identities.
-#[test]
-fn drm_plus_audio_decodes_through_the_receiver() {
+fn drm_plus_audio_roundtrip(audio: &str, min_frames: u64) -> (u64, f64) {
     let dir = tempfile::tempdir().unwrap();
-    let toml = r#"
+    let toml = format!(
+        r#"
         [channel]
         mode = "E"
         occupancy = 0
@@ -1046,11 +1046,10 @@ fn drm_plus_audio_decodes_through_the_receiver() {
         label = "DRM+ Audio"
         id = 0x00A002
         [service.audio]
-        codec = "he-aac"
-        core_rate = 24000
-        input = { tone_hz = 800.0 }
-    "#;
-    let (_, plan, status) = transmit(dir.path(), toml, 40);
+        {audio}
+    "#
+    );
+    let (_, plan, status) = transmit(dir.path(), &toml, 40);
     assert_eq!(plan.layout.mode, RobustnessMode::E);
     assert_clean_encoding(&status);
 
@@ -1084,7 +1083,7 @@ fn drm_plus_audio_decodes_through_the_receiver() {
         "mode E: {frames_ok} audio frames ({} concealed, {} super frame errors), FAC {} SDC {}",
         st.frames_concealed, st.super_frame_errors, rx.fac_ok, rx.sdc_ok
     );
-    assert!(frames_ok >= 60, "only {frames_ok} audio frames of 4 s decoded");
+    assert!(frames_ok >= min_frames, "only {frames_ok} audio frames of 4 s decoded");
     // The 800 Hz tone must be the strongest component of the last decoded second (48 kHz
     // output: one second is an exact Goertzel bin).
     assert!(audio.len() > 48_000, "only {} audio samples", audio.len());
@@ -1106,7 +1105,30 @@ fn drm_plus_audio_decodes_through_the_receiver() {
             (best, best_p) = (f64::from(f), p);
         }
     }
-    assert!((best - 800.0).abs() < 10.0, "strongest decoded tone {best} Hz, expected 800");
+    (frames_ok, best)
+}
+
+#[test]
+fn drm_plus_audio_decodes_through_the_receiver() {
+    let (_, tone) = drm_plus_audio_roundtrip("codec = \"he-aac\"\ncore_rate = 24000\ninput = { tone_hz = 800.0 }", 60);
+    assert!((tone - 800.0).abs() < 10.0, "strongest decoded tone {tone} Hz, expected 800");
+}
+
+/// xHE-AAC in mode E: its audio super frame is 200 ms over the two logical frames, and the
+/// receiver finds the pair from the super frame's header CRC (the reference DRM+
+/// recordings decode this way; now the station makes one too).
+#[test]
+fn drm_plus_audio_decodes_xhe_aac() {
+    let (_, tone) = drm_plus_audio_roundtrip("codec = \"xhe-aac\"\ninput = { tone_hz = 800.0 }", 40);
+    assert!((tone - 800.0).abs() < 10.0, "strongest decoded tone {tone} Hz, expected 800");
+}
+
+/// Opus in mode E: ten 20 ms packets in the 200 ms super frame. The station used to build
+/// the DRM30 format's twenty borders for it and fail to produce a super frame at all.
+#[test]
+fn drm_plus_audio_decodes_opus() {
+    let (_, tone) = drm_plus_audio_roundtrip("codec = \"opus\"\ninput = { tone_hz = 800.0 }", 150);
+    assert!((tone - 800.0).abs() < 10.0, "strongest decoded tone {tone} Hz, expected 800");
 }
 
 /// Sound-card output: 3 s to a (virtual) device. Never run automatically.
