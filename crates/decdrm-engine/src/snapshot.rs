@@ -99,6 +99,9 @@ pub struct DiversityView {
     pub carriers: Option<CarrierMix>,
     /// Carrier spacing, Hz (0 before the robustness mode is known).
     pub spacing_hz: f64,
+    /// Seconds per multiplex frame of the mode being received: 0.4 in modes A–D, **0.1 in
+    /// mode E** (§8.1) — the unit the frame-based counts and plots use.
+    pub frame_seconds: f64,
     /// Each branch's latest equalised MSC cells: its constellation before combining
     /// (the combined one is [`Visuals`]' MSC constellation).
     pub msc: [Vec<Cplx>; 2],

@@ -4,10 +4,13 @@
 # (git-ignored): decdrm-gui.exe (receiver + transmitter) and decdrm.exe (command line).
 #
 #   powershell -ExecutionPolicy Bypass -File scripts\build-portable.ps1
+#   powershell -ExecutionPolicy Bypass -File scripts\build-portable.ps1 -NoWeights
 #
 # Needs the DAC weights at build time (`decdrm models download dac`, or
-# $env:DECDRM_MODELS). Builds in target\portable, so the usual target directory and its
-# cache stay as they are.
+# $env:DECDRM_MODELS). With -NoWeights the DAC codec is left out (much smaller
+# executables; DAC services are then named, not decoded). Builds in target\portable, so
+# the usual target directory and its cache stay as they are.
+param([switch]$NoWeights)
 
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
@@ -18,12 +21,27 @@ $triple = "x86_64-pc-windows-msvc"
 $env:RUSTFLAGS = "-C target-feature=+crt-static"
 $env:CARGO_TARGET_DIR = Join-Path $root "target\portable"
 if (-not $env:CARGO_BUILD_JOBS) { $env:CARGO_BUILD_JOBS = "6" }
+# The release profile carries line tables, and MSVC then embeds the compile command line
+# in every object (/Z7). With the codec crates' long include list and a deep workspace
+# path that fails (D8050: c1xx cannot write the debug record), so portable binaries are
+# built without debug info -- which they do not need.
+$env:CARGO_PROFILE_RELEASE_DEBUG = "0"
+# MSVC's librarian and linker scratch files go to %TEMP%, which a sandbox, a cleaner or a
+# scanner can lock (lib.exe then fails with LNK1104 on lnk{GUID}.tmp). Keep them in the
+# workspace instead.
+$env:TEMP = Join-Path $root "target\tmp\buildtmp"
+$env:TMP = $env:TEMP
+New-Item -ItemType Directory -Force $env:TEMP | Out-Null
 
 $features = "decdrm-gui/embed-weights,decdrm-cli/embed-weights"
 
 Push-Location $root
 try {
-    cargo build --release --target $triple -p decdrm-gui -p decdrm-cli --features $features
+    if ($NoWeights) {
+        cargo build --release --target $triple -p decdrm-gui -p decdrm-cli
+    } else {
+        cargo build --release --target $triple -p decdrm-gui -p decdrm-cli --features $features
+    }
     if ($LASTEXITCODE -ne 0) { throw "cargo build failed ($LASTEXITCODE)" }
     $out = Join-Path $root "exe"
     New-Item -ItemType Directory -Force $out | Out-Null
@@ -33,6 +51,9 @@ try {
         Write-Host ("{0,-16} {1,6:N1} MB" -f $exe, $mb)
     }
     Write-Host "written to $out"
+    if ($NoWeights) {
+        Write-Host "built WITHOUT the DAC codec (-NoWeights): DAC services are named, not decoded"
+    }
 } finally {
     Pop-Location
 }

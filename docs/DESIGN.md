@@ -1253,6 +1253,22 @@ needs 120 or 192 kHz; the input is resampled to whatever the receiver is configu
     −21 dBFS with `papr_db = 6` and asserts no clipped samples: 0 in 30 s measured, where the
     old default clipped 1973.
 
+  *The form follows the mode* (2026-11-03). The transmitter form's audio card now knows the
+  mode: for mode E it greys out xHE-AAC and DAC (no mode E super frame yet) with the reason on
+  hover, offers the mode's core rates (24 kHz, and 48 kHz without SBR — §5.4.1; 12 kHz does
+  not exist in mode E), and repairs a rate the document still holds from the other mode, the
+  way the channel rows repair their fields. The receiver's Diversity tab used a hardcoded
+  400 ms per record for its time axis; `DiversityView::frame_seconds` now carries the mode's
+  (0.1 s in mode E).
+
+  *Portable executables* (2026-11-03). `scripts/build-portable.ps1` gained `-NoWeights` (build
+  without the DAC codec for a much smaller executable, or when the weights are not at hand)
+  and a `scripts/build-portable.bat` wrapper. The build now sets
+  `CARGO_PROFILE_RELEASE_DEBUG=0`: with the profile's line tables MSVC embeds the compile
+  command line in every object (`/Z7`), and the codec crates' long include list plus this
+  workspace's path make `cl` fail with D8050 ("cannot execute c1xx.dll ... debug record").
+  The portable binaries do not need debug info.
+
   Not yet done: xHE-AAC/DAC in mode E; the DRM+ acquisition path (pinning mode E is the reliable
   way in); the GUI's diversity history still assumes 400 ms frames (receiver side, mode E
   diversity is untested).

@@ -426,6 +426,7 @@ impl Session {
                     recent: d.recent_mix().clone(),
                     carriers: d.carrier_mix().cloned(),
                     spacing_hz: mode.map_or(0.0, |m| m.carrier_spacing()),
+                    frame_seconds: mode.map_or(0.4, |m| f64::from(m.frame_ms()) / 1000.0),
                     msc: [a.msc_cells(), b.msc_cells()],
                 })
             }
