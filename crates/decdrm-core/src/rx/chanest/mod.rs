@@ -25,14 +25,31 @@ const INIT_SNR_ESTIM_DB: Real = 20.0;
 const TICONST_SNREST_FAST: Real = 30.0;
 const TICONST_SNREST_MSC: Real = 1.0;
 
-fn freq_wiener_len(mode: RobustnessMode) -> usize {
+/// Overrides for the channel estimator's Wiener parameters.
+///
+/// The defaults come from the per-mode tables (annex B for modes A–D; mode E's are tuned
+/// against synthesised VHF channels — see DESIGN). A sweep (or a diagnostic build) can set
+/// them here instead of recompiling; `examples/modee_sweep.rs` is one.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct ChanEstTuning {
+    /// Time-Wiener filter length, pilots (per-mode default when `None`).
+    pub time_len: Option<usize>,
+    /// Maximum Doppler σ of the time Wiener, Hz (per-mode default when `None`).
+    pub time_sigma_hz: Option<Real>,
+    /// Frequency-Wiener filter length, carriers (per-mode default when `None`).
+    pub freq_len: Option<usize>,
+}
+
+fn freq_wiener_len(mode: RobustnessMode, tuning: ChanEstTuning) -> usize {
+    if let Some(len) = tuning.freq_len {
+        return len;
+    }
     match mode {
         RobustnessMode::A => 6,
         RobustnessMode::B | RobustnessMode::C => 11,
         RobustnessMode::D => 13,
-        // Mode E (DRM+): a placeholder, the widest DRM30 value (mode D's); no spec-derived
-        // value has been established, and a sweep from 3 to 21 taps changed nothing (see
-        // time_wiener.rs). Tune it against the graded recordings.
+        // Mode E (DRM+): the widest DRM30 value (mode D's), tuned against the VHF sweeps in
+        // DESIGN; see `examples/modee_sweep.rs`.
         RobustnessMode::E => 13,
     }
 }
@@ -135,6 +152,11 @@ impl ChannelEstimator {
 
     /// [`Self::new`] at an explicit working sample rate (mode E needs 120 or 192 kHz).
     pub fn new_at(map: Arc<CellMap>, rate: crate::params::WorkingRate) -> Self {
+        Self::new_with(map, rate, ChanEstTuning::default())
+    }
+
+    /// [`Self::new_at`] with the Wiener parameters overridden (see [`ChanEstTuning`]).
+    pub fn new_with(map: Arc<CellMap>, rate: crate::params::WorkingRate, tuning: ChanEstTuning) -> Self {
         let n_car = map.num_carriers;
         let x = map.scattered.freq_int;
         let num_pil = (n_car - 1) / x + 1;
@@ -143,10 +165,10 @@ impl ChannelEstimator {
         } else {
             None
         };
-        let tw = TimeWiener::new_at(&map, rate);
+        let tw = TimeWiener::new_with(&map, rate, tuning);
         let delay = tw.delay;
         let track = PdsTracker::new_at(&map, num_pil, delay + 1, rate);
-        let fw_len = freq_wiener_len(map.mode());
+        let fw_len = freq_wiener_len(map.mode(), tuning);
         let ns = map.symbols_per_frame;
         let sym_rate = Real::from(rate.hz()) / map.mode().symbol_len_at(rate) as Real;
         let sys_bw = n_car as Real / map.mode().fft_size_at(rate) as Real * Real::from(rate.hz());

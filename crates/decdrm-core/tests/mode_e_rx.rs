@@ -591,12 +591,13 @@ fn mode_e_is_acquired_without_pinning() {
 
 /// Mode E through a VHF mobile channel: COST 207 TU6 at 100 km/h on 200 MHz (18.5 Hz
 /// maximum Doppler), 20 dB SNR, 192 kHz. The first end-to-end use of the VHF models, and
-/// the first look at mode E's channel estimation at a realistic Doppler — its
-/// `params(E)`/`freq_wiener_len(E)` are placeholders copied from modes C/D.
+/// what the `params(E)` tuning was measured with: with the 3-pilot/12 Hz weights this is 78
+/// FAC and 66 MSC of 80 frames, where the C/D placeholders got 38 and 48.
 #[test]
 fn mode_e_decodes_through_a_moving_vhf_channel() {
-    // Knobs for the sweep the milestone records (a car at 100 km/h on Band III is the
-    // default); the assertions only require that *something* decodes.
+    // Knobs for reproducing the milestone's sweep (a car at 100 km/h on Band III is the
+    // default). The thresholds are loose on purpose: they catch a regression to the old
+    // placeholder without pinning one exact run.
     let knobs = |name: &str, default: Real| {
         std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
     };
@@ -610,7 +611,25 @@ fn mode_e_decodes_through_a_moving_vhf_channel() {
     };
     let (fac, sdc, msc) = run_impaired(WorkingRate::R192, 8.0, true, Some(ch));
     eprintln!("[me] TU6 {speed} km/h 200 MHz {snr} dB: FAC {fac}, SDC {sdc}, MSC {msc}");
-    assert!(fac > 0, "no FAC through TU6 (FAC {fac})");
-    assert!(sdc > 0, "no CRC-valid SDC through TU6 (SDC {sdc})");
-    assert!(msc > 0, "no multiplex frame through TU6 (MSC {msc})");
+    assert!(fac > 60, "FAC {fac} of 80: the estimator is not tracking this Doppler");
+    assert!(sdc > 5, "SDC {sdc}");
+    assert!(msc > 40, "MSC {msc} of 80: the estimator is not tracking this Doppler");
+}
+
+/// The case that motivated the tuning: at 200 km/h (37 Hz) the C/D placeholder decoded **no**
+/// multiplex frames at all; the measured 3-tap/12 Hz weights decode most of them. This is the
+/// regression test for `params(E)`.
+#[test]
+fn mode_e_survives_200_kmh() {
+    let ch = ChannelConfig {
+        snr_db: Some(20.0),
+        model: vhf::cost207_tu6(200.0, 200e6),
+        seed: 3,
+        ..Default::default()
+    };
+    let (fac, sdc, msc) = run_impaired(WorkingRate::R192, 8.0, true, Some(ch));
+    eprintln!("[me] TU6 200 km/h 200 MHz 20 dB: FAC {fac}, SDC {sdc}, MSC {msc}");
+    assert!(fac > 40, "FAC {fac} of 80");
+    assert!(sdc > 0, "SDC {sdc}");
+    assert!(msc > 30, "MSC {msc} of 80 (0 with the old placeholder)");
 }

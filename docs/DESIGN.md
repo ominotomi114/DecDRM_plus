@@ -1001,12 +1001,13 @@ needs 120 or 192 kHz; the input is resampled to whatever the receiver is configu
      the mode picker is a shortcut, not a requirement, and a DRM+ signal no longer has to
      be tuned to the receiver's centre frequency.
 
-  The `TimeWiener` `params(E)` filter length/Doppler pair and `freq_wiener_len(E)` are
-  **placeholders** copied from mode C/D, marked as such in the code. They are demonstrably
-  not the blocker — a sweep of the frequency length from 3 to 21 taps on a synthetic signal
-  changed nothing, before and after the timing fix — but they are unverified, and the
-  graded recording sweep is the place to tune them (a lower protection level or more noise
-  would show it first).
+  The `TimeWiener` `params(E)` filter length/Doppler pair and `freq_wiener_len(E)` were
+  **placeholders** copied from mode C/D. They are tuned now (2026-11-02): **mode E is
+  (3 pilots, σ = 12 Hz)** and the frequency length stays 13, which a 7–15 tap sweep could not
+  distinguish. The measurement is in the VHF milestone at the end of this document: the
+  placeholder decoded no multiplex frames at 200 km/h, the tuned weights decode 66 of 80.
+  `ChanEstTuning` (a `ReceiverConfig` field) now carries overrides so a sweep can repeat this
+  without recompiling; `examples/modee_sweep.rs` is that sweep.
 
   *Fixed in the form since the list above was written:* the sample-rate value was written to
   the TOML as a number where `RateSetting` needs a string (the saved file could not be read
@@ -1117,24 +1118,35 @@ needs 120 or 192 kHz; the input is resampled to whatever the receiver is configu
   its 2.88–3.30-sample delays, TU6 fading in motion and not when parked, and the frequency
   response of a static two-path channel at 192 kHz.
 
-  *End to end: mode E decodes through a moving VHF channel* (2026-11-01).
-  `mode_e_rx.rs`'s `mode_e_decodes_through_a_moving_vhf_channel` sends 8 s of mode E
-  (80 frames) at 192 kHz through TU6 at 200 MHz and decodes it. Measured, FAC / SDC / MSC
-  frames of 80:
+  *End to end: mode E decodes through a moving VHF channel* (2026-11-01, retuned 2026-11-02).
+  `mode_e_rx.rs`'s `mode_e_decodes_through_a_moving_vhf_channel` and
+  `mode_e_survives_200_kmh` send 8 s of mode E (80 frames) at 192 kHz through TU6 at 200 MHz
+  and decode it. Measured with the tuned estimator, FAC / SDC / MSC frames of 80:
 
   | channel | FAC | SDC | MSC |
   |---|---|---|---|
-  | TU6, parked, 20 dB | 77 | 18 | 66 |
-  | TU6, 100 km/h (18.5 Hz), 20 dB | 37 | 6 | 48 |
-  | TU6, 200 km/h (37 Hz), 20 dB | 12 | 2 | 6 |
-  | TU6, 100 km/h, 10 dB | 31 | 5 | 48 |
+  | TU6, parked, 20 dB | 78 | 18 | 66 |
+  | TU6, 100 km/h (18.5 Hz), 20 dB | 78 | 18 | 66 |
+  | TU6, 200 km/h (37 Hz), 20 dB | 78 | 16 | 66 |
+  | TU6, 100 km/h, 10 dB | 77 | 17 | 66 |
 
-  The limit is **Doppler, not noise**: dropping 10 dB at 100 km/h barely moves the counts,
-  while doubling the speed collapses them. That is exactly where the placeholder
-  `params(E)`/`freq_wiener_len(E)` (copied from modes C/D, whose signals see a few Hz)
-  would be expected to give way, and this sweep is now the measurement to tune them
-  against — at 37 Hz the Wiener filter is being asked to track fades ten times faster than
-  the filters it inherited.
+  ***The tuning pass*** (2026-11-02). With the C/D placeholders (9 pilots, σ = 2.85 Hz) the
+  same runs gave **38/6/48** at 100 km/h and **12/2/6** at 200 km/h: the limit was the
+  estimator, not the noise, because doubling the speed collapsed the counts while dropping
+  10 dB barely moved them. The truth is that 37 Hz is simply outside what a filter sized for
+  a few hertz can follow. `examples/modee_sweep.rs` sweeps the TimeWiener's length (3–9
+  pilots) and maximum Doppler (4–12 Hz) over TU6 at 100 and 200 km/h, then checks the winner
+  parked and at 10 dB (where a wide Doppler setting could cost instead of gain).
+
+  **Result: mode E is 3 pilots, σ = 12 Hz** (`params(E)`), and the frequency length stays 13 —
+  a 7–15 tap sweep could not distinguish it, matching the earlier "not the blocker" note. The
+  short filter is what tracks a 37 Hz fade; 12 Hz is the widest the sweep tried and still
+  improved, so a faster receiver or a harsher profile should extend the grid rather than
+  assume this is the optimum. Parked reception is not a trade: 78 FAC against the
+  placeholder's 77.
+
+  `ChanEstTuning` (a `ReceiverConfig` field) carries the overrides the sweep needs, so this
+  can be repeated without recompiling the receiver.
 
   *Reachable from the station* (2026-11-01). The simulator already lived in `[simulate]`,
   with annex B's HF presets; it takes a VHF preset too now — `vhf = "ra" | "tu6" | "ht"` with

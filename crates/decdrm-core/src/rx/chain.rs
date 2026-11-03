@@ -3,7 +3,7 @@
 //! the robustness mode, spectrum occupancy or coding parameters change.
 
 use super::ReceiverConfig;
-use super::chanest::{ChanStats, ChannelEstimator, PdsAxis};
+use super::chanest::{ChanEstTuning, ChanStats, ChannelEstimator, PdsAxis};
 use super::framesync::{FrameSync, FrameSyncState};
 use super::ofdm::OfdmDemod;
 use super::timesync::SymbolWindow;
@@ -133,6 +133,8 @@ pub(super) struct SymbolChain {
     mode: RobustnessMode,
     /// Working sample rate of the input (mode E, DRM+, needs 120 or 192 kHz).
     rate: WorkingRate,
+    /// Overrides for the estimator's Wiener parameters (see [`ChanEstTuning`]).
+    tuning: ChanEstTuning,
     map: Arc<CellMap>,
     ofdm: OfdmDemod,
     frame: FrameSync,
@@ -220,9 +222,10 @@ impl SymbolChain {
         Some(Self {
             mode,
             rate: cfg.working_rate,
+            tuning: cfg.chanest,
             ofdm: OfdmDemod::new_at(&map, cfg.working_rate),
             frame: FrameSync::new_at(&map, cfg.working_rate),
-            chanest: ChannelEstimator::new_at(Arc::clone(&map), cfg.working_rate),
+            chanest: ChannelEstimator::new_with(Arc::clone(&map), cfg.working_rate, cfg.chanest),
             history: super::scatter::ChannelHistory::new_at(&map, cfg.working_rate),
             cells: Vec::new(),
             recent: VecDeque::new(),
@@ -304,7 +307,7 @@ impl SymbolChain {
             let map = Arc::new(map);
             self.ofdm = OfdmDemod::new_at(&map, self.rate);
             self.frame.reconfigure(&map);
-            self.chanest = ChannelEstimator::new_at(Arc::clone(&map), self.rate);
+            self.chanest = ChannelEstimator::new_with(Arc::clone(&map), self.rate, self.tuning);
             if self.tracking {
                 self.chanest.start_time_wiener_tracking();
             }
@@ -399,7 +402,7 @@ impl SymbolChain {
         }
         if fs.id_changed {
             // Frame alignment changed: channel history and demapper are invalid.
-            self.chanest = ChannelEstimator::new_at(Arc::clone(&self.map), self.rate);
+            self.chanest = ChannelEstimator::new_with(Arc::clone(&self.map), self.rate, self.tuning);
             if self.tracking {
                 self.chanest.start_time_wiener_tracking();
             }

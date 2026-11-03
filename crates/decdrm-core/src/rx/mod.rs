@@ -26,7 +26,7 @@ mod chain;
 mod mscdec;
 
 pub use chain::{CHAN_ROWS, ChainVisuals, MscConfig, MscFrame, SdcBlock};
-pub use chanest::PdsAxis;
+pub use chanest::{ChanEstTuning, PdsAxis};
 pub use diversity::{CarrierMix, DiversityReceiver, DiversityStats, MixRecord, MscCells, RECENT_MIX};
 pub use scatter::DelayDoppler;
 pub use input::{InputFormat, RealChannel};
@@ -97,6 +97,9 @@ pub struct ReceiverConfig {
     pub input: InputFormat,
     /// Channels in the interleaved input.
     pub channels: usize,
+    /// Channel-estimator overrides (normally the per-mode Wiener defaults; a sweep sets them
+    /// here — see [`ChanEstTuning`]).
+    pub chanest: ChanEstTuning,
     /// Mirror the spectrum (manual).
     pub flip: bool,
     /// Also accept spectrally inverted signals during acquisition.
@@ -145,6 +148,7 @@ impl Default for ReceiverConfig {
         Self {
             input: InputFormat::default(),
             channels: 1,
+            chanest: ChanEstTuning::default(),
             flip: false,
             auto_flip: true,
             msc_iterations: 2,

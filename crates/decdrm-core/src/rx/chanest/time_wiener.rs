@@ -24,11 +24,16 @@ fn params(mode: RobustnessMode) -> (usize, Real) {
         RobustnessMode::B => (7, 2.7 / 2.0),
         RobustnessMode::C => (9, 5.7 / 2.0),
         RobustnessMode::D => (9, 4.5 / 2.0),
-        // Mode E (DRM+): a placeholder, the widest DRM30 value (mode C's). Mode E reception
-        // works with it (real recordings decode end to end), and a sweep of the frequency
-        // filter length showed the equaliser tuning is not where the losses were, but no
-        // spec-derived value has been established. Tune it against the graded recordings.
-        RobustnessMode::E => (9, 5.7 / 2.0),
+        // Mode E (DRM+): measured, not inherited. A car on Band III at 100 km/h sees 18.5 Hz
+        // and at 200 km/h 37 Hz of Doppler, an order of magnitude above the modes C/D weights
+        // this used to borrow (σ = 2.85 Hz). Swept against COST 207 TU6 at 200 MHz
+        // (`examples/modee_sweep.rs`, 50-frame runs at 20/10/6 dB): the 3-tap/12 Hz pair
+        // decodes every multiplex frame at 100 km/h and 200 km/h, where the placeholder got
+        // 22/36 and 0/36 at 20 dB, and it also beats it parked (48 FAC against 47), so there
+        // is no static-reception trade. The short filter is what tracks a 37 Hz fade; σ = 12
+        // is the widest the sweep tried and still improved, so a faster receiver may want
+        // more (see the sweep for the next cell).
+        RobustnessMode::E => (3, 12.0),
     }
 }
 
@@ -79,8 +84,19 @@ impl TimeWiener {
     /// into a per-carrier phase rotation with the **FFT size at that rate** as the
     /// denominator: using the 48 kHz size at 192 kHz rotates every estimate 4x too far.
     pub fn new_at(map: &CellMap, rate: crate::params::WorkingRate) -> Self {
+        Self::new_with(map, rate, super::ChanEstTuning::default())
+    }
+
+    /// [`Self::new_at`] with the filter length and Doppler σ overridden (for tuning).
+    pub fn new_with(
+        map: &CellMap,
+        rate: crate::params::WorkingRate,
+        tuning: super::ChanEstTuning,
+    ) -> Self {
         let mode = map.mode();
-        let (len, sigma_max) = params(mode);
+        let (default_len, default_sigma) = params(mode);
+        let len = tuning.time_len.unwrap_or(default_len);
+        let sigma_max = tuning.time_sigma_hz.unwrap_or(default_sigma);
         let t = map.scattered.time_int;
         let delay = ((len * t - t + 1) as Real / 2.0).ceil() as usize + t / 2 - 1;
         let ts = mode.symbol_len_at(rate) as Real / Real::from(rate.hz());
