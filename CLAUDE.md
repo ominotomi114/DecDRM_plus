@@ -85,10 +85,11 @@ milestone checklist (keep it current).
   portable Windows exes, checks and smoke-tests them and uploads them to a draft
   release. Then write the notes and publish:
   `gh release edit vX.Y.Z --title … --notes-file … --draft=false --latest`.
-- Portable Windows executables locally: `scripts\build-portable.bat` (wrapper around
-  `build-portable.ps1`; `-NoWeights` leaves DAC out). Needs the DAC weights
-  (`decdrm models download dac`) for the 300 MB single-file build; writes `exe\decdrm-gui.exe`
-  and `exe\decdrm.exe`.
+- Portable Windows executables locally: `scripts\build-portable.bat` (with DAC and its
+  weights, ~300 MB; needs `decdrm models download dac`) and
+  `scripts\build-portable-noweights.bat` (without the codec, much smaller), both wrappers
+  around `build-portable.ps1` (`-NoWeights` is the flag behind the second). Writes
+  `exe\decdrm-gui.exe` and `exe\decdrm.exe`.
 
 ## Conventions
 - DSP in `f64` (`Real`, `Cplx`); PCM audio is `f32`. Working sample rate 48 kHz.

@@ -1283,7 +1283,9 @@ needs 120 or 192 kHz; the input is resampled to whatever the receiver is configu
 
   *Portable executables* (2026-11-03). `scripts/build-portable.ps1` gained `-NoWeights` (build
   without the DAC codec for a much smaller executable, or when the weights are not at hand)
-  and a `scripts/build-portable.bat` wrapper. The build now sets
+  and two wrappers, `scripts/build-portable.bat` (with the weights) and
+  `scripts/build-portable-noweights.bat` (without); the script checks for the weights up
+  front, so a missing download is one clear line rather than a build-script panic. The build now sets
   `CARGO_PROFILE_RELEASE_DEBUG=0`: with the profile's line tables MSVC embeds the compile
   command line in every object (`/Z7`), and the codec crates' long include list plus this
   workspace's path make `cl` fail with D8050 ("cannot execute c1xx.dll ... debug record").
