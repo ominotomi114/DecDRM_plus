@@ -1020,6 +1020,89 @@ fn drm_plus_transmits_through_a_vhf_channel() {
     assert!(bytes > 300_000, "{bytes} bytes of 192 kHz signal");
 }
 
+/// A DRM+ station's audio, end to end at 192 kHz: mode E writes 4 s of I/Q, and a receiver
+/// pinned to mode E (the only reliable way in without the DRM+ acquisition path) decodes
+/// the tone. This is the audio super frame the station used to get wrong: 200 ms over two
+/// 100 ms logical frames (§5.3.1.0), split at the FAC's frame identities.
+#[test]
+fn drm_plus_audio_decodes_through_the_receiver() {
+    let dir = tempfile::tempdir().unwrap();
+    let toml = r#"
+        [channel]
+        mode = "E"
+        occupancy = 0
+        working_sample_rate = "192"
+        [output]
+        file = "drmplus.wav"
+        format = "iq"
+        sample_format = "float32"
+        [[service]]
+        label = "DRM+ Audio"
+        id = 0x00A002
+        [service.audio]
+        codec = "he-aac"
+        core_rate = 24000
+        input = { tone_hz = 800.0 }
+    "#;
+    let (_, plan, status) = transmit(dir.path(), toml, 40);
+    assert_eq!(plan.layout.mode, RobustnessMode::E);
+    assert_clean_encoding(&status);
+
+    let mut reader = FileReader::open(dir.path().join("drmplus.wav")).unwrap();
+    assert_eq!(reader.format().sample_rate, 192_000);
+    let channels = reader.format().channels;
+    let mut session = Session::new(ReceiverConfig {
+        input: InputFormat::Iq { swap: false },
+        channels,
+        working_rate: decdrm_core::params::WorkingRate::R192,
+        pinned: Some((RobustnessMode::E, SpectrumOccupancy::SO_0)),
+        ..Default::default()
+    });
+    let mut audio = Vec::new();
+    let mut frames_ok = 0u64;
+    while let Some(block) = reader.read(4800).unwrap() {
+        for ev in session.push(&block) {
+            match ev {
+                SessionEvent::Audio(pcm) if !pcm.concealed => {
+                    frames_ok += 1;
+                    audio.extend(pcm.samples.iter().step_by(usize::from(pcm.channels)).map(|&v| f64::from(v)));
+                }
+                SessionEvent::Log(l) => println!("rx: {l}"),
+                _ => {}
+            }
+        }
+    }
+    let st = &session.audio_stats;
+    let rx = session.status();
+    println!(
+        "mode E: {frames_ok} audio frames ({} concealed, {} super frame errors), FAC {} SDC {}",
+        st.frames_concealed, st.super_frame_errors, rx.fac_ok, rx.sdc_ok
+    );
+    assert!(frames_ok >= 60, "only {frames_ok} audio frames of 4 s decoded");
+    // The 800 Hz tone must be the strongest component of the last decoded second (48 kHz
+    // output: one second is an exact Goertzel bin).
+    assert!(audio.len() > 48_000, "only {} audio samples", audio.len());
+    let seg = &audio[audio.len() - 48_000..];
+    let power = |f: f64| {
+        let w = 2.0 * std::f64::consts::PI * f / 48_000.0;
+        let (c, mut s1, mut s2) = (2.0 * w.cos(), 0.0, 0.0);
+        for &v in seg {
+            let s0 = v + c * s1 - s2;
+            s2 = s1;
+            s1 = s0;
+        }
+        s1 * s1 + s2 * s2 - c * s1 * s2
+    };
+    let (mut best, mut best_p) = (0.0, 0.0);
+    for f in 300..=3_000 {
+        let p = power(f64::from(f));
+        if p > best_p {
+            (best, best_p) = (f64::from(f), p);
+        }
+    }
+    assert!((best - 800.0).abs() < 10.0, "strongest decoded tone {best} Hz, expected 800");
+}
+
 /// Sound-card output: 3 s to a (virtual) device. Never run automatically.
 #[test]
 #[ignore = "plays to a sound card: DECDRM_TX_DEVICE (default \"CABLE-A Input\")"]

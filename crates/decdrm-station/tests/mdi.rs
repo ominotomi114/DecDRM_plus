@@ -127,11 +127,14 @@ fn drm_plus_over_mdi() {
     assert!((snap.input.position_s - 6.0).abs() < 1e-9, "60 frames of 100 ms, got {} s", snap.input.position_s);
     assert!(snap.services.iter().any(|s| s.label == "DRM+ MDI"), "{:?}", snap.services);
     assert!(snap.rx.fac_ok >= 55 && snap.rx.sdc_ok >= 14, "FAC {} SDC {}", snap.rx.fac_ok, snap.rx.sdc_ok);
-    println!("[mdi] mode E: FAC {}/60, SDC {}, {} s", snap.rx.fac_ok, snap.rx.sdc_ok, snap.input.position_s);
-    // The multiplex arrives; the audio super frame is the known mode E gap (see
-    // `docs/DESIGN.md`: the station still encodes one 400 ms super frame per logical
-    // frame), so this only reports what it made of it.
-    println!("[mdi] mode E audio: {} frames ok, {} bad", snap.audio.frames_ok, snap.audio.frames_bad);
+    // Mode E's audio super frame is 200 ms over two logical frames (§5.3.1.0): 6 s is
+    // 150 AAC frames of 40 ms at the 24 kHz core rate.
+    assert!(snap.audio.frames_ok >= 140, "only {} audio frames ok", snap.audio.frames_ok);
+    assert_eq!(snap.audio.frames_bad, 0, "{} audio frames bad", snap.audio.frames_bad);
+    println!(
+        "[mdi] mode E: FAC {}/60, SDC {}, {} s, {} audio frames",
+        snap.rx.fac_ok, snap.rx.sdc_ok, snap.input.position_s, snap.audio.frames_ok
+    );
 }
 
 /// An MDI recording (file framing, as Dream writes `.rsA`): decoded to the end.

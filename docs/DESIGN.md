@@ -1190,18 +1190,54 @@ needs 120 or 192 kHz; the input is resampled to whatever the receiver is configu
 
   Measured with `drm_plus_over_mdi` (60 frames of a mode E station at 192 kHz through a `.rsM`
   recording and the engine): mode E in the status, the service from the SDC, **FAC 60/60**,
-  SDC 15, and 6.0 s of input — where the old code would have called it 24 s. The audio still
-  decodes to **0 frames**: the station's `AudioChain::next_logical_frame` encodes 400 ms of PCM
-  per *logical* frame, while mode E's audio super frame is 200 ms mapped onto two 100 ms logical
-  frames (§5.3.1.0). The engine's deframer already expects that split
-  (`super_frames_per_logical(E) = 2`), so this is a transmitter-side fix and the next thing to
-  do for DRM+ audio.
+  SDC 15, and 6.0 s of input — where the old code would have called it 24 s.
 
-  Not yet done: mode E's station audio, now with a measured cause (above) — the audio super
-  frame is 200 ms (§5.3.1.0) while the station's pipeline is written around 400 ms frames. The
-  DRM+ loopback tests decode the multiplex through the receiver, but they bypass the station.
+  *Mode E audio, end to end* (2026-11-03). Real DRM+ recordings decoded all along: the
+  `refs/` recordings are xHE-AAC, and the receiver's deframer finds the 200 ms super frame
+  from the xHE-AAC header (the 26 Oct build decodes 459 audio frames of a 20 s reference with
+  none concealed; this code state 454, none concealed). What never worked was DecDRM's
+  **station** on mode E — it encoded one 400 ms super frame per 100 ms logical frame — and the
+  **AAC** branch of the deframer, which had no way to find the phase (the xHE-AAC check never
+  passes on an AAC super frame): the old build locks onto this station's mode E AAC signal
+  (FAC/SDC fine) and decodes **0** audio frames, where this one decodes 10 of 1.5 s. Now:
 
-  Next: mode E's audio super frame. The tuning pass on `params(E)` is done (above).
+  - `AudioPlan` carries `parts_per_super_frame` (1 in A–D, 2 in mode E) and the logical frame
+    duration; `AudioChain::next_logical_frame` encodes one super frame (200 ms of PCM in mode E)
+    and returns its halves, one per call, holding the second in `pending`.
+  - The AAC frame count follows §5.4.1's mode E rates: 5 frames at a 24 kHz core, 10 at 48 kHz
+    (where A–D have 12/24 kHz) — `AudioParams::aac_frames_per_super_frame` now takes the mode,
+    and Opus gets 10 packets per 200 ms super frame instead of 20.
+  - The receiver's `AudioDeframer` takes the phase from the FAC's frame identities when it has
+    them (MDI, whose frames carry their own FAC: frames 0 and 2 start a super frame), and
+    otherwise finds it from the audio frame borders (AAC/Opus `parse`) or the xHE-AAC header CRC.
+
+  Three more station bugs stood in the way, all found by making a receiver decode the signal:
+
+  - **SDC mode.** Mode E has no 16-QAM SDC; its SDC-mode bit is a protection level (§6.3.3), so
+    the station's default `sdc_mode = Qam16` made the encoder send 16-QAM cells while the FAC
+    announced 4-QAM. No receiver could decode the SDC (it carries the audio and data
+    parameters), which is why the mode E loopback tests never got an audio pipeline at all. A
+    16-QAM setting now means the mode's 4-QAM rate 1/2.
+  - **MSC mode.** The default `msc_mode = Qam64Sm` cannot be signalled in mode E either: the FAC
+    field fell back to 4-QAM while the cells carried 64-QAM. A 64-QAM/hierarchical setting is
+    now mapped to 16-QAM for mode E, and 16-QAM's four protection levels (table 31) are accepted
+    there where modes A–D have two.
+  - **Allocation tables.** `allocate` sized the streams with `MlcParams::msc`, which is
+    hardcoded to mode B: mode E streams were computed from A–D's code rates and came out ~5×
+    too long (the debug check against the transmitter caught it once the MSC mode agreed). It
+    now uses `msc_for(mode, …)`.
+
+  Measured: `drm_plus_audio_decodes_through_the_receiver` (4 s of mode E HE-AAC at 192 kHz,
+  I/Q, receiver pinned to mode E) decodes **75 audio frames** with no concealment and the 800 Hz
+  tone is the strongest component of the last second; `drm_plus_over_mdi` decodes **150 frames**
+  of its 6 s (40 ms AAC frames at the 24 kHz core) with no errors. xHE-AAC and DAC in mode E
+  are rejected with a message (their super frames still need the two-frame split).
+
+  Not yet done: xHE-AAC/DAC in mode E; the DRM+ acquisition path (pinning mode E is the reliable
+  way in); the mode E station bit rates in `plan.describe` still divide by 400 ms.
+
+  Next: xHE-AAC/DAC audio super frames for mode E. The tuning pass on `params(E)` is done
+  (above).
 
   *PAPR reduction, measured* (2026-11-03). There was none: the output stage clipped at ±1 and
   that was the whole story, so a mode B signal (10.7 dB crest; 12.8 dB for the real part at the

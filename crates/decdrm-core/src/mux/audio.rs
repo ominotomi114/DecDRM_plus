@@ -203,7 +203,13 @@ impl AacSuperFrameFormat {
 
     /// Dream's Opus framing in a stream of the given lengths.
     pub fn opus(stream: StreamLengths) -> Self {
-        Self::with_borders(OPUS_FRAMES_PER_SUPER_FRAME, OPUS_FRAMES_PER_SUPER_FRAME, stream)
+        Self::opus_for(stream, OPUS_FRAMES_PER_SUPER_FRAME)
+    }
+
+    /// [`Self::opus`] with an explicit packet count: 20 packets per 400 ms super frame
+    /// (modes A–D), 10 per mode E's 200 ms one.
+    pub fn opus_for(stream: StreamLengths, frames: usize) -> Self {
+        Self::with_borders(frames, frames, stream)
     }
 
     fn with_borders(num_frames: usize, num_borders: usize, stream: StreamLengths) -> Self {
@@ -676,12 +682,15 @@ impl AudioDeframer {
     pub fn new_at(params: &AudioParams, stream: StreamLengths, mode: RobustnessMode) -> Result<Self, AudioError> {
         let (deframer, nominal_frames) = match params.codec {
             AudioCodec::Aac => {
-                let n = params
-                    .aac_frames_per_super_frame()
-                    .ok_or(AudioError::Unsupported("AAC sampling rate not allowed in robustness modes A-D"))?;
+                let n = params.aac_frames_per_super_frame(mode).ok_or(AudioError::Unsupported(
+                    "AAC sampling rate not allowed in this robustness mode (modes A-D: 12 or 24 kHz; mode E: 24 or 48 kHz)",
+                ))?;
                 (Deframer::Aac(AacSuperFrameFormat::aac(n, stream)), Some(n))
             }
-            AudioCodec::Opus => (Deframer::Aac(AacSuperFrameFormat::opus(stream)), Some(OPUS_FRAMES_PER_SUPER_FRAME)),
+            AudioCodec::Opus => {
+                let n = OPUS_FRAMES_PER_SUPER_FRAME / super_frames_per_logical(mode);
+                (Deframer::Aac(AacSuperFrameFormat::opus_for(stream, n)), Some(n))
+            }
             AudioCodec::XheAac => (Deframer::Xhe(XheAacDeframer::new()), None),
             AudioCodec::Dac | AudioCodec::Encodec => (Deframer::Whole, Some(1)),
             AudioCodec::Reserved => return Err(AudioError::Unsupported("reserved audio coding")),
@@ -710,30 +719,56 @@ impl AudioDeframer {
     }
 
     /// Process the logical frame (part A + part B bytes) of one multiplex frame.
+    ///
+    /// For mode E, whose audio super frame spans two logical frames, this finds the
+    /// boundary from the codec's own structure (the xHE-AAC header CRC). A caller that
+    /// knows the frame's position in the DRM super frame should use
+    /// [`Self::push_at`] instead: the frame identities 0 and 2 begin a super frame
+    /// (§8.1), which is what a receiver uses for AAC, whose super frame has no check of
+    /// its own.
     pub fn push(&mut self, logical_frame: &[u8]) -> AudioSuperFrame {
+        self.push_at(logical_frame, None)
+    }
+
+    /// [`Self::push`] with the super frame's phase, for mode E: `Some(true)` says this
+    /// logical frame begins an audio super frame (the first and third frame of a mode E
+    /// DRM super frame), `Some(false)` that it is its second half, `None` that the phase
+    /// is unknown and must be found from the bits.
+    ///
+    /// A second half with no first one (the receiver joined mid-super-frame) is dropped
+    /// and yields an empty result; the next start resynchronises.
+    pub fn push_at(&mut self, logical_frame: &[u8], phase: Option<bool>) -> AudioSuperFrame {
         let (sf, text) = split_text_message(logical_frame, self.text_flag);
         // Collect the parts of a multi-logical-frame super frame (mode E: two). Nothing is
         // parsed until the last part arrives, so a partly collected super frame yields an
         // empty result rather than a spurious error.
         let owned: Vec<u8>;
         let sf = if self.parts_per_super_frame > 1 {
-            // Mode E: the super frame is two logical frames, and *which* two is not in the
-            // bits, so find the boundary the way the rest of the stream is found — by its
-            // own check. A candidate that passes the header CRC and repeats its count in
-            // every directory element is the super frame; if the first candidate does not,
-            // the phase is one logical frame off, so drop one and try again. Once locked
-            // the phase never changes, and a super frame is consumed whole, so the two
-            // halves always travel together.
-            let per_part = self.super_frame_bytes / self.parts_per_super_frame.max(1);
-            self.pending_parts.extend_from_slice(audio_part(logical_frame, self.text_flag));
-            loop {
-                if self.pending_parts.len() < self.super_frame_bytes {
+            match phase {
+                Some(true) => self.pending_parts.clear(),
+                Some(false) if self.pending_parts.is_empty() => {
                     return AudioSuperFrame { nominal_frames: self.nominal_frames, text, ..Default::default() };
                 }
-                if xhe_super_frame_ok(&self.pending_parts[..self.super_frame_bytes]) {
-                    break;
+                _ => {}
+            }
+            let per_part = self.super_frame_bytes / self.parts_per_super_frame.max(1);
+            self.pending_parts.extend_from_slice(audio_part(logical_frame, self.text_flag));
+            if self.pending_parts.len() < self.super_frame_bytes {
+                return AudioSuperFrame { nominal_frames: self.nominal_frames, text, ..Default::default() };
+            }
+            if phase.is_none() {
+                // No phase from the caller: find the boundary by its own check (xHE-AAC's
+                // header CRC and directory). A candidate that fails is one logical frame
+                // off, so drop one and try again.
+                loop {
+                    if self.pending_parts.len() < self.super_frame_bytes {
+                        return AudioSuperFrame { nominal_frames: self.nominal_frames, text, ..Default::default() };
+                    }
+                    if self.super_frame_looks_valid() {
+                        break;
+                    }
+                    self.pending_parts.drain(..per_part);
                 }
-                self.pending_parts.drain(..per_part);
             }
             owned = self.pending_parts.drain(..self.super_frame_bytes).collect();
             owned.as_slice()
@@ -756,9 +791,29 @@ impl AudioDeframer {
         out
     }
 
+    /// Whether the collected bytes start with a valid audio super frame: xHE-AAC checks
+    /// its header CRC and directory; AAC (and Dream's Opus, whose packets carry a CRC)
+    /// has no super frame CRC but its frame borders must increase and fill the payload, so
+    /// a parse of the wrong pair fails. DAC is one whole super frame — nothing to check.
+    fn super_frame_looks_valid(&self) -> bool {
+        let candidate = &self.pending_parts[..self.super_frame_bytes];
+        match &self.deframer {
+            Deframer::Xhe(_) => xhe_super_frame_ok(candidate),
+            Deframer::Aac(fmt) => parse_aac_super_frame(candidate, fmt).is_ok(),
+            Deframer::Whole => true,
+        }
+    }
+
     /// [`Self::push`] for a demultiplexed [`LogicalFrame`].
     pub fn push_frame(&mut self, frame: &LogicalFrame) -> AudioSuperFrame {
         self.push(&frame.data)
+    }
+
+    /// [`Self::push_at`] for a demultiplexed [`LogicalFrame`]: the session passes the
+    /// frame's position in the DRM super frame, so mode E's two-logical-frame audio super
+    /// frame needs no search.
+    pub fn push_frame_at(&mut self, frame: &LogicalFrame, starts_super_frame: bool) -> AudioSuperFrame {
+        self.push_at(&frame.data, Some(starts_super_frame))
     }
 }
 
@@ -1097,6 +1152,41 @@ mod tests {
         let out = d.push(&lf);
         assert_eq!((out.text, out.nominal_frames, out.error), (Some(*b"TEXT"), Some(1), None));
         assert_eq!(out.frames, vec![AudioFrame { data: lf[..100].to_vec(), crc_byte: None, crc_ok: None }]);
+    }
+
+    /// Mode E: one 200 ms AAC audio super frame over **two** 100 ms logical frames
+    /// (§5.3.1.0), 5 AAC frames at a 24 kHz core (§5.4.1). The first half must yield
+    /// nothing; the second completes the super frame.
+    #[test]
+    fn mode_e_audio_super_frame_spans_two_logical_frames() {
+        let stream = StreamLengths { part_a: 0, part_b: 500 };
+        let params = AudioParams::new(0, AudioCodec::Aac, true, AudioMode::Mono, 24_000, false, vec![]);
+        let mut d = AudioDeframer::new_at(&params, stream, RobustnessMode::E).unwrap();
+        let fmt = AacSuperFrameFormat::aac(5, stream);
+        // The super frame is both logical frames' audio: 2 × 500 bytes.
+        let payload = fmt.payload_len(1000).unwrap();
+        let mut frames = Vec::new();
+        let mut left = payload;
+        for i in 0..5 {
+            let n = if i == 4 { left } else { 100 };
+            frames.push(AudioFrame::with_crc(vec![i as u8 + 1; n], 0x55));
+            left -= n;
+        }
+        let sf = build_aac_super_frame(&frames, &fmt, 1000).unwrap();
+        assert_eq!(sf.len(), 1000);
+        let first = d.push_at(&sf[..500], Some(true));
+        assert!(first.frames.is_empty(), "a half super frame must not be parsed");
+        let second = d.push_at(&sf[500..], Some(false));
+        assert!(second.error.is_none(), "{:?}", second.error);
+        assert_eq!(second.frames.len(), 5);
+        assert_eq!(second.frames[0].data, frames[0].data);
+        assert_eq!(second.nominal_frames, Some(5));
+        // A second half without a first one (a receiver joining mid-super-frame) is
+        // dropped, and the next start resynchronises.
+        let mut d = AudioDeframer::new_at(&params, stream, RobustnessMode::E).unwrap();
+        assert!(d.push_at(&sf[500..], Some(false)).frames.is_empty());
+        assert!(d.push_at(&sf[..500], Some(true)).frames.is_empty());
+        assert_eq!(d.push_at(&sf[500..], Some(false)).frames.len(), 5);
     }
 
     #[test]

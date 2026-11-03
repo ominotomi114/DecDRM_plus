@@ -14,8 +14,10 @@ occupancy = 3                # 0..5 = 4.5, 5, 9, 10, 18, 20 kHz; modes C and D o
                              # mode E only 0 (100 kHz, the DRM+ raster)
 working_sample_rate = "48"   # 48 (modes A-D), 96, 120 or 192 kHz. Mode E needs 120 or 192:
                              # its 213 carriers reach +-47.11 kHz, so 48/96 kHz are refused
-msc_mode = "64-QAM"          # "16-QAM", "64-QAM", "HMsym" or "HMmix" (hierarchical 64-QAM)
-sdc_mode = "16-QAM"          # "16-QAM" or "4-QAM" (robust, about half the SDC capacity)
+msc_mode = "64-QAM"          # "16-QAM", "64-QAM", "HMsym" or "HMmix" (hierarchical 64-QAM);
+                             # mode E has 16- and 4-QAM only (a 64-QAM setting becomes 16-QAM)
+sdc_mode = "16-QAM"          # "16-QAM" or "4-QAM" (robust, about half the SDC capacity);
+                             # mode E has 4-QAM only ("4-QAM rate 1/4" for its lower level)
 interleaving = "long"        # "long" (2 s, robust against fading) or "short" (400 ms)
 protection_b = 1             # 0 = most robust; 0-1 with 16-QAM, 0-3 with 64-QAM
 protection_a = 0             # only used when a stream sets part = "A" (unequal protection);

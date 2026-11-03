@@ -825,10 +825,22 @@ impl Session {
         // Content checks of this multiplex frame (passed, failed).
         let (mut good, mut bad) = (0u64, 0u64);
 
+        // Mode E's audio super frame spans two logical frames, and the DRM super frame's
+        // frame identities say which pair: 0 and 2 begin one (§8.1). That holds for MDI,
+        // whose frames carry their own FAC. A receiver's MSC event can arrive after the
+        // FAC of a later frame, so there the deframer finds the phase from the audio
+        // frame structure itself.
+        let mdi = matches!(self.rx, Rx::Mdi(_));
+        let starts_super_frame = self.last_channel.is_none_or(|c| c.frame_index.is_multiple_of(2));
+
         if let Some(a) = self.audio.as_mut()
             && let Some(Some(lf)) = logical.get(a.stream_id as usize)
         {
-            let sf = a.deframer.push_frame(lf);
+            let sf = if mdi {
+                a.deframer.push_frame_at(lf, starts_super_frame)
+            } else {
+                a.deframer.push_frame(lf)
+            };
             // Mute while the long interleaver is still filling: CRC-8 alone lets the
             // occasional garbage frame through.
             if complete {

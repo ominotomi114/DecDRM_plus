@@ -922,6 +922,8 @@ pub(crate) struct AudioChain {
     /// The title currently in the text message cycle.
     title: Option<String>,
     stream_len: usize,
+    /// The second logical frame of a mode E audio super frame, waiting for its turn.
+    pending: Option<Vec<u8>>,
     pcm: Vec<f32>,
     pub counters: AudioCounters,
 }
@@ -962,6 +964,7 @@ impl AudioChain {
             titles: settings.input.sends_titles(),
             title: None,
             stream_len: stream.total(),
+            pending: None,
             pcm: Vec::new(),
             counters: AudioCounters::default(),
         })
@@ -984,10 +987,19 @@ impl AudioChain {
         self.title = title;
     }
 
-    /// The stream bytes of the next multiplex frame.
+    /// The stream bytes of the next logical frame.
+    ///
+    /// One call per transmission frame. In modes A–D the logical frame *is* the audio super
+    /// frame (400 ms). **Mode E's audio super frame is 200 ms over two 100 ms logical
+    /// frames** (§5.3.1.0), so every second call returns the other half of the super frame
+    /// the previous call encoded (`pending`).
     pub fn next_logical_frame(&mut self, service_name: &str) -> Result<Vec<u8>> {
-        // 400 ms at the encoder's input rate.
-        let frames = self.plan.input_rate as usize * 2 / 5;
+        if let Some(part) = self.pending.take() {
+            return Ok(self.finish_logical_frame(part));
+        }
+        // One audio super frame at the encoder's input rate.
+        let super_s = self.plan.frame_seconds * self.plan.parts_per_super_frame as f64;
+        let frames = (f64::from(self.plan.input_rate) * super_s).round() as usize;
         self.pcm.clear();
         self.source
             .read(frames, &mut self.pcm)
@@ -998,7 +1010,7 @@ impl AudioChain {
         self.counters.input_drift_ppm = self.source.drift_ppm();
         self.update_title();
         let len = self.plan.super_frame_len;
-        let mut lf = match &mut self.encoder {
+        let mut sf = match &mut self.encoder {
             Encoder::Aac(e) => {
                 let sf = e.super_frame(&self.pcm, len)?;
                 self.counters.frames_dropped = e.dropped;
@@ -1025,13 +1037,26 @@ impl AudioChain {
                 sf
             }
         };
+        self.counters.super_frames += 1;
+        // One super frame, `parts` logical frames: return the first part and keep the rest.
+        sf.resize(len, 0);
+        if self.plan.parts_per_super_frame > 1 {
+            let per_part = len / self.plan.parts_per_super_frame;
+            let rest = sf.split_off(per_part);
+            self.pending = Some(rest);
+        }
+        Ok(self.finish_logical_frame(sf))
+    }
+
+    /// Add the next text message piece and pad the part to the stream length: what the
+    /// multiplex takes as one logical frame.
+    fn finish_logical_frame(&mut self, mut lf: Vec<u8>) -> Vec<u8> {
         if let Some(t) = self.text.as_mut() {
             lf.resize(self.stream_len, 0);
             insert_text_message(&mut lf, t.next_piece());
         }
         debug_assert_eq!(lf.len(), self.stream_len);
-        self.counters.super_frames += 1;
-        Ok(lf)
+        lf
     }
 
     /// Whether the input is a non-looping file that has ended.

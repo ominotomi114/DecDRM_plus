@@ -20,6 +20,11 @@ milestone checklist (keep it current).
   audio/text/data pipelines) → audio out / data store; `Snapshot`s for the UIs.
 - `crates/decdrm-station` — transmitter application layer (TOML station config);
   `feeds` turns RSS/Atom feeds into Journaline pages (fetched on a schedule).
+  Mode E (DRM+): logical frames are 100 ms and the **audio super frame is 200 ms over two
+  of them** (§5.3.1.0, `AudioPlan::parts_per_super_frame`); AAC runs at 24/48 kHz there
+  and the MSC uses 16- or 4-QAM only (a 64-QAM setting maps to 16-QAM; the SDC is 4-QAM).
+  Receiver of the station's own signal: `Session` (from decdrm-engine) with
+  `ReceiverConfig::pinned` for mode E.
 - `crates/decdrm-schedule` — DRM broadcast schedules (Dream's DRMDX `DRMSchedule.ini`,
   EiBi CSV): what is on the air now; GUI Schedule tab, `decdrm schedule`. Downloads only
   on the user's request (curl/wget); `src/eibi_tables.rs` is generated from Dream.

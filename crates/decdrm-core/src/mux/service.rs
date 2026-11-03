@@ -23,7 +23,7 @@ use super::sdc::{
     ServiceLinking, StreamLengths, TimeAndDate, parse_sdc,
 };
 use crate::fac::{ChannelParams, Fac, LANGUAGES, PROGRAMME_TYPES, ServiceParams};
-use crate::params::MAX_SERVICES;
+use crate::params::{MAX_SERVICES, RobustnessMode};
 use crate::rx::MscConfig;
 
 // ---------------------------------------------------------------------------------
@@ -313,12 +313,16 @@ impl AudioParams {
         }
     }
 
-    /// Number of AAC frames per 400 ms audio super frame in robustness modes A–D
-    /// (§5.4.1): 5 at 12 kHz, 10 at 24 kHz. `None` for other rates or codecs.
-    pub fn aac_frames_per_super_frame(&self) -> Option<usize> {
-        match (self.codec, self.sample_rate_hz) {
-            (AudioCodec::Aac, 12_000) => Some(5),
-            (AudioCodec::Aac, 24_000) => Some(10),
+    /// Number of AAC frames per audio super frame (§5.4.1). Modes A–D have a 400 ms
+    /// super frame: 5 at a 12 kHz core, 10 at 24 kHz. **Mode E has a 200 ms super frame**
+    /// at twice those rates: 5 at a 24 kHz core, 10 at 48 kHz (48 kHz only without SBR).
+    /// `None` for other rates or codecs.
+    pub fn aac_frames_per_super_frame(&self, mode: RobustnessMode) -> Option<usize> {
+        match (self.codec, self.sample_rate_hz, mode) {
+            (AudioCodec::Aac, 12_000, m) if !m.is_drm_plus() => Some(5),
+            (AudioCodec::Aac, 24_000, m) if m.is_drm_plus() => Some(5),
+            (AudioCodec::Aac, 24_000, _) => Some(10),
+            (AudioCodec::Aac, 48_000, m) if m.is_drm_plus() => Some(10),
             _ => None,
         }
     }
@@ -1121,7 +1125,7 @@ mod tests {
         assert_eq!(p.type9_bytes, vec![0x23, 0x80]);
         assert_eq!((p.codec, p.sample_rate_hz, p.mode), (AudioCodec::Aac, 24_000, AudioMode::Mono));
         assert_eq!(p.output_sample_rate_hz(), 48_000);
-        assert_eq!(p.aac_frames_per_super_frame(), Some(10));
+        assert_eq!(p.aac_frames_per_super_frame(RobustnessMode::B), Some(10));
         // AAC 12 kHz PS with MPEG Surround bits and rfa set: surround kept, rfa bits
         // (coder field lsbs and the final rfa bit) are cleared as Dream re-encodes them.
         let mut e = audio_entity(1, 2, 0, true, 1, 1, false);
@@ -1129,7 +1133,7 @@ mod tests {
         e.rfa = true;
         let p = AudioParams::from_entity(&e).unwrap();
         assert_eq!(p.type9_bytes, vec![0b0010_1001, 0b0001_0000]);
-        assert_eq!(p.aac_frames_per_super_frame(), Some(5));
+        assert_eq!(p.aac_frames_per_super_frame(RobustnessMode::B), Some(5));
         // xHE-AAC 38.4 kHz stereo with config: rate code kept, config appended; the SBR
         // bit is rfa for xHE-AAC.
         let mut e = audio_entity(0, 1, 3, true, 2, 6, false);
@@ -1169,7 +1173,17 @@ mod tests {
         let config = vec![0x00, b'D', b'A', b'C', b'1', 0x48];
         let p = AudioParams::new(2, AudioCodec::Dac, false, AudioMode::Mono, 24_000, true, config.clone());
         assert_eq!(p.type9_bytes, [&[0b1000_0011, 0x80][..], &config].concat());
-        assert_eq!((p.aac_frames_per_super_frame(), p.output_sample_rate_hz()), (None, 24_000));
+        assert_eq!((p.aac_frames_per_super_frame(RobustnessMode::B), p.output_sample_rate_hz()), (None, 24_000));
+        // Mode E's super frame is 200 ms: the same rates are 24 and 48 kHz, and 12 kHz
+        // does not exist there (§5.4.1).
+        let e = AudioParams::new(0, AudioCodec::Aac, true, AudioMode::Mono, 24_000, false, vec![]);
+        assert_eq!(e.aac_frames_per_super_frame(RobustnessMode::E), Some(5));
+        assert_eq!(e.aac_frames_per_super_frame(RobustnessMode::B), Some(10));
+        let e48 = AudioParams::new(0, AudioCodec::Aac, false, AudioMode::Mono, 48_000, false, vec![]);
+        assert_eq!(e48.aac_frames_per_super_frame(RobustnessMode::E), Some(10));
+        assert_eq!(e48.aac_frames_per_super_frame(RobustnessMode::B), None);
+        let e12 = AudioParams::new(0, AudioCodec::Aac, true, AudioMode::Mono, 12_000, false, vec![]);
+        assert_eq!(e12.aac_frames_per_super_frame(RobustnessMode::E), None);
         let e = p.to_entity(1);
         assert_eq!((e.coding, e.sbr, e.mode, e.sample_rate, e.text, e.coder_field), (2, false, 0, 3, true, 0));
         assert_eq!(e.codec_config, config);
