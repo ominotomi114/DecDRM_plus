@@ -53,6 +53,8 @@ pub struct StationStatus {
     pub clipped_samples: u64,
     /// Knee of the PAPR limiter, dB above the RMS, if one is configured (`[output] papr_db`).
     pub papr_db: Option<f32>,
+    /// The limiter's law (`"clip"` or `"tanh"`), if one is configured.
+    pub papr_law: Option<&'static str>,
     /// Baseband samples above the limiter's knee so far (0 without a limiter).
     pub limited_samples: u64,
     /// The output file (resolved path), if any.
@@ -669,6 +671,10 @@ impl Station {
         st.seconds = st.frames as f64 * self.plan.frame_seconds();
         st.clipped_samples = self.output.clipped_samples();
         st.papr_db = self.plan.output.peak_limit.map(|l| l.threshold_db as f32);
+        st.papr_law = self.plan.output.peak_limit.map(|l| match l.law {
+            decdrm_core::tx::output::PeakLaw::Clip => "clip",
+            decdrm_core::tx::output::PeakLaw::Tanh => "tanh",
+        });
         st.limited_samples = self.output.limited_samples();
         st.device = self.device.as_ref().map(|d| d.name().to_string());
         st.device_underruns = self.device.as_ref().map_or(0, DeviceSink::underruns);

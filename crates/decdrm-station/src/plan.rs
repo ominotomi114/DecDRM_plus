@@ -58,7 +58,7 @@
 //! or 4:1 stereo) and then creates the encoder once, for the xHE-AAC Static Config that
 //! SDC type 9 carries.
 
-use crate::config::{AppKind, Codec, Part, SbrRatio, SignalFormat, StationConfig};
+use crate::config::{AppKind, Codec, PaprLaw, Part, SbrRatio, SignalFormat, StationConfig};
 use crate::error::{ConfigProblems, Result, StationError};
 use crate::sdc;
 use decdrm_core::cellmap::CellMap;
@@ -541,7 +541,10 @@ pub(crate) fn output_config(
         level_dbfs: out.level_dbfs,
         band_limit: out.band_limit,
         working_rate: rate,
-        peak_limit: out.papr_db.map(PeakLimit::tanh),
+        peak_limit: out.papr_db.map(|db| match out.papr_law {
+            PaprLaw::Clip => PeakLimit::clip(db),
+            PaprLaw::Tanh => PeakLimit::tanh(db),
+        }),
     }
 }
 

@@ -4,7 +4,7 @@
 //!
 //! Steps:
 //!
-//! 1. Optional PAPR reduction ([`PeakLimit`]): a memoryless soft limiter that
+//! 1. Optional PAPR reduction ([`PeakLimit`]): a memoryless limiter that
 //!    compresses the baseband peaks before the filter, so the out-of-band part of the
 //!    distortion it creates is removed along with the OFDM side lobes (clipping after
 //!    the filter, as the final ±1 clip does, would spray it straight into the output).
@@ -26,11 +26,12 @@
 //!
 //! With a limiter the same level refers to the limited signal: the limiter restores the
 //! power it removes (see [`PeakLimit`]), so its peaks are bounded by the knee's asymptote
-//! — 7.2 dB above the RMS for a 6 dB knee, where the raw signal reaches 10.7 dB — and the
-//! level can be raised by 3.5 dB before the final ±1 clip is reached. That is the point of
-//! it: not quantisation noise (at 16 bits it is far below any DRM channel), but keeping the
-//! peaks inside full scale at a higher RMS. It is not free: see the MER figures in
-//! [`PeakLimit`] and `examples/papr`.
+//! — 6.0 dB above the RMS for a 6 dB knee with [`PeakLaw::Clip`], 7.2 dB with
+//! [`PeakLaw::Tanh`], where the raw signal reaches 10.7 dB — so the level can be raised by
+//! 4.6 or 3.5 dB before the final ±1 clip is reached. That is the point of it: not
+//! quantisation noise (at 16 bits it is far below any DRM channel), but keeping the peaks
+//! inside full scale at a higher RMS. It is not free: see the MER figures in [`PeakLimit`]
+//! and `examples/papr`.
 
 use super::TxError;
 use crate::cellmap::CellMap;
@@ -70,26 +71,23 @@ pub enum OutputFormat {
     Iq { offset_hz: Real, swap: bool },
 }
 
-/// Peak-to-average power ratio (PAPR) reduction: a memoryless soft limiter applied to
-/// the baseband signal before the channel filter (see the module docs).
+/// Peak-to-average power ratio (PAPR) reduction: a memoryless limiter applied to the
+/// baseband signal before the channel filter (see the module docs).
 ///
-/// The law is `tanh`, radially: a baseband sample `x` of amplitude `r` comes out as
-/// `x·(A/r)·tanh(r/A)`, i.e. with amplitude `A·tanh(r/A)` and **unchanged phase**. That
-/// amplitude is linear in `r` for small `r`, `A·(r/A − (r/A)³/3)` well below the knee,
-/// asymptotically `A` above it, and smooth (C^∞) everywhere — no corner in the waveform,
-/// so the distortion products decay much faster than hard clipping's. The knee `A` is
-/// `threshold_db` above the RMS amplitude of the baseband (`√mean_power`), so
+/// Two laws are available (see [`PeakLaw`]): a radial `tanh`, and a hard clip at the knee.
+/// Both work on the amplitude and leave the phase alone, and both use the same knee: `A`
+/// is `threshold_db` above the RMS amplitude of the baseband (`√mean_power`), so
 /// `threshold_db = 6` says "compress everything above 2σ".
 ///
 /// Two consequences worth knowing:
 ///
 /// * `tanh` compresses *before* the knee as well (at `r = A/2` the gain is already
-///   −0.7 dB); it is not a transparent limiter with a knee and a flat top. That is the
-///   price of the smoothness, and the reason the distortion is not confined to the peaks.
-///   Measured on a real mode B frame: a 6 dB knee takes 4.1 dB off the crest and costs
-///   23.5 dB MER; a hard clip at the same peak costs 35 dB MER, because it leaves
-///   everything below the ceiling alone. The smooth law wins on the *spectrum* of the
-///   distortion, not on its in-band power.
+///   −0.7 dB); a clip leaves everything below the knee exactly alone. Measured on a real
+///   mode B frame, a 6 dB knee takes ~4 dB off the crest and costs 23.6 dB MER with
+///   `tanh`; a clip at the same knee costs 31.6 dB (35 dB when it is set to tanh's slightly
+///   higher peak). The smooth law wins on the *spectrum* of the distortion (its products
+///   decay much faster), which the transmit filter after it already handles — so `Clip` is
+///   the better default when the limiter is on.
 /// * The limiter removes mean power. It restores it with the gain predicted for a
 ///   circularly symmetric Gaussian signal (which an OFDM symbol with hundreds of carriers
 ///   is to a good approximation), so the configured level still means what it says. The
@@ -98,19 +96,45 @@ pub enum OutputFormat {
 pub struct PeakLimit {
     /// Knee of the limiter, dB above the RMS of the baseband signal.
     pub threshold_db: Real,
+    /// Which nonlinearity to use.
+    pub law: PeakLaw,
+}
+
+/// The shape of a [`PeakLimit`]'s nonlinearity, both radial: `A·tanh(r/A)` or `min(r, A)`
+/// for a sample of amplitude `r`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeakLaw {
+    /// `A·tanh(r/A)`: smooth (C^∞) everywhere, so its distortion products decay fast, but
+    /// it compresses samples well below the knee too.
+    Tanh,
+    /// `min(r, A)`: exactly transparent below the knee, with a corner at it. Same peak for
+    /// the same knee as `Tanh`, ~8 dB better MER at a 6 dB knee (11 dB when compared at
+    /// the same peak, since the tanh's peak is a little higher); its distortion has a wider
+    /// spectrum, which the channel filter after it removes.
+    Clip,
 }
 
 impl PeakLimit {
     /// A `tanh` limiter with its knee `threshold_db` above the RMS (6 dB ≈ 2σ).
     pub fn tanh(threshold_db: Real) -> Self {
-        Self { threshold_db }
+        Self { threshold_db, law: PeakLaw::Tanh }
     }
 
-    /// The lowest asymptote, relative to the RMS, that this limiter allows, dB: the
-    /// tanh saturates at the knee, which the power normalisation then scales up.
+    /// A hard clip at the knee (the default recommendation when a limiter is used).
+    pub fn clip(threshold_db: Real) -> Self {
+        Self { threshold_db, law: PeakLaw::Clip }
+    }
+
+    /// The lowest asymptote, relative to the RMS, that this limiter allows, dB: the hard
+    /// clip's is the knee itself, the `tanh`'s slightly above it (its asymptote is scaled
+    /// up by the power normalisation).
     pub fn ceiling_db(&self) -> Real {
         let gamma = 10f64.powf(self.threshold_db / 20.0);
-        20.0 * (gamma * (1.0 / gaussian_tanh_loss(gamma)).sqrt()).log10()
+        let loss = match self.law {
+            PeakLaw::Tanh => gaussian_tanh_loss(gamma),
+            PeakLaw::Clip => clip_loss(gamma),
+        };
+        20.0 * (gamma / loss.sqrt()).log10()
     }
 }
 
@@ -313,13 +337,25 @@ fn gaussian_tanh_loss(gamma: Real) -> Real {
     (s * h / 3.0).clamp(1e-9, 1.0)
 }
 
-/// The [`PeakLimit`] `tanh` limiter, with its state (see [`PeakLimit`]).
+/// Mean power left by a hard clip at `γσ`, relative to the input power: `1 − e^{−γ²}`.
+///
+/// With the same Rayleigh amplitude model as [`gaussian_tanh_loss`], the samples below the
+/// knee give `∫₀^{γ²} t·e^{−t} dt = 1 − e^{−γ²}(1 + γ²)` and the tail contributes
+/// `γ²·e^{−γ²}`, so the sum is `1 − e^{−γ²}`. At 6 dB (γ = 2) that is 0.98, i.e. −0.08 dB —
+/// a clip barely removes power.
+fn clip_loss(gamma: Real) -> Real {
+    (1.0 - (-gamma * gamma).exp()).clamp(1e-9, 1.0)
+}
+
+/// The [`PeakLimit`] limiter, with its state (see [`PeakLimit`]).
 #[derive(Debug, Clone)]
 struct Limiter {
     /// Knee amplitude in baseband units: `γ·√mean_power`.
     knee: Real,
     /// Gain restoring the mean power the limiting removes (Gaussian model).
     norm: Real,
+    /// Which nonlinearity to apply.
+    law: PeakLaw,
     /// Samples whose amplitude exceeded the knee so far.
     limited: u64,
 }
@@ -327,12 +363,17 @@ struct Limiter {
 impl Limiter {
     fn new(limit: PeakLimit, rms: Real) -> Self {
         let gamma = 10f64.powf(limit.threshold_db / 20.0);
-        Self { knee: gamma * rms, norm: 1.0 / gaussian_tanh_loss(gamma).sqrt(), limited: 0 }
+        let loss = match limit.law {
+            PeakLaw::Tanh => gaussian_tanh_loss(gamma),
+            PeakLaw::Clip => clip_loss(gamma),
+        };
+        Self { knee: gamma * rms, norm: 1.0 / loss.sqrt(), law: limit.law, limited: 0 }
     }
 
-    /// Limit in place: amplitude `r ↦ A·tanh(r/A)`, phase unchanged, then the power
-    /// normalisation. The `r → 0` limit is `x·(1 − r²/(3A²))`, which the expression
-    /// `A/r·tanh(r/A)` gives without a special case (both factors are `O(r)`).
+    /// Limit in place: amplitude `r ↦ A·tanh(r/A)` or `r ↦ min(r, A)`, phase unchanged,
+    /// then the power normalisation. The `tanh`'s `r → 0` limit is `x·(1 − r²/(3A²))`,
+    /// which the expression `A/r·tanh(r/A)` gives without a special case (both factors are
+    /// `O(r)`).
     fn apply(&mut self, data: &mut [Cplx]) {
         let (knee, norm) = (self.knee, self.norm);
         for v in data.iter_mut() {
@@ -340,11 +381,14 @@ impl Limiter {
             if r > knee {
                 self.limited += 1;
             }
-            if r > 0.0 {
-                let g = norm * knee / r * (r / knee).tanh();
-                v.re *= g;
-                v.im *= g;
-            }
+            let g = match self.law {
+                PeakLaw::Tanh if r > 0.0 => norm * knee / r * (r / knee).tanh(),
+                PeakLaw::Tanh => norm,
+                PeakLaw::Clip if r > knee => norm * knee / r,
+                PeakLaw::Clip => norm,
+            };
+            v.re *= g;
+            v.im *= g;
         }
     }
 }
@@ -596,31 +640,45 @@ mod tests {
         }
     }
 
-    /// The `tanh` limiter: real gain (phase preserved), power restored by the Gaussian
-    /// model, the predicted fraction of samples above the knee, and a bounded peak.
+    /// Both laws: real gain (phase preserved), power restored by the Gaussian model, the
+    /// predicted fraction of samples above the knee, and a bounded peak.
     #[test]
-    fn the_tanh_limiter_is_phase_preserving_and_power_neutral() {
+    fn the_limiter_is_phase_preserving_and_power_neutral() {
         use crate::channel::Rng;
         let mut rng = Rng::new(3);
         let x: Vec<Cplx> = (0..200_000).map(|_| rng.complex_gaussian()).collect();
         let power = |v: &[Cplx]| v.iter().map(|c| c.norm_sqr()).sum::<Real>() / v.len() as Real;
         let gamma = 10f64.powf(6.0 / 20.0);
-        let mut y = x.clone();
-        let peaks = apply_peak_limit(&mut y, 1.0, PeakLimit::tanh(6.0));
-        // E|z|² = 1 for `complex_gaussian`, so the knee is γ and the tail e^{−γ²}.
-        let got = peaks as Real / x.len() as Real;
-        let want = (-gamma * gamma).exp();
-        assert!((got - want).abs() < 0.2 * want, "{got:.4} above the knee, want ~{want:.4}");
-        // Power conserved to the model's accuracy (0.1 dB), peak bounded near the knee
-        // scaled by the normalisation (the asymptote is γ/√loss ≈ 1.14·γ at this knee).
-        let ratio_db = 10.0 * (power(&y) / power(&x)).log10();
-        assert!(ratio_db.abs() < 0.1, "power changed by {ratio_db:.2} dB");
-        let peak = y.iter().map(|c| c.norm()).fold(0.0, Real::max);
-        assert!(peak <= gamma * 1.2 && peak > gamma * 0.95, "peak {peak:.3} with a knee of {gamma:.3}");
-        // Phase unchanged: y/x is real for every sample (the law is radial).
-        for (a, b) in x.iter().zip(&y) {
-            let cross = (b * a.conj()).im.abs();
-            assert!(cross <= 1e-12 * a.norm() * b.norm() + 1e-15, "phase changed at {a:?} -> {b:?}");
+        for limit in [PeakLimit::tanh(6.0), PeakLimit::clip(6.0)] {
+            let mut y = x.clone();
+            let peaks = apply_peak_limit(&mut y, 1.0, limit);
+            // E|z|² = 1 for `complex_gaussian`, so the knee is γ and the tail e^{−γ²}.
+            let got = peaks as Real / x.len() as Real;
+            let want = (-gamma * gamma).exp();
+            assert!((got - want).abs() < 0.2 * want, "{limit:?}: {got:.4} above the knee, want ~{want:.4}");
+            // Power conserved to the model's accuracy (0.1 dB), peak bounded near the knee.
+            let ratio_db = 10.0 * (power(&y) / power(&x)).log10();
+            assert!(ratio_db.abs() < 0.1, "{limit:?}: power changed by {ratio_db:.2} dB");
+            let peak = y.iter().map(|c| c.norm()).fold(0.0, Real::max);
+            // The tanh asymptote is γ/√loss ≈ 1.14·γ at this knee; the clip's is γ itself
+            // scaled by its normalisation (≈ 1.009·γ).
+            let factor = if limit.law == PeakLaw::Tanh { 1.2 } else { 1.05 };
+            assert!(peak <= gamma * factor && peak > gamma * 0.95, "{limit:?}: peak {peak:.3} with a knee of {gamma:.3}");
+            // Phase unchanged: y/x is real for every sample (both laws are radial).
+            for (a, b) in x.iter().zip(&y) {
+                let cross = (b * a.conj()).im.abs();
+                assert!(cross <= 1e-12 * a.norm() * b.norm() + 1e-15, "{limit:?}: phase changed at {a:?} -> {b:?}");
+            }
+        }
+        // The clip only scales samples below the knee (by the one power-normalisation
+        // gain); the tanh compresses them by varying amounts.
+        let mut clipped = x.clone();
+        apply_peak_limit(&mut clipped, 1.0, PeakLimit::clip(6.0));
+        let g0 = (clipped[0] / x[0]).re;
+        for (a, b) in x.iter().zip(&clipped) {
+            if a.norm() < gamma * 0.95 {
+                assert!((b - a * g0).norm() < 1e-12 * a.norm(), "a clip must not touch samples below the knee");
+            }
         }
     }
 

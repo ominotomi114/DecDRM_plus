@@ -1,21 +1,20 @@
-//! What a `tanh` PAPR limiter buys a DRM transmitter, and what it costs.
+//! What a PAPR limiter buys a DRM transmitter, and what it costs.
 //!
 //! `cargo run -p decdrm-core --release --example papr`
 //!
 //! For a mode B (DRM30) and a mode E (DRM+) transmission it prints
 //! * the peak-to-average ratio of the baseband and of the real part (the real-IF output),
-//! * how much of the output reaches full scale at a few RMS levels, with and without the
-//!   limiter — the reason to have one,
-//! * for each limiter knee: the resulting peak (which the receiver sees as the maximum
-//!   level the transmitter can use), the mean-power change, and the in-band **MER** —
-//!   the error-vector magnitude of every cell against the unlimited signal, measured
-//!   with a perfect receiver. Also the MER of a **hard** clip at the same peak, which is
-//!   what the ±1 clip at the end of the chain does, for comparison.
+//! * how much of the output reaches full scale at a few RMS levels, without a limiter and
+//!   with each law at a 6 dB knee — the reason to have one,
+//! * for each knee and each law (`tanh` and hard `clip`): the resulting peak (which the
+//!   receiver sees as the maximum level the transmitter can use) and the in-band **MER**,
+//!   the error-vector magnitude of every cell against the unlimited signal, measured with
+//!   a perfect receiver — the price.
 //!
-//! MER is the honest cost: the limiter is a memoryless nonlinearity, so it distorts the
+//! MER is the honest cost: a limiter is a memoryless nonlinearity, so it distorts the
 //! constellation. The out-of-band part of that distortion is removed by the transmit
-//! channel filter (the limiter works *before* it); the in-band part is not, and it is
-//! what a receiver has to demodulate through.
+//! channel filter (the limiter works *before* it); the in-band part is not, and it is what
+//! a receiver has to demodulate through.
 
 use decdrm_core::cellmap::CellMap;
 use decdrm_core::channel::Rng;
@@ -85,9 +84,9 @@ fn output(sig: &[Cplx], layout: ChannelLayout, cfg: OutputConfig) -> (Vec<f32>, 
 }
 
 /// The limited baseband, and the number of samples the limiter found above its knee.
-fn limited_baseband(sig: &[Cplx], mean_power: Real, knee_db: Real) -> (Vec<Cplx>, u64) {
+fn limited_baseband(sig: &[Cplx], mean_power: Real, limit: PeakLimit) -> (Vec<Cplx>, u64) {
     let mut y = sig.to_vec();
-    let peaks = apply_peak_limit(&mut y, mean_power, PeakLimit::tanh(knee_db));
+    let peaks = apply_peak_limit(&mut y, mean_power, limit);
     (y, peaks)
 }
 
@@ -133,24 +132,6 @@ fn mer_db(reference: &[Cplx], tested: &[Cplx], layout: ChannelLayout, n: usize, 
     10.0 * (sig / err).log10()
 }
 
-/// A hard clip at `ceiling` (baseband units) followed by a power normalisation, i.e. the
-/// final ±1 clip when the output level puts `ceiling` at full scale.
-fn hard_clipped(reference: &[Cplx], ceiling: Real) -> Vec<Cplx> {
-    let mut y: Vec<Cplx> = reference
-        .iter()
-        .map(|v| {
-            let r = v.norm();
-            if r > ceiling { v * (ceiling / r) } else { *v }
-        })
-        .collect();
-    let g = (power(reference) / power(&y)).sqrt();
-    for v in &mut y {
-        v.re *= g;
-        v.im *= g;
-    }
-    y
-}
-
 fn report(name: &str, cfg: TxConfig, frames: usize) {
     let rate = cfg.working_rate;
     let (band, layout) = baseband(cfg, frames);
@@ -167,38 +148,49 @@ fn report(name: &str, cfg: TxConfig, frames: usize) {
 
     // Full-scale use of the real-IF output, which is what a sound card receives.
     println!("\n  real-IF output, samples clipped at full scale (one channel):");
-    println!("     RMS level     no limiter     6 dB knee");
+    println!("     RMS level     no limiter    tanh 6 dB    clip 6 dB");
     let if_hz = decdrm_core::tx::output::suggested_if_hz_at(layout, rate);
     for level in LEVELS_DBFS {
         let (_, st_off) = output(&band, layout, OutputConfig { level_dbfs: level, ..OutputConfig::real_at(if_hz, rate) });
-        let (_, st_on) = output(
+        let (_, st_tanh) = output(
             &band,
             layout,
             OutputConfig { level_dbfs: level, peak_limit: Some(PeakLimit::tanh(6.0)), ..OutputConfig::real_at(if_hz, rate) },
         );
+        let (_, st_clip) = output(
+            &band,
+            layout,
+            OutputConfig { level_dbfs: level, peak_limit: Some(PeakLimit::clip(6.0)), ..OutputConfig::real_at(if_hz, rate) },
+        );
         println!(
-            "    {level:>6.1} dBFS   {:>10}   {:>10}",
-            st_off.clipped_samples(), st_on.clipped_samples()
+            "    {level:>6.1} dBFS   {:>10}   {:>10}   {:>10}",
+            st_off.clipped_samples(),
+            st_tanh.clipped_samples(),
+            st_clip.clipped_samples()
         );
     }
 
     let mean_power = CellMap::new(layout.mode, layout.occupancy).expect("layout").avg_power_per_symbol;
-    println!("\n  knee   peak/RMS   RMS change   peaks > knee        MER   hard clip, same peak");
-    println!("   [dB]       [dB]         [dB]        [%]         [dB]        [dB]");
+    println!("\n  knee    tanh peak   tanh MER    clip peak   clip MER   clip peaks > knee");
+    println!("   [dB]        [dB]       [dB]         [dB]       [dB]                  [%]");
     for knee in KNEES_DB {
-        let (lim, peaks) = limited_baseband(&band, mean_power, knee);
-        let peak_db = papr_db(&lim);
-        let rms_change = 10.0 * (power(&lim) / power(&band)).log10();
-        let mer = mer_db(&band, &lim, layout, n, guard);
-        // A hard clip at the peak the limiter reached, renormalised to the same power.
-        let ceiling = lim.iter().map(|v| v.norm()).fold(0.0, Real::max) * (power(&band) / power(&lim)).sqrt();
-        let hard = hard_clipped(&band, ceiling);
-        let hard_mer = mer_db(&band, &hard, layout, n, guard);
+        let (tanh, _) = limited_baseband(&band, mean_power, PeakLimit::tanh(knee));
+        let (clip, peaks) = limited_baseband(&band, mean_power, PeakLimit::clip(knee));
         let pct = 100.0 * peaks as Real / band.len() as Real;
+        // A dip of one sample can make the max smaller, but both come from the same signal.
         println!(
-            "   {knee:>4.1}     {peak_db:>5.2}      {rms_change:>+5.2}      {pct:>6.3}     {mer:>6.1}         {hard_mer:>6.1}"
+            "   {knee:>4.1}     {:>5.2}      {:>5.1}       {:>5.2}     {:>5.1}              {pct:>6.3}",
+            papr_db(&tanh),
+            mer_db(&band, &tanh, layout, n, guard),
+            papr_db(&clip),
+            mer_db(&band, &clip, layout, n, guard)
         );
     }
+    println!(
+        "  (same peak, same RMS: the clip is transparent below its knee, tanh is not — the\n   \
+         clip wins in-band; tanh's distortion decays faster out of band, which the transmit\n   \
+         filter after it removes either way.)"
+    );
 }
 
 fn main() {

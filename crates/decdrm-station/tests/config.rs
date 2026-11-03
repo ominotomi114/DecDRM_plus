@@ -3,7 +3,7 @@
 use decdrm_core::fac::MscMode;
 use decdrm_core::mux::sdc::StreamLengths;
 use decdrm_core::mux::service::{AudioCodec, AudioMode};
-use decdrm_station::{AppKind, Codec, Part, StationConfig, StationError, StreamContent};
+use decdrm_station::{AppKind, Codec, PaprLaw, Part, StationConfig, StationError, StreamContent};
 use std::path::Path;
 
 /// A minimal valid configuration: one HE-AAC tone service, output to `out.wav`.
@@ -596,22 +596,29 @@ fn modulator_section() {
     assert!(problems("[output]\nfile = \"o.wav\"\n[mdi]\ninput = \"nonsense\"\n").iter().any(|x| x.starts_with("mdi: input")));
 }
 
-/// `[output] papr_db`: the tanh PAPR limiter. Optional, off by default, range-checked, and
-/// round-tripped through TOML.
+/// `[output] papr_db` / `papr_law`: the PAPR limiter. Optional, off by default, the law
+/// defaults to a hard clip, range-checked and round-tripped through TOML.
 #[test]
 fn papr_limiter_setting() {
     assert_eq!(parse(&base()).output.papr_db, None, "off unless asked for");
+    assert_eq!(parse(&base()).output.papr_law, PaprLaw::Clip, "clip is the default law");
     let cfg = parse(&base().replace("file = \"out.wav\"", "file = \"out.wav\"\npapr_db = 6.0"));
     assert_eq!(cfg.output.papr_db, Some(6.0));
     let plan = cfg.validate().unwrap();
-    assert_eq!(plan.output.peak_limit, Some(decdrm_core::tx::output::PeakLimit::tanh(6.0)));
+    assert_eq!(plan.output.peak_limit, Some(decdrm_core::tx::output::PeakLimit::clip(6.0)));
     let back = parse(&cfg.to_toml_string().unwrap());
     assert_eq!(back.output.papr_db, Some(6.0));
+
+    let tanh = parse(&base().replace("file = \"out.wav\"", "file = \"out.wav\"\npapr_db = 6.0\npapr_law = \"tanh\""));
+    assert_eq!(tanh.output.papr_law, PaprLaw::Tanh);
+    assert_eq!(tanh.validate().unwrap().output.peak_limit, Some(decdrm_core::tx::output::PeakLimit::tanh(6.0)));
 
     for db in ["1.0", "21.0"] {
         let text = base().replace("file = \"out.wav\"", &format!("file = \"out.wav\"\npapr_db = {db}"));
         assert!(has(&problems(&text), "papr_db"), "{db} must be refused");
     }
+    let bad_law = base().replace("file = \"out.wav\"", "file = \"out.wav\"\npapr_law = \"softish\"");
+    assert!(StationConfig::from_toml_str(&bad_law).unwrap_err().to_string().contains("unknown PAPR limiter law"));
 }
 
 /// The VHF presets (`[simulate] vhf = ...`): COST 207 taps for DRM+, with the speed and

@@ -721,8 +721,9 @@ fn output_card(ui: &mut Ui, tx: &TxSession, pal: &Palette) {
                 .on_hover_text("Output samples limited to full scale so far.");
             ui.end_row();
             if let Some(db) = s.papr_db {
-                value(ui, "PAPR limit", format!("{db:.1} dB, {} peaks limited", s.limited_samples)).on_hover_text(
-                    "tanh soft limiter: its knee above the RMS, and the baseband samples that exceeded it.",
+                let law = s.papr_law.unwrap_or("clip");
+                value(ui, "PAPR limit", format!("{db:.1} dB {law}, {} peaks limited", s.limited_samples)).on_hover_text(
+                    "The limiter's knee above the RMS (a tanh law or a hard clip), and the baseband samples that exceeded it.",
                 );
                 ui.end_row();
             }

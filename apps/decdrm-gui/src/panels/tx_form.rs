@@ -1667,6 +1667,8 @@ fn extra_apps(ui: &mut Ui, svc: &mut Table, i: usize, ctx: &mut FormCtx, parts: 
 
 const FORMATS: &[(&str, &str)] = &[("real", "Real IF (1 channel)"), ("iq", "I/Q (2 channels)")];
 const SAMPLE_FORMATS: &[(&str, &str)] = &[("int16", "16-bit"), ("int24", "24-bit"), ("float32", "32-bit float")];
+/// PAPR limiter laws, in order: a hard clip is the better in-band trade (see `[output]`).
+const PAPR_LAWS: &[(&str, &str)] = &[("clip", "hard clip"), ("tanh", "tanh")];
 
 /// The channel layout (robustness mode and bandwidth) of the document, if valid.
 fn channel_layout(doc: &DocumentMut) -> Option<ChannelLayout> {
@@ -1757,19 +1759,26 @@ fn output(ui: &mut Ui, doc: &mut DocumentMut, ctx: &mut FormCtx) -> bool {
         ui.horizontal(|ui| {
             let mut on = out.contains_key("papr_db");
             let mut db = get_num(out, "papr_db").unwrap_or(6.0);
-            let hint = "Soft-limit the peaks with a tanh law, before the channel filter (so the \
-                out-of-band part of the distortion is filtered with the side lobes). Compresses \
-                everything above this level: ~4 dB less peak at the same RMS, at a cost of \
-                ~24 dB MER at 6 dB.";
-            if ui.checkbox(&mut on, "tanh").on_hover_text(hint).changed() {
+            let hint = "Limit the peaks before the channel filter (so the out-of-band part of the \
+                distortion is filtered with the side lobes). A hard clip is transparent below its \
+                knee and costs ~32 dB MER at 6 dB; tanh is smoother but compresses below the knee \
+                too and costs ~24 dB.";
+            if ui.checkbox(&mut on, "limit peaks").on_hover_text(hint).changed() {
                 if on {
                     set(out, "papr_db", db);
+                    set(out, "papr_law", "clip");
                 } else {
                     remove(out, "papr_db");
+                    remove(out, "papr_law");
                 }
                 changed = true;
             }
             if on {
+                let law = get_str(out, "papr_law").unwrap_or_else(|| "clip".into());
+                if let Some(v) = combo(ui, "tx_papr_law", &law, PAPR_LAWS, 90.0) {
+                    set(out, "papr_law", v);
+                    changed = true;
+                }
                 let edit = egui::DragValue::new(&mut db)
                     .range(MIN_PEAK_LIMIT_DB..=MAX_PEAK_LIMIT_DB)
                     .speed(0.25)

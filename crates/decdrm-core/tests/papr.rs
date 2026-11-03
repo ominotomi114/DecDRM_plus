@@ -12,7 +12,7 @@ use decdrm_core::fac::{ChannelParams, Fac, Interleaving, MscMode, SdcMode, Servi
 use decdrm_core::fec::mlc::MscProtection;
 use decdrm_core::params::{ChannelLayout, RobustnessMode, SpectrumOccupancy};
 use decdrm_core::rx::{InputFormat, MscConfig, Receiver, ReceiverEvent, ReceiverConfig};
-use decdrm_core::tx::output::{OutputConfig, OutputStage, PeakLimit, apply_peak_limit};
+use decdrm_core::tx::output::{OutputConfig, OutputStage, PeakLaw, PeakLimit, apply_peak_limit};
 use decdrm_core::tx::{Transmitter, TxConfig};
 use decdrm_core::{Cplx, Real};
 
@@ -107,52 +107,65 @@ fn mer_db(reference: &[Cplx], tested: &[Cplx], layout: ChannelLayout) -> Real {
     10.0 * (sig / err).log10()
 }
 
-/// The peak is capped near the knee, the power is restored, and the fraction of samples
-/// the limiter touches is the Gaussian tail it predicts (`e^{−γ²}` = 1.8 % at 2σ).
+/// Both laws: the peak is capped near the knee, the power is restored, and the fraction of
+/// samples the limiter touches is the Gaussian tail it predicts (`e^{−γ²}` = 1.8 % at 2σ).
 #[test]
-fn the_tanh_limiter_caps_the_peaks_and_keeps_the_power() {
+fn both_limiter_laws_cap_the_peaks_and_keep_the_power() {
     let (band, _, mean_power) = signal(12);
     let sigma = mean_power.sqrt();
-    for knee in [6.0, 9.0] {
+    for limit in [PeakLimit::tanh(6.0), PeakLimit::tanh(9.0), PeakLimit::clip(6.0), PeakLimit::clip(9.0)] {
+        let knee = limit.threshold_db;
         let mut y = band.clone();
-        let peaks = apply_peak_limit(&mut y, mean_power, PeakLimit::tanh(knee));
+        let peaks = apply_peak_limit(&mut y, mean_power, limit);
         let gamma = 10f64.powf(knee / 20.0);
         // Power is restored by the Gaussian model: no more than 0.1 dB of error.
-        assert!((10.0 * (power(&y) / power(&band)).log10()).abs() < 0.1, "knee {knee}: power changed");
-        // No sample exceeds the knee's asymptote (the knee itself, scaled by the
-        // normalisation, within the model's few-percent error).
+        assert!((10.0 * (power(&y) / power(&band)).log10()).abs() < 0.1, "{limit:?}: power changed");
+        // No sample exceeds the knee's asymptote (the knee itself scaled by the power
+        // normalisation: within 1 % for a clip, a little more for tanh's).
         let peak = y.iter().map(|v| v.norm()).fold(0.0, Real::max);
-        assert!(peak <= gamma * sigma * 1.08, "knee {knee}: peak {peak:.1} vs knee {:.1}", gamma * sigma);
-        assert!(papr_db(&y) < papr_db(&band) - 1.0, "knee {knee}: no PAPR reduction");
+        let bound = if limit.law == PeakLaw::Tanh { 1.08 } else { 1.02 };
+        assert!(peak <= gamma * sigma * bound, "{limit:?}: peak {peak:.1} vs knee {:.1}", gamma * sigma);
+        assert!(papr_db(&y) < papr_db(&band) - 1.0, "{limit:?}: no PAPR reduction");
         // The tail above γσ is e^{−γ²} of the samples; a real frame with pilots is close.
         let want = (-gamma * gamma).exp();
         let got = peaks as Real / band.len() as Real;
-        assert!((got - want).abs() < (0.005 as Real).max(0.25 * want), "knee {knee}: {got:.4} of samples above the knee, want ~{want:.4}");
+        assert!(
+            (got - want).abs() < (0.005 as Real).max(0.25 * want),
+            "{limit:?}: {got:.4} of samples above the knee, want ~{want:.4}"
+        );
     }
-    // A 6 dB knee is the aggressive end: ~4 dB off the peak, 1-2 % of samples touched.
-    let mut y = band.clone();
-    apply_peak_limit(&mut y, mean_power, PeakLimit::tanh(6.0));
-    let reduction = papr_db(&band) - papr_db(&y);
-    assert!((3.4..4.8).contains(&reduction), "reduction {reduction:.2} dB");
+    // A 6 dB knee is the aggressive end: 4-5 dB off the peak, 1-2 % of samples touched.
+    let crest = |limit| {
+        let mut y = band.clone();
+        apply_peak_limit(&mut y, mean_power, limit);
+        papr_db(&y)
+    };
+    let (tanh, clip) = (crest(PeakLimit::tanh(6.0)), crest(PeakLimit::clip(6.0)));
+    assert!((6.5..7.2).contains(&tanh), "tanh 6 dB knee: {tanh:.2} dB crest");
+    assert!((5.7..6.4).contains(&clip), "clip 6 dB knee: {clip:.2} dB crest");
 }
 
 /// What the reduction costs: in-band distortion, i.e. MER. Measured on the same frame:
-/// ~28 dB at a 9 dB knee, ~24 dB at 6 dB. This is the number to compare against the
-/// channel's SNR; it is not free.
+/// ~28 dB at a 9 dB knee, ~24 dB at 6 dB with `tanh`; a hard clip at the same knee is
+/// ~11 dB better, because it leaves everything below the knee exactly alone.
 #[test]
-fn the_tanh_limiter_costs_in_band_distortion() {
+fn tanh_costs_in_band_distortion_and_clip_costs_less() {
     let (band, layout, mean_power) = signal(6);
-    let mer = |knee: Real| {
+    let mer = |limit| {
         let mut y = band.clone();
-        apply_peak_limit(&mut y, mean_power, PeakLimit::tanh(knee));
+        apply_peak_limit(&mut y, mean_power, limit);
         mer_db(&band, &y, layout)
     };
-    let (m9, m6) = (mer(9.0), mer(6.0));
-    eprintln!("[papr] MER {m9:.1} dB at a 9 dB knee, {m6:.1} dB at 6 dB");
-    assert!(m9 > 27.0, "9 dB knee: MER {m9:.1} dB");
-    assert!(m6 > 22.0, "6 dB knee: MER {m6:.1} dB");
-    // More limiting, less MER — the trade is monotone.
-    assert!(m6 < m9);
+    let (t9, t6) = (mer(PeakLimit::tanh(9.0)), mer(PeakLimit::tanh(6.0)));
+    let (c9, c6) = (mer(PeakLimit::clip(9.0)), mer(PeakLimit::clip(6.0)));
+    eprintln!("[papr] MER at a 9 dB / 6 dB knee: tanh {t9:.1} / {t6:.1} dB, clip {c9:.1} / {c6:.1} dB");
+    assert!(t9 > 27.0, "9 dB knee: tanh MER {t9:.1} dB");
+    assert!(t6 > 22.0, "6 dB knee: tanh MER {t6:.1} dB");
+    // More limiting, less MER — the trade is monotone for both laws.
+    assert!(t6 < t9 && c6 < c9);
+    // The same peak costs much less in band when the limiter is a clip (~8 dB at this knee).
+    assert!(c6 > t6 + 6.0, "clip {c6:.1} dB vs tanh {t6:.1} dB at a 6 dB knee");
+    assert!(c9 > t9 + 8.0, "clip {c9:.1} dB vs tanh {t9:.1} dB at a 9 dB knee");
 }
 
 /// The end-to-end check: a 64-QAM signal through a 6 dB knee still decodes. The limit is
@@ -215,8 +228,12 @@ fn a_knee_outside_the_range_is_rejected() {
         let cfg = OutputConfig { peak_limit: Some(PeakLimit::tanh(db)), ..OutputConfig::iq(0.0) };
         assert!(OutputStage::new(layout, cfg).is_err(), "{db} dB must be rejected");
     }
-    // The asymptote sits a little above the knee (the power normalisation scales it up):
-    // ~7.2 dB for a 6 dB knee, so a level of -10 dBFS keeps the real output clear of ±1.
-    let ceiling = PeakLimit::tanh(6.0).ceiling_db();
-    assert!((6.0..7.5).contains(&ceiling), "ceiling {ceiling:.2} dB for a 6 dB knee");
+    // The tanh asymptote sits a little above the knee (the power normalisation scales it
+    // up, ~7.2 dB for a 6 dB knee); a clip's is the knee itself. So a clip at 6 dB lets the
+    // level be 6 dB higher than the raw crest allows, plus the 3 dB of the real part.
+    let tanh = PeakLimit::tanh(6.0).ceiling_db();
+    let clip = PeakLimit::clip(6.0).ceiling_db();
+    assert!((6.0..7.5).contains(&tanh), "tanh ceiling {tanh:.2} dB for a 6 dB knee");
+    assert!((5.9..6.3).contains(&clip), "clip ceiling {clip:.2} dB for a 6 dB knee");
+    assert_eq!(PeakLimit::clip(6.0).law, PeakLaw::Clip);
 }

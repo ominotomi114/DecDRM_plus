@@ -1185,34 +1185,44 @@ needs 120 or 192 kHz; the input is resampled to whatever the receiver is configu
   *PAPR reduction, measured* (2026-11-03). There was none: the output stage clipped at ±1 and
   that was the whole story, so a mode B signal (10.7 dB crest; 12.8 dB for the real part at the
   IF) either clipped or had to run at about −15 dBFS RMS. `[output] papr_db` (GUI: Output →
-  PAPR → *tanh*) now enables a soft limiter on the baseband, **before** the channel filter —
-  amplitude `r ↦ γσ·tanh(r/(γσ))` with `σ` the RMS, phase unchanged, and the power lost to the
-  compression restored by the Gaussian model (a Rayleigh amplitude, which a few hundred carriers
-  approximate: measured within 0.02 dB), so `level_dbfs` still means the RMS. `examples/papr`
-  and `tests/papr.rs` measure it on real frames, mode B 64-QAM and mode E 16-QAM:
+  PAPR → *limit peaks*) now enables a limiter on the baseband, **before** the channel filter,
+  with two laws — a radial `tanh` (`PeakLaw::Tanh`) and a hard `clip` (`PeakLaw::Clip`, the
+  default) — with `σ` the RMS, phase unchanged, and the power lost to the limiting restored by
+  the Gaussian model (a Rayleigh amplitude, which a few hundred carriers approximate: measured
+  within 0.02 dB), so `level_dbfs` still means the RMS. `examples/papr` and `tests/papr.rs`
+  measure it on real frames, mode B 64-QAM and mode E 16-QAM (mode E within 0.2 dB of the
+  mode B figures):
 
-  | knee (dB above RMS) | peak/RMS | MER | peak of a hard clip at the same peak | samples above the knee |
-  |---|---|---|---|---|
-  | none | 10.7 | — | — | — |
-  | 12 | 9.2 | 33.7 dB | 55.9 dB | 0.000 % |
-  | 9 | 8.1 | 28.4 dB | 46.1 dB | 0.016 % |
-  | 7.5 | 7.4 | 25.9 dB | 40.7 dB | 0.27 % |
-  | 6 | 6.6 | 23.5 dB | 35.2 dB | 1.7 % |
+  | knee (dB above RMS) | tanh peak | tanh MER | clip peak | clip MER | samples above the knee |
+  |---|---|---|---|---|---|
+  | none | 10.7 | — | 10.7 | — | — |
+  | 12 | 9.2 | 33.7 dB | 10.7 | 143.7 dB | 0.000 % |
+  | 9 | 8.1 | 28.4 dB | 9.0 | 54.1 dB | 0.016 % |
+  | 7.5 | 7.4 | 25.9 dB | 7.5 | 41.5 dB | 0.27 % |
+  | 6 | 6.6 | 23.6 dB | 6.1 | 31.6 dB | 1.7 % |
+  | 4.5 | 5.8 | 21.4 dB | 4.7 | 24.7 dB | 5.8 % |
 
-  The trade is real and not flattering to `tanh`: at a 6 dB knee the crest drops 4.1 dB for
-  23.5 dB MER, while a **hard** clip at the same peak costs 35 dB MER — a memoryless clip is
+  (The 12 dB clip row touches a couple of samples in 4.8 s, so its MER is meaninglessly large —
+  it is there to show that at that knee the clip does essentially nothing.)
+
+  The trade is real and not flattering to `tanh`: at the same 6 dB knee the clip keeps 8 dB more
+  MER (11 dB if the comparison is at tanh's slightly higher peak) — a memoryless clip is
   transparent below the ceiling and only touches the top 1.7 % of samples, whereas `tanh` starts
   compressing at half the knee (its gain is already −0.7 dB at `r = γσ/2`) and distorts the
   whole distribution. What the smooth law buys is the *spectrum* of the distortion: its products
   decay much faster than a clip's, which matters when the limiter is the last stage. In this
-  chain the transmit filter follows it, so that advantage is largely spent — the honest summary
-  is that the limiter is a **peak-safety knob**, not a quality improvement, and it should be off
-  unless the level has to rise. With a 6 dB knee its asymptote is 7.2 dB above the RMS (and the
-  real part adds 3 dB), so −11 dBFS is the level that keeps the real output clear of ±1; the
-  128 samples that clipped in the 192 kHz VHF loopback above would be covered by that.
+  chain the transmit filter follows it (the limiter plus filter *is* one iteration of
+  clip-and-filter), so that advantage is largely spent — the honest summary is that the limiter
+  is a **peak-safety knob**, not a quality improvement, and it is off by default. With a 6 dB
+  knee the clip's asymptote is the knee itself (the tanh's is 7.2 dB) and the real part adds
+  3 dB, so −10 dBFS (−11 with tanh) keeps the real output clear of ±1; the 128 samples that
+  clipped in the 192 kHz VHF loopback above would be covered by that.
 
-  A hard clip *before* the filter (one iteration of clip-and-filter) would be the better
-  in-band trade at the same peak and is the obvious next law; `tanh` is what was asked for.
+  Further iterations of clip-and-filter would push the out-of-band distortion below the filter's
+  −70 dB floor, which is already where it is; what ICF would buy here is a *final* clip after the
+  filter, which is only useful if the level is set so that the filter's re-growth matters. The
+  `±1` clip at the end of the chain already bounds the output; a level at −10 dBFS leaves it
+  ~4 dB of margin.
 
 ## Conventions
 

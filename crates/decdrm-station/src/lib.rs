@@ -56,7 +56,7 @@ pub use afs::{AfsMultiplexSettings, AfsOtherSettings, AfsRegionSettings, AfsSche
 pub use audio::AudioCounters;
 pub use config::{
     AppKind, AppSettings, AudioInputSettings, AudioSettings, ChannelSettings, Codec, EpgProgramme, FacLanguage,
-    JournalineFile, JournalinePage, MdiSettings, Mode, OutputSettings, Part, ProgrammeType, RateSetting,
+    JournalineFile, JournalinePage, MdiSettings, Mode, OutputSettings, PaprLaw, Part, ProgrammeType, RateSetting,
     SampleFormat, ServiceSettings, SignalFormat, SimulateSettings, StationConfig, TimeSettings, VhfProfile,
 };
 /// The working sample rate of the transmit chain (`[channel] working_sample_rate`): re-exported

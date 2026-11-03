@@ -229,13 +229,17 @@ pub struct OutputSettings {
     pub level_dbfs: f64,
     /// Apply the transmit channel filter (removes the OFDM side lobes).
     pub band_limit: bool,
-    /// PAPR reduction: knee of a `tanh` soft limiter above the RMS of the baseband, dB
-    /// (e.g. 6 = "compress everything above 2σ"). `None` (the default) leaves the peaks
-    /// alone. With it, the peaks are bounded by an asymptote a little above the knee (7.2 dB
-    /// above the RMS for a 6 dB knee, against ~10 dB raw), so the level can be raised by
-    /// ~3.5 dB before the output clips. It costs in-band distortion (23.5 dB MER at a 6 dB
-    /// knee), so it is a choice, not a free lunch.
+    /// PAPR reduction: knee of the limiter above the RMS of the baseband, dB (e.g. 6 =
+    /// "compress everything above 2σ"). `None` (the default) leaves the peaks alone. With
+    /// it, the peaks are bounded by the knee (a clip) or a little above it (tanh), so the
+    /// level can be raised by ~4.6 dB (clip) or ~3.5 dB (tanh) at a 6 dB knee before the
+    /// output clips. It costs in-band distortion — 31.6 dB MER for a clip, 23.6 dB for tanh
+    /// at a 6 dB knee — so it is a choice, not a free lunch.
     pub papr_db: Option<f64>,
+    /// Which limiter `papr_db` uses: `"clip"` (hard, transparent below the knee; the
+    /// default and the better in-band trade) or `"tanh"` (smooth, wider-spectrum
+    /// distortion, but ~11 dB worse MER for the same peak).
+    pub papr_law: PaprLaw,
 }
 
 impl Default for OutputSettings {
@@ -252,6 +256,7 @@ impl Default for OutputSettings {
             level_dbfs: decdrm_core::tx::output::DEFAULT_LEVEL_DBFS,
             band_limit: true,
             papr_db: None,
+            papr_law: PaprLaw::Clip,
         }
     }
 }
@@ -1074,6 +1079,33 @@ string_setting!(
         SampleFormat::Int16 => "int16",
         SampleFormat::Int24 => "int24",
         SampleFormat::Float32 => "float32",
+    }
+    .to_string()
+);
+
+/// PAPR limiter law of `[output] papr_db`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub enum PaprLaw {
+    /// Hard clip at the knee: exactly transparent below it, with a corner at it. The
+    /// default, and ~8 dB better in-band (MER) than `Tanh` at a 6 dB knee.
+    #[default]
+    Clip,
+    /// `tanh` soft limiter: smooth, so its distortion products decay faster, but it
+    /// compresses below the knee as well — ~11 dB worse MER than `Clip` at a 6 dB knee.
+    Tanh,
+}
+
+string_setting!(
+    PaprLaw,
+    |s: &str| match norm(s).as_str() {
+        "clip" | "hard" => Ok(PaprLaw::Clip),
+        "tanh" | "soft" => Ok(PaprLaw::Tanh),
+        _ => Err(format!("unknown PAPR limiter law \"{s}\" (use clip or tanh)")),
+    },
+    |l: PaprLaw| match l {
+        PaprLaw::Clip => "clip",
+        PaprLaw::Tanh => "tanh",
     }
     .to_string()
 );
