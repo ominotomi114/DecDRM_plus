@@ -226,6 +226,8 @@ pub struct OutputSettings {
     /// I/Q output: I on the right channel instead of the left.
     pub iq_swap: bool,
     /// RMS level of each output channel, dBFS (the OFDM peaks are about 10 dB higher).
+    /// A `[simulate]` channel adds fading gain on top: there, leave about 6 dB more
+    /// headroom (about −21 dBFS), or use `papr_db`.
     pub level_dbfs: f64,
     /// Apply the transmit channel filter (removes the OFDM side lobes).
     pub band_limit: bool,

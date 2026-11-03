@@ -21,7 +21,7 @@ use crate::data::JournalineWatch;
 use crate::error::{Result, StationError};
 use crate::fac::FacScheduler;
 use crate::output::DeviceSink;
-use crate::plan::{FRAME_SECONDS, MultiplexPlan, StreamContent};
+use crate::plan::{MultiplexPlan, StreamContent};
 use crate::sdc::{SdcScheduler, entities};
 use crate::webstream::WebStreamStatus;
 use decdrm_core::Cplx;
@@ -243,6 +243,8 @@ pub struct Station {
     last_mdi: Option<decdrm_mdi::MdiFrame>,
     /// A modulator (`[mdi]`): the MDI input.
     modulator: Option<Box<crate::modulator::Modulator>>,
+    /// The output clipping warning has been logged (once).
+    clipped_warned: bool,
 }
 
 // Compile-time check that a station can be moved to a worker thread (e.g. by a GUI).
@@ -387,6 +389,7 @@ impl Station {
             capture_mdi: false,
             last_mdi: None,
             modulator,
+            clipped_warned: false,
         };
         station.update_status();
         Ok(station)
@@ -670,6 +673,16 @@ impl Station {
         let st = &mut self.status;
         st.seconds = st.frames as f64 * self.plan.frame_seconds();
         st.clipped_samples = self.output.clipped_samples();
+        if st.clipped_samples > 0 && !self.clipped_warned {
+            // Said once: the count in the status keeps growing, the advice does not need to.
+            self.clipped_warned = true;
+            let level = self.cfg.output.level_dbfs;
+            self.log.push(format!(
+                "output: {} samples clipped at {level:.1} dBFS — lower `level_dbfs` (a channel simulator's fading \
+                 adds gain on top of the signal's own peaks), or set `[output] papr_db` and leave it headroom",
+                st.clipped_samples
+            ));
+        }
         st.papr_db = self.plan.output.peak_limit.map(|l| l.threshold_db as f32);
         st.papr_law = self.plan.output.peak_limit.map(|l| match l.law {
             decdrm_core::tx::output::PeakLaw::Clip => "clip",
@@ -685,7 +698,7 @@ impl Station {
         if let Some(m) = &self.modulator {
             st.mdi = Some(m.status.clone());
             st.sdc_capacity = self.tx.sdc_capacity_bytes();
-            st.services = modulator_services(m.ensemble());
+            st.services = modulator_services(m.ensemble(), self.plan.frame_seconds());
             return;
         }
         st.services = self
@@ -733,9 +746,11 @@ impl Station {
 }
 
 /// The services of a modulator's multiplex (from its FAC and SDC), for the status.
-fn modulator_services(ens: &decdrm_core::mux::service::Ensemble) -> Vec<ServiceStatus> {
+/// `frame_seconds`: one logical frame of the mode being transmitted (0.4 s, or 0.1 s in
+/// mode E) — the stream lengths are per such frame.
+fn modulator_services(ens: &decdrm_core::mux::service::Ensemble, frame_seconds: f64) -> Vec<ServiceStatus> {
     let lengths = ens.stream_lengths();
-    let rate = |stream: u8| lengths.get(usize::from(stream)).map_or(0.0, |l| l.total() as f64 * 8.0 / FRAME_SECONDS);
+    let rate = |stream: u8| lengths.get(usize::from(stream)).map_or(0.0, |l| l.total() as f64 * 8.0 / frame_seconds);
     ens.services()
         .map(|s| {
             let audio = s.audio.as_ref().map(|a| AudioStatus {

@@ -596,6 +596,27 @@ fn modulator_section() {
     assert!(problems("[output]\nfile = \"o.wav\"\n[mdi]\ninput = \"nonsense\"\n").iter().any(|x| x.starts_with("mdi: input")));
 }
 
+/// The plan warns when a channel simulator is combined with too little output headroom:
+/// the fading adds gain on top of the signal's own peaks (at the default −15 dBFS, a mode E
+/// VHF station clipped ~2000 samples in 30 s).
+#[test]
+fn simulator_headroom_warning() {
+    let default_level = parse(&format!("{}\n[simulate]\nsnr_db = 20\n", base()));
+    let text = default_level.validate().unwrap().describe(&default_level);
+    assert!(text.contains("headroom"), "{text}");
+    assert!(text.contains("level_dbfs"), "{text}");
+    // 6 dB lower: the warning goes away.
+    let low = base().replace("file = \"out.wav\"", "file = \"out.wav\"\nlevel_dbfs = -21");
+    let low = parse(&format!("{low}\n[simulate]\nsnr_db = 20\n"));
+    assert!(!low.validate().unwrap().describe(&low).contains("headroom"));
+    // A peak limiter holds the peaks down: no warning even at the default level.
+    let limited = base().replace("file = \"out.wav\"", "file = \"out.wav\"\npapr_db = 6");
+    let limited = parse(&format!("{limited}\n[simulate]\nsnr_db = 20\n"));
+    assert!(!limited.validate().unwrap().describe(&limited).contains("headroom"));
+    // Without a simulator the default level is not warned about.
+    assert!(!parse(&base()).validate().unwrap().describe(&parse(&base())).contains("headroom"));
+}
+
 /// `[output] papr_db` / `papr_law`: the PAPR limiter. Optional, off by default, the law
 /// defaults to a hard clip, range-checked and round-tripped through TOML.
 #[test]

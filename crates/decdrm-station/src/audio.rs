@@ -1,15 +1,15 @@
 //! Audio services: the input (file, sound card, web stream — see [`crate::webstream`] —
 //! or test tone, converted to the encoder's rate and channel count), the encoder
 //! (FDK-AAC, libxaac for xHE-AAC, Opus, or DAC with the `dac` feature) and the
-//! logical frame of each 400 ms multiplex frame (audio super frame plus text message
-//! piece; a web stream's titles join the configured messages).
+//! logical frame of each multiplex frame (audio super frame plus text message piece; a
+//! web stream's titles join the configured messages).
 //!
-//! Timing: one call of [`AudioChain::next_logical_frame`] consumes exactly 400 ms of
-//! PCM at the encoder's input rate — five or ten AAC granules of 960 core samples
-//! (1920 input samples with SBR), twenty 20 ms Opus frames, 400 ms of xHE-AAC input
-//! (1024-, 2048- or 4096-sample frames that do not align with the super frames), or
-//! thirty 320-sample DAC frames at 24 kHz — and produces one audio super frame
-//! (ES 201 980 §5.3.1, §5.4.1).
+//! Timing: one call of [`AudioChain::next_logical_frame`] consumes the PCM of one **audio
+//! super frame** — 400 ms in modes A–D (five or ten AAC granules of 960 core samples, 1920
+//! input samples with SBR; twenty 20 ms Opus frames; 400 ms of xHE-AAC input; thirty
+//! 320-sample DAC frames at 24 kHz) and **200 ms in mode E, which is two 100 ms logical
+//! frames** (§5.3.1.0): the call returns the super frame's first half and holds the second
+//! for the next one. The return value is one logical frame (ES 201 980 §5.3.1, §5.4.1).
 //!
 //! FDK-AAC has an encoder delay: its first calls return no frame. The encoder is primed
 //! with silence at start-up until it delivers its first frame, after which every

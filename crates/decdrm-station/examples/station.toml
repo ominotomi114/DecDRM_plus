@@ -36,7 +36,8 @@ format = "real"              # "real" IF signal (1 channel) or "iq" (2 channels,
                              # (DC carrier 12 kHz for 9/10 kHz, ~9.7 kHz for 4.5/5 kHz, ~7 kHz for 18/20)
 # iq_offset_hz = 0           # iq: DC carrier offset
 # iq_swap = false            # iq: I on the right channel
-level_dbfs = -15             # RMS level per channel; OFDM peaks are ~10 dB higher
+level_dbfs = -15             # RMS level per channel; OFDM peaks are ~10 dB higher. With
+                             # [simulate] the fading adds gain: use about -21 (6 dB headroom)
 band_limit = true            # transmit channel filter against the OFDM side lobes
 # papr_db = 6                # peak limiter, knee above the RMS (off by default): ~4.6 dB less
                              # peak for ~32 dB MER with the default hard clip. With it, -10 dBFS
@@ -45,6 +46,8 @@ band_limit = true            # transmit channel filter against the OFDM side lob
                              # "tanh" (smoother, but compresses below the knee: ~24 dB MER)
 
 # --- Channel simulator (for testing receivers): impairs the signal before the outputs --
+# The fading adds several dB of gain on top of the signal's own peaks, so a simulated
+# station needs headroom: see `level_dbfs` above (about -21 dBFS) and/or `papr_db`.
 # [simulate]                 # the CLI's --channel-model N / --snr DB set or override this
 # channel = 3                # DRM channel model (ES 201 980 annex B): 1 AWGN, 2 Rice with delay,
                              # 3 US Consortium, 4 CCIR Poor, 5 and 6 (severe Doppler and delay)

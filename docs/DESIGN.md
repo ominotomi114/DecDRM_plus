@@ -1233,8 +1233,29 @@ needs 120 or 192 kHz; the input is resampled to whatever the receiver is configu
   of its 6 s (40 ms AAC frames at the 24 kHz core) with no errors. xHE-AAC and DAC in mode E
   are rejected with a message (their super frames still need the two-frame split).
 
+  *Mode E durations, and simulated stations' headroom* (2026-11-03). Two small fixes from the
+  same review:
+
+  - **Bit rates and durations.** The station still divided by 400 ms everywhere: the plan's
+    stream bit rates, `MSC … kbit/s`, the data-request sizes and the modulator's service
+    rates read a mode E stream 4× low (a 1530-byte frame is 122.4 kbit/s, not 30.6). Mode E
+    frames are 100 ms (§8.1), so `StreamPlan` carries its `frame_seconds`, `describe` uses
+    `MultiplexPlan::frame_seconds()`, and the `--duration` frame count in the CLI and the GUI
+    (`tx_config::frames_for`) take the mode's frame duration — a 60 s run was 15 s long in
+    mode E before this.
+  - **Output headroom with a simulator.** A `[simulate]` channel adds fading gain on top of
+    the signal's own peaks: at the default −15 dBFS a mode E real-IF station clipped ~2000
+    samples in 30 s through TU6, where the same station without a simulator clipped none in
+    30 s (peaks −2.2 dBFS). `plan.describe` now warns when a simulator leaves less than 6 dB
+    of headroom and no limiter is set (it suggests about −20 dBFS or `papr_db`), `Station`
+    logs one line when the output first clips, and the example/config docs say so. With a
+    6 dB limiter at −15 dBFS, 30 s through TU6 clipped nothing. The VHF loopback test runs at
+    −21 dBFS with `papr_db = 6` and asserts no clipped samples: 0 in 30 s measured, where the
+    old default clipped 1973.
+
   Not yet done: xHE-AAC/DAC in mode E; the DRM+ acquisition path (pinning mode E is the reliable
-  way in); the mode E station bit rates in `plan.describe` still divide by 400 ms.
+  way in); the GUI's diversity history still assumes 400 ms frames (receiver side, mode E
+  diversity is untested).
 
   Next: xHE-AAC/DAC audio super frames for mode E. The tuning pass on `params(E)` is done
   (above).

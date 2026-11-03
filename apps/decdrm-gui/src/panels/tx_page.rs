@@ -269,7 +269,7 @@ impl TxPage {
             return;
         };
         let frames = if settings.tx_duration_enabled {
-            tx_config::frames_for(settings.tx_duration_s)
+            tx_config::frames_for(settings.tx_duration_s, plan.frame_seconds())
         } else {
             None
         };

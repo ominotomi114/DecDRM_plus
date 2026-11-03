@@ -453,7 +453,7 @@ mod tests {
         };
         let (cfg, plan) = check(EXAMPLE_STATION, &dir, &ov).unwrap();
         let mut tx = TxSession::default();
-        tx.start(cfg, plan, frames_for(2.0), "test".into());
+        tx.start(cfg, plan, frames_for(2.0, 0.4), "test".into());
         assert!(tx.is_running());
         wait_until_stopped(&mut tx);
         assert_eq!(tx.error, None, "{:?}", tx.messages);
@@ -481,7 +481,7 @@ mod tests {
         };
         let (cfg, plan) = check(EXAMPLE_STATION, &dir, &ov).unwrap();
         let mut tx = TxSession::default();
-        let limit = frames_for(3600.0);
+        let limit = frames_for(3600.0, 0.4);
         tx.start(cfg, plan, limit, "long".into());
         tx.stop();
         assert!(tx.is_stopping());
@@ -513,7 +513,7 @@ mod tests {
         };
         let (cfg, plan) = check(EXAMPLE_STATION, &dir, &ov).unwrap();
         let mut tx = TxSession::default();
-        tx.start(cfg, plan, frames_for(3600.0), "journaline".into());
+        tx.start(cfg, plan, frames_for(3600.0, 0.4), "journaline".into());
         // Edited once the station has loaded the page file.
         let t0 = Instant::now();
         while !tx.snap.started && t0.elapsed() < Duration::from_secs(60) {
@@ -570,7 +570,7 @@ mod tests {
         cfg.output.file = Some(dir.join("never.wav"));
         std::fs::remove_file(dir.join("journaline.toml")).unwrap();
         let mut tx = TxSession::default();
-        tx.start(cfg, plan, frames_for(1.0), "broken".into());
+        tx.start(cfg, plan, frames_for(1.0, 0.4), "broken".into());
         wait_until_stopped(&mut tx);
         let e = tx.error.clone().unwrap_or_default();
         assert!(e.contains("journaline"), "{e}");

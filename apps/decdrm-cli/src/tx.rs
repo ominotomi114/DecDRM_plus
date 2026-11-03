@@ -86,7 +86,8 @@ pub fn run(a: TxArgs) -> Result<()> {
     {
         bail!("--duration must be a positive number of seconds");
     }
-    let frames = a.duration.map(|d| (d / 0.4).ceil() as u64);
+    // One frame per logical frame of the mode: 400 ms in modes A–D, 100 ms in mode E.
+    let frames = a.duration.map(|d| (d / plan.frame_seconds()).ceil() as u64);
 
     // Checked before the station creates its output file.
     if frames.is_none() && cfg.output.device.is_none() && !cfg.inputs_finite() {

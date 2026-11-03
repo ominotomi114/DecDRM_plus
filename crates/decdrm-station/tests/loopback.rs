@@ -1000,6 +1000,11 @@ fn drm_plus_transmits_through_a_vhf_channel() {
         working_sample_rate = "192"
         [output]
         file = "vhf.wav"
+        # The simulator's fading adds gain on top of the signal's own peaks: 6 dB of
+        # headroom, and the limiter for the deepest constructive peak (at the default
+        # -15 dBFS this channel clipped ~2000 samples in 30 s).
+        level_dbfs = -21
+        papr_db = 6
         [[service]]
         label = "VHF"
         id = 0x00A001
@@ -1016,6 +1021,7 @@ fn drm_plus_transmits_through_a_vhf_channel() {
     assert_eq!(plan.layout.mode, RobustnessMode::E);
     assert_eq!(plan.output.working_rate, decdrm_core::params::WorkingRate::R192);
     assert!(status.seconds > 1.9, "{} s", status.seconds);
+    assert_eq!(status.clipped_samples, 0, "the level check must keep the output inside full scale");
     let bytes = std::fs::metadata(dir.path().join("vhf.wav")).unwrap().len();
     assert!(bytes > 300_000, "{bytes} bytes of 192 kHz signal");
 }

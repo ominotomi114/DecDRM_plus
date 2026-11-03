@@ -128,6 +128,9 @@ pub struct StreamPlan {
     pub lengths: StreamLengths,
     /// Carried in the very strongly protected part (HMsym/HMmix).
     pub hierarchical: bool,
+    /// Duration of one multiplex frame in this plan's mode: 0.4 s, or **0.1 s in mode
+    /// E** (§8.1). The stream lengths above are per such frame, so bit rates divide by it.
+    pub frame_seconds: f64,
     pub content: StreamContent,
 }
 
@@ -139,7 +142,7 @@ impl StreamPlan {
 
     /// Gross bit rate of the stream, bit/s.
     pub fn bitrate(&self) -> f64 {
-        self.bytes() as f64 * 8.0 / FRAME_SECONDS
+        self.bytes() as f64 * 8.0 / self.frame_seconds
     }
 }
 
@@ -310,7 +313,7 @@ impl MultiplexPlan {
             s,
             "MSC {} bytes per frame ({:.2} kbit/s), SDC {} bytes per super frame",
             total / 8,
-            total as f64 / FRAME_SECONDS / 1000.0,
+            total as f64 / self.frame_seconds() / 1000.0,
             self.sdc_capacity
         );
         for st in &self.streams {
@@ -351,6 +354,24 @@ impl MultiplexPlan {
         }
         if let Some(sim) = &cfg.simulate {
             let _ = writeln!(s, "channel simulator: {}", sim.describe());
+            // The signal's own peaks, plus the fading gain the simulator adds on top: at the
+            // default level a mode E real-IF station clips (measured: ~2000 samples in 30 s
+            // through TU6 at -15 dBFS). 12.8 dB is the measured crest of the real part in
+            // modes A-D, 13.3 dB in mode E. With a limiter the peaks are already held down
+            // (measured: no clip at -15 dBFS with a 6 dB knee).
+            if self.output.peak_limit.is_none() {
+                let crest = if self.layout.mode == RobustnessMode::E { 13.3 } else { 12.8 };
+                let peak = self.output.level_dbfs + crest;
+                if peak > -6.0 {
+                    let safe = (-6.0 - crest).floor();
+                    let _ = writeln!(
+                        s,
+                        "headroom: the OFDM peaks reach about {peak:.1} dBFS at this level, and the channel simulator's \
+                         fading adds gain on top; lower `level_dbfs` to about {safe:.0} dBFS or set `[output] papr_db` to \
+                         keep them inside full scale"
+                    );
+                }
+            }
         }
         let afs = &cfg.afs;
         if !afs.is_empty() {
@@ -875,6 +896,8 @@ fn build(cfg: &StationConfig) -> Result<MultiplexPlan> {
     p.finish()?;
 
     let map = CellMap::new(layout.mode, layout.occupancy).expect("valid layout");
+    // Mode E's multiplex frames are 100 ms, not 400: bit rates divide by this.
+    let frame_s = f64::from(layout.mode.frame_ms()) / 1000.0;
     let mapping = msc_mode.mapping();
     // Without a part A (equal error protection) part A's level is 0, as signalled.
     let protection = MscProtection {
@@ -938,8 +961,8 @@ fn build(cfg: &StationConfig) -> Result<MultiplexPlan> {
     let Some(params) = try_total(0, &mut lens) else {
         p.push(format!(
             "the data applications need {data_bytes} bytes per frame ({:.1} kbit/s) but the MSC holds only {main_bytes} ({:.1} kbit/s){}",
-            data_bytes as f64 * 8.0 / FRAME_SECONDS / 1000.0,
-            main_bytes as f64 * 8.0 / FRAME_SECONDS / 1000.0,
+            data_bytes as f64 * 8.0 / frame_s / 1000.0,
+            main_bytes as f64 * 8.0 / frame_s / 1000.0,
             if requests.iter().any(|r| r.part == Part::A) { " with this part A length" } else { "" }
         ));
         return Err(StationError::Config(ConfigProblems(p.0)));
@@ -975,7 +998,13 @@ fn build(cfg: &StationConfig) -> Result<MultiplexPlan> {
         } else {
             StreamLengths { part_a: lens[i], part_b: 0 }
         };
-        streams.push(StreamPlan { id: id as u8, lengths, hierarchical: r.hierarchical, content: r.content.clone() });
+        streams.push(StreamPlan {
+            id: id as u8,
+            lengths,
+            hierarchical: r.hierarchical,
+            frame_seconds: f64::from(layout.mode.frame_ms()) / 1000.0,
+            content: r.content.clone(),
+        });
     }
 
     // --- Services: audio plans and applications.
@@ -1249,6 +1278,7 @@ fn stream_requests(cfg: &StationConfig, p: &mut Problems) -> Vec<Request> {
     }
     // Packet ids (explicit ones must differ; the others take the first free id) and
     // data lengths (whole packets for the sum of the requested bit rates).
+    let frame_s = f64::from(cfg.channel.mode.0.frame_ms()) / 1000.0;
     for r in &mut requests {
         let StreamContent::Data { packet_len, apps } = &mut r.content else { continue };
         let explicit: Vec<Option<u8>> =
@@ -1277,7 +1307,7 @@ fn stream_requests(cfg: &StationConfig, p: &mut Problems) -> Vec<Request> {
             };
         }
         let bits: f64 = r.app_bitrates.iter().sum();
-        let bytes = bits * FRAME_SECONDS / 8.0;
+        let bytes = bits * frame_s / 8.0;
         let packets = (bytes / *packet_len as f64).ceil().max(apps.len() as f64) as usize;
         r.bytes = packets * *packet_len;
     }
@@ -1455,7 +1485,7 @@ fn xhe_plan(
         khz(rate),
         if sbr == SbrRatio::Auto { String::new() } else { format!(" with SBR ratio {sbr}") }
     );
-    let kbit = |bytes: usize| bytes as f64 * 8.0 / FRAME_SECONDS / 1000.0;
+    let kbit = |bytes: usize| bytes as f64 * 8.0 / frame_s / 1000.0;
     let budget = config.budget().map_err(|e| match config.min_super_frame_bytes() {
         Some(min) if super_frame_len < min => format!(
             "{:.1} kbit/s left for the audio stream; {what} needs at least {:.1} kbit/s ({})",
@@ -1557,7 +1587,7 @@ fn dac_plan(
         decdrm_dac::choose_config(super_frame_len, requested)
     };
     let config = chosen.map_err(|e| {
-        let kbit = |bytes: usize| bytes as f64 * 8.0 / FRAME_SECONDS / 1000.0;
+        let kbit = |bytes: usize| bytes as f64 * 8.0 / frame_s / 1000.0;
         let remedy = if stream.hierarchical {
             "the hierarchical stream's length is fixed by the channel: use a higher protection_hierarchical, \
              HMsym instead of HMmix, or a wider channel"

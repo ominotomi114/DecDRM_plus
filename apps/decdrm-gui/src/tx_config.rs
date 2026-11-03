@@ -16,9 +16,6 @@ pub const EXAMPLE_STATION: &str =
 pub const EXAMPLE_JOURNALINE: &str =
     include_str!("../../../crates/decdrm-station/examples/journaline.toml");
 
-/// Frame duration, seconds.
-const FRAME_SECONDS: f64 = 0.4;
-
 /// Directory for the untitled example's companion files and relative outputs:
 /// `station-example` next to the GUI settings file (so a test run with `--config`
 /// keeps everything in its own directory).
@@ -137,10 +134,11 @@ pub fn line_start_char(text: &str, line: usize) -> usize {
     text.chars().count()
 }
 
-/// Frames for a duration limit (400 ms each, rounded up); `None` for a non-positive
-/// or non-finite duration.
-pub fn frames_for(seconds: f64) -> Option<u64> {
-    (seconds.is_finite() && seconds > 0.0).then(|| (seconds / FRAME_SECONDS).ceil() as u64)
+/// Frames for a duration limit, one per logical frame of the mode (`frame_seconds`: 0.4 s
+/// in modes A–D, **0.1 s in mode E**, §8.1), rounded up; `None` for a non-positive or
+/// non-finite duration.
+pub fn frames_for(seconds: f64, frame_seconds: f64) -> Option<u64> {
+    (seconds.is_finite() && seconds > 0.0 && frame_seconds > 0.0).then(|| (seconds / frame_seconds).ceil() as u64)
 }
 
 /// `true` if the programme ends by itself: there is audio and every audio input is a
@@ -255,7 +253,7 @@ mod tests {
             start_check(&cfg, None, true).is_err(),
             "file output without an end"
         );
-        assert!(start_check(&cfg, frames_for(10.0), true).is_ok());
+        assert!(start_check(&cfg, frames_for(10.0, 0.4), true).is_ok());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -354,18 +352,22 @@ mod tests {
         assert!(!inputs_finite(&cfg), "data-only stations never end");
         cfg.output.file = None;
         assert!(
-            start_check(&cfg, frames_for(1.0), true).is_err(),
+            start_check(&cfg, frames_for(1.0, 0.4), true).is_err(),
             "no output at all"
         );
     }
 
     #[test]
     fn durations_become_frames() {
-        assert_eq!(frames_for(0.4), Some(1));
-        assert_eq!(frames_for(1.0), Some(3));
-        assert_eq!(frames_for(60.0), Some(150));
-        assert_eq!(frames_for(0.0), None);
-        assert_eq!(frames_for(f64::NAN), None);
+        assert_eq!(frames_for(0.4, 0.4), Some(1));
+        assert_eq!(frames_for(1.0, 0.4), Some(3));
+        assert_eq!(frames_for(60.0, 0.4), Some(150));
+        // Mode E's logical frame is 100 ms (§8.1).
+        assert_eq!(frames_for(1.0, 0.1), Some(10));
+        assert_eq!(frames_for(60.0, 0.1), Some(600));
+        assert_eq!(frames_for(0.0, 0.4), None);
+        assert_eq!(frames_for(f64::NAN, 0.4), None);
+        assert_eq!(frames_for(1.0, 0.0), None);
     }
 
     #[test]
