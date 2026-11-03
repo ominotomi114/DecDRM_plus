@@ -652,7 +652,16 @@ impl Settings {
     /// Select a newly opened recording and guess its signal format from the name
     /// (DecDRM/Dream recordings of I/Q signals carry an `IQ` token, e.g.
     /// `Test_Mode_B_10kHz_IQ_Pos_26dB_SNR.flac`). Returns the guessed format.
+    ///
+    /// The working sample rate follows the file's own rate, rounded to one DecDRM
+    /// demodulates, whenever the header can be read — which is what makes a 192 kHz DRM+
+    /// recording decode without touching the rate picker (at the 48 kHz default its 100 kHz
+    /// signal would be resampled away). An MDI recording has no rate of its own and leaves
+    /// the picker alone.
     pub fn open_file(&mut self, path: PathBuf) -> SignalFormat {
+        if let Some(rate) = decdrm_io::probe_sample_rate(&path) {
+            self.working_rate_hz = WorkingRate::closest(rate).hz();
+        }
         let iq = path
             .file_stem()
             .is_some_and(|s| name_has_iq_token(&s.to_string_lossy()));
@@ -1028,6 +1037,61 @@ mod tests {
         assert!(!store.is_dirty(&s));
         let (_, loaded, _) = SettingsStore::load(Some(path.clone()));
         assert_eq!(loaded, s);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A minimal 16-bit stereo PCM WAV: enough for the reader to report the rate.
+    fn write_wav(path: &Path, sample_rate: u32) {
+        let (channels, bits) = (2u16, 16u16);
+        let block = channels * bits / 8; // block alignment, bytes per frame (a u16 field)
+        let data = u32::from(block) * 480;
+        let mut v = Vec::with_capacity(44 + data as usize);
+        v.extend_from_slice(b"RIFF");
+        v.extend_from_slice(&(36 + data).to_le_bytes());
+        v.extend_from_slice(b"WAVEfmt ");
+        v.extend_from_slice(&16u32.to_le_bytes());
+        v.extend_from_slice(&1u16.to_le_bytes());
+        v.extend_from_slice(&channels.to_le_bytes());
+        v.extend_from_slice(&sample_rate.to_le_bytes());
+        v.extend_from_slice(&(sample_rate * u32::from(block)).to_le_bytes());
+        v.extend_from_slice(&block.to_le_bytes());
+        v.extend_from_slice(&bits.to_le_bytes());
+        v.extend_from_slice(b"data");
+        v.extend_from_slice(&data.to_le_bytes());
+        v.extend(std::iter::repeat_n(0u8, data as usize));
+        std::fs::write(path, &v).unwrap();
+    }
+
+    /// Opening a recording demodulates it at its own rate: a 192 kHz DRM+ file would lose
+    /// its 100 kHz signal at the 48 kHz default, and a DRM30 file at 44.1 kHz has no reason
+    /// to be resampled up to 96.
+    #[test]
+    fn opening_a_recording_takes_its_own_rate() {
+        let dir = std::env::temp_dir().join(format!("decdrm-rate-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut s = Settings::default();
+        s.working_rate_hz = WorkingRate::R48.hz();
+        let wide = dir.join("drmplus_IQ_192k.wav");
+        write_wav(&wide, 192_000);
+        assert_eq!(
+            decdrm_io::probe_sample_rate(&wide),
+            Some(192_000),
+            "the reader must see the file's rate"
+        );
+        s.open_file(wide);
+        assert_eq!(s.working_rate_hz, 192_000, "a 192 kHz recording is demodulated at 192 kHz");
+
+        let narrow = dir.join("drm30_44k.wav");
+        write_wav(&narrow, 44_100);
+        s.open_file(narrow);
+        assert_eq!(s.working_rate_hz, 48_000, "44.1 kHz rounds to 48, not up to 96");
+
+        // A file the reader cannot open (an MDI recording) leaves the picker alone.
+        s.working_rate_hz = 120_000;
+        s.open_file(dir.join("recording.mdi"));
+        assert_eq!(s.working_rate_hz, 120_000);
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

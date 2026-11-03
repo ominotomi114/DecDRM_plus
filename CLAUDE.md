@@ -71,6 +71,8 @@ milestone checklist (keep it current).
 - Full decode of a recording (audio, text, data):
   `cargo run --release -p decdrm-cli -- rx samples/DW_ModeB_10kHz.flac [--out a.wav]
   [--data-dir DIR] [--format iq]`; GUI: `cargo run --release -p decdrm-gui -- FILE`.
+  The working rate follows the file's own rate (`WorkingRate::closest`); `--sample-rate`
+  overrides it, and a DRM+ file needs no mode option (see the mode E note above).
 - Receiver-only smoke test:
   `cargo run --release -p decdrm-core --example rxfile -- samples/DW_ModeB_10kHz.flac`
   (append `iq` for I/Q files). `--example spectrum` prints a coarse spectrum,

@@ -998,12 +998,19 @@ needs 120 or 192 kHz; the input is resampled to whatever the receiver is configu
      *Reachable from the GUI and CLI now* (2026-10-25): `ReceiverConfig::pinned` carries a
      mode/occupancy to decode instead of searching, so `Receiver::new` pins it without a
      caller having to reach in with `set_mode`. The GUI's source bar has a **mode picker**
-     (Auto / Mode E (DRM+), which also raises the rate to 120 kHz if it is still 48); the CLI
-     has `--sample-rate` for the rate and `--drm-plus` to pin the mode (which raises the rate
-     itself if it is left at the default). Mode E's occupancy is always 0 (§8.1), so the
-     picker derives that rather than offering a choice. **Auto works now too** (see item 4):
-     the mode picker is a shortcut, not a requirement, and a DRM+ signal no longer has to
-     be tuned to the receiver's centre frequency.
+     (Auto / Mode E (DRM+), which also raises a working rate that cannot carry the mode);
+     the CLI has `--sample-rate` for the rate and `--drm-plus` to pin the mode. Mode E's
+     occupancy is always 0 (§8.1), so the picker derives that rather than offering a choice.
+     **Auto works now too** (see item 4): the mode picker is a shortcut, not a requirement,
+     and a DRM+ signal no longer has to be tuned to the receiver's centre frequency.
+
+     **The working rate follows the input** (2026-11-03). It is a property of the recording,
+     not a choice: demodulating at another rate means resampling, and a 192 kHz DRM+ file
+     resampled to 48 kHz is gone. Opening a recording in the GUI now sets the rate picker to
+     the file's own rate, and `decdrm rx` does the same when `--sample-rate` is left out, both
+     through `WorkingRate::closest` (nearest supported rate, 48/96/120/192; 44.1 kHz DRM30
+     stays at 48). A sound card or a KiwiSDR has no file to ask, so those keep 48 kHz unless
+     the caller says otherwise.
 
   The `TimeWiener` `params(E)` filter length/Doppler pair and `freq_wiener_len(E)` were
   **placeholders** copied from mode C/D. They are tuned now (2026-11-02): **mode E is

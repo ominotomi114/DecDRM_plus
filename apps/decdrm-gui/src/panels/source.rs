@@ -495,7 +495,8 @@ fn rate_picker(ui: &mut Ui, settings: &mut Settings) {
             "Working sample rate of the receiver: what the OFDM chain demodulates at, and what the input is \
              resampled to. Modes A–D are received at 48 kHz; robustness mode E (DRM+) carries 213 carriers \
              reaching ±47.11 kHz and needs 120 kHz or more (96 kHz leaves only 0.89 kHz of Nyquist margin). \
-             Set 120 or 192 kHz to receive DRM+: Auto finds it there.",
+             Opening a recording sets it from the file's own rate; set 120 or 192 kHz by hand to receive \
+             DRM+ from a sound card or a KiwiSDR, where the search finds it too.",
         );
 }
 

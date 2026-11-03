@@ -71,6 +71,19 @@ impl WorkingRate {
         }
     }
 
+    /// The supported rate closest to `hz` Hz (a tie goes to the lower rate).
+    ///
+    /// The working rate wants to follow the input, not to be a free choice: demodulating at
+    /// another rate means resampling, and a DRM+ signal resampled down to 48 kHz is gone.
+    /// A caller that reads a file's own rate (a 44.1 kHz DRM30 recording, a 250 kHz Kiwi
+    /// capture) rounds it with this.
+    pub fn closest(hz: u32) -> Self {
+        Self::ALL
+            .into_iter()
+            .min_by_key(|r| r.0.abs_diff(hz))
+            .unwrap_or(Self::R48)
+    }
+
     /// The rate in Hz.
     pub const fn hz(self) -> u32 {
         self.0
@@ -654,5 +667,31 @@ mod tests {
             assert!(ChannelLayout::new(RobustnessMode::A, so).is_some());
             assert!(ChannelLayout::new(RobustnessMode::B, so).is_some());
         }
+    }
+
+    /// A recording is demodulated at its own rate where that is possible: 44.1 kHz DRM30
+    /// stays at 48, and a 44.1/48 kHz *upsampled* capture (88.2/96) stays wide enough for
+    /// mode E, whose carriers would fold at 48.
+    #[test]
+    fn the_closest_rate_follows_the_input() {
+        let cases = [
+            (8_000, WorkingRate::R48),
+            (22_050, WorkingRate::R48),
+            (44_100, WorkingRate::R48),
+            (48_000, WorkingRate::R48),
+            (88_200, WorkingRate::R96),
+            (96_000, WorkingRate::R96),
+            (110_250, WorkingRate::R120),
+            (120_000, WorkingRate::R120),
+            (176_400, WorkingRate::R192),
+            (192_000, WorkingRate::R192),
+            (250_000, WorkingRate::R192),
+            (384_000, WorkingRate::R192),
+        ];
+        for (hz, want) in cases {
+            assert_eq!(WorkingRate::closest(hz), want, "{hz} Hz");
+        }
+        // A rate exactly between two supported ones takes the lower.
+        assert_eq!(WorkingRate::closest(108_000), WorkingRate::R96);
     }
 }

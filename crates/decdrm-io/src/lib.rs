@@ -64,7 +64,7 @@ pub use device::{
     DeviceInfo,
 };
 pub use error::{Error, Result};
-pub use file_reader::FileReader;
+pub use file_reader::{probe_sample_rate, FileReader};
 pub use file_writer::{Container, Encoding, FileWriter};
 pub use player::{AudioPlayer, PlayerOptions, PlayerStatus};
 pub use resample::{resample, Resampler, ResamplerQuality, To48k, ToRate};

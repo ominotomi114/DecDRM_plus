@@ -79,16 +79,17 @@ struct RxArgs {
     #[arg(long)]
     no_auto_flip: bool,
     /// Working sample rate, kHz: the rate the OFDM chain demodulates at (the input is
-    /// resampled to it). Modes A–D are received at 48; robustness mode E (DRM+) needs 120
-    /// or 192, because its 213 carriers reach ±47.11 kHz.
-    #[arg(long, value_name = "KHZ", default_value_t = 48)]
-    sample_rate: u32,
+    /// resampled to it). Default: the recording's own rate, rounded to one DecDRM supports
+    /// (48, 96, 120 or 192 kHz), so a 192 kHz DRM+ file decodes without choosing anything;
+    /// 48 kHz for a sound card or a KiwiSDR.
+    #[arg(long, value_name = "KHZ")]
+    sample_rate: Option<u32>,
     /// Decode robustness mode E (DRM+) instead of searching for one. Not needed to receive
     /// DRM+ any more: the search finds the signal's spectrum, and the guard interval refines
     /// the carrier to within a few Hz, so the automatic path decodes it too. Pinning skips
     /// both and runs at DC, which is useful on a weak signal if the carrier is known; being
-    /// a few tens of Hz off is still corrected by the guard interval. Implies the rate mode E
-    /// needs if --sample-rate is left at its default.
+    /// a few tens of Hz off is still corrected by the guard interval. Raises a working rate
+    /// that cannot carry mode E (a 48 kHz input) to 120 kHz.
     #[arg(long)]
     drm_plus: bool,
     /// DC carrier frequency of the input in Hz, for a pinned receiver: the mixer runs here
@@ -237,9 +238,25 @@ fn rx(a: RxArgs) -> Result<()> {
         Format::Iq => InputFormat::Iq { swap: false },
         Format::IqSwapped => InputFormat::Iq { swap: true },
     };
-    // Mode E needs 120 kHz or more; naming DRM+ without a rate raises the 48 kHz default
-    // rather than leaving a receiver whose carriers would fold.
-    let sample_rate = if a.drm_plus && a.sample_rate == 48 { 120 } else { a.sample_rate };
+    // The working rate follows the input: the caller's --sample-rate, else the recording's
+    // own rate rounded to one DecDRM demodulates (a DRM+ recording is 192 kHz, and the
+    // 48 kHz default would resample its 100 kHz signal away), else 48 kHz for a sound card
+    // or a KiwiSDR.
+    let mut sample_rate = match a.sample_rate {
+        Some(khz) => khz,
+        None => match &a.file {
+            Some(path) => decdrm_io::probe_sample_rate(path)
+                .map_or(48, |hz| WorkingRate::closest(hz).hz() / 1000),
+            None => 48,
+        },
+    };
+    // Mode E needs 120 kHz or more: naming DRM+ for an input that cannot carry it (a 48 kHz
+    // file or sound card) raises the rate rather than leaving a receiver whose carriers fold.
+    if a.drm_plus
+        && !WorkingRate::new(sample_rate.saturating_mul(1000)).is_some_and(|r| r.allows(RobustnessMode::E))
+    {
+        sample_rate = 120;
+    }
     let working_rate = WorkingRate::new(sample_rate.saturating_mul(1000)).ok_or_else(|| {
         anyhow::anyhow!(
             "--sample-rate {} kHz is not one DecDRM supports (48, 96, 120 or 192)",
