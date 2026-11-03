@@ -4,14 +4,18 @@
 //!
 //! Steps:
 //!
-//! 1. Optional transmit channel filter (Dream's `CDRMBandpassFilt`,
+//! 1. Optional PAPR reduction ([`PeakLimit`]): a memoryless soft limiter that
+//!    compresses the baseband peaks before the filter, so the out-of-band part of the
+//!    distortion it creates is removed along with the OFDM side lobes (clipping after
+//!    the filter, as the final ±1 clip does, would spray it straight into the output).
+//! 2. Optional transmit channel filter (Dream's `CDRMBandpassFilt`,
 //!    `FT_TRANSMITTER`): a linear-phase FIR band-pass that passes the carriers
 //!    Kmin..Kmax plus [`BAND_MARGIN_HZ`] on each side and suppresses the slowly
 //!    decaying OFDM side lobes. It also removes out-of-band noise added by the
 //!    [`crate::channel`] simulator, which would otherwise fold into the band when
 //!    the real part is taken (costing 3 dB of SNR on real output).
-//! 2. Frequency shift to the IF (real output) or to the I/Q offset.
-//! 3. Scaling to the requested RMS level, real part (real output) or I/Q split,
+//! 3. Frequency shift to the IF (real output) or to the I/Q offset.
+//! 4. Scaling to the requested RMS level, real part (real output) or I/Q split,
 //!    clipping to ±1.
 //!
 //! Level: Dream scales to a fixed 3000/32768 RMS (≈ −21 dBFS for the complex
@@ -19,6 +23,14 @@
 //! in dBFS for the undistorted transmitter signal; the default of −15 dBFS leaves
 //! 15 dB of headroom, enough for the OFDM peak-to-average ratio (a Gaussian-like
 //! signal exceeds 5.6σ in only ~10⁻⁸ of the samples).
+//!
+//! With a limiter the same level refers to the limited signal: the limiter restores the
+//! power it removes (see [`PeakLimit`]), so its peaks are bounded by the knee's asymptote
+//! — 7.2 dB above the RMS for a 6 dB knee, where the raw signal reaches 10.7 dB — and the
+//! level can be raised by 3.5 dB before the final ±1 clip is reached. That is the point of
+//! it: not quantisation noise (at 16 bits it is far below any DRM channel), but keeping the
+//! peaks inside full scale at a higher RMS. It is not free: see the MER figures in
+//! [`PeakLimit`] and `examples/papr`.
 
 use super::TxError;
 use crate::cellmap::CellMap;
@@ -29,6 +41,11 @@ use std::f64::consts::PI;
 
 /// Default RMS level of each output channel, dBFS.
 pub const DEFAULT_LEVEL_DBFS: Real = -15.0;
+
+/// Accepted range of [`PeakLimit::threshold_db`]: below 2 dB the limiter costs ~17 dB of
+/// MER or more, above 20 dB it does nothing measurable.
+pub const MIN_PEAK_LIMIT_DB: Real = 2.0;
+pub const MAX_PEAK_LIMIT_DB: Real = 20.0;
 
 /// Pass band of the channel filter beyond the outermost carriers' main lobes, Hz
 /// (Dream's transmitter filter adds 300 Hz to the nominal bandwidth).
@@ -53,6 +70,50 @@ pub enum OutputFormat {
     Iq { offset_hz: Real, swap: bool },
 }
 
+/// Peak-to-average power ratio (PAPR) reduction: a memoryless soft limiter applied to
+/// the baseband signal before the channel filter (see the module docs).
+///
+/// The law is `tanh`, radially: a baseband sample `x` of amplitude `r` comes out as
+/// `x·(A/r)·tanh(r/A)`, i.e. with amplitude `A·tanh(r/A)` and **unchanged phase**. That
+/// amplitude is linear in `r` for small `r`, `A·(r/A − (r/A)³/3)` well below the knee,
+/// asymptotically `A` above it, and smooth (C^∞) everywhere — no corner in the waveform,
+/// so the distortion products decay much faster than hard clipping's. The knee `A` is
+/// `threshold_db` above the RMS amplitude of the baseband (`√mean_power`), so
+/// `threshold_db = 6` says "compress everything above 2σ".
+///
+/// Two consequences worth knowing:
+///
+/// * `tanh` compresses *before* the knee as well (at `r = A/2` the gain is already
+///   −0.7 dB); it is not a transparent limiter with a knee and a flat top. That is the
+///   price of the smoothness, and the reason the distortion is not confined to the peaks.
+///   Measured on a real mode B frame: a 6 dB knee takes 4.1 dB off the crest and costs
+///   23.5 dB MER; a hard clip at the same peak costs 35 dB MER, because it leaves
+///   everything below the ceiling alone. The smooth law wins on the *spectrum* of the
+///   distortion, not on its in-band power.
+/// * The limiter removes mean power. It restores it with the gain predicted for a
+///   circularly symmetric Gaussian signal (which an OFDM symbol with hundreds of carriers
+///   is to a good approximation), so the configured level still means what it says. The
+///   residual error of that model is a few hundredths of a dB.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PeakLimit {
+    /// Knee of the limiter, dB above the RMS of the baseband signal.
+    pub threshold_db: Real,
+}
+
+impl PeakLimit {
+    /// A `tanh` limiter with its knee `threshold_db` above the RMS (6 dB ≈ 2σ).
+    pub fn tanh(threshold_db: Real) -> Self {
+        Self { threshold_db }
+    }
+
+    /// The lowest asymptote, relative to the RMS, that this limiter allows, dB: the
+    /// tanh saturates at the knee, which the power normalisation then scales up.
+    pub fn ceiling_db(&self) -> Real {
+        let gamma = 10f64.powf(self.threshold_db / 20.0);
+        20.0 * (gamma * (1.0 / gaussian_tanh_loss(gamma)).sqrt()).log10()
+    }
+}
+
 /// Output stage settings.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct OutputConfig {
@@ -66,6 +127,9 @@ pub struct OutputConfig {
     /// whose Nyquist limits the output band. Modes A–D use [`WorkingRate::R48`]; robustness
     /// mode E needs [`WorkingRate::R120`] or more.
     pub working_rate: WorkingRate,
+    /// PAPR reduction before the channel filter (`None`: none, the output is the raw OFDM
+    /// signal, whose peaks reach ~10 dB above the RMS).
+    pub peak_limit: Option<PeakLimit>,
 }
 
 impl OutputConfig {
@@ -76,6 +140,7 @@ impl OutputConfig {
             level_dbfs: DEFAULT_LEVEL_DBFS,
             band_limit: true,
             working_rate: WorkingRate::R48,
+            peak_limit: None,
         }
     }
 
@@ -91,6 +156,7 @@ impl OutputConfig {
             level_dbfs: DEFAULT_LEVEL_DBFS,
             band_limit: true,
             working_rate: WorkingRate::R48,
+            peak_limit: None,
         }
     }
 
@@ -222,12 +288,88 @@ fn wrap(p: Real) -> Real {
     (p + PI).rem_euclid(2.0 * PI) - PI
 }
 
+/// Mean power left by the `tanh` limiter, relative to the input power, for a circularly
+/// symmetric complex Gaussian input with `E|z|² = 1`.
+///
+/// With Rayleigh amplitude `r` (density `2r·e^{−r²}`) and knee `γ` (in units of the RMS),
+/// the output amplitude is `γ·tanh(r/γ)`, so after `t = r²`
+/// `loss = ∫₀^∞ γ²·tanh²(√t/γ)·e^{−t} dt` — the `γ²` is the amplitude's scale: a sample at
+/// `r = γ/2` comes out at 0.46γ (gain 0.92, power ratio 0.85). For a large knee the loss
+/// tends to 1 (no limiting); for a knee at the RMS it is several dB. Simpson's rule over
+/// the region that carries the mass (`e^{−30}` is 10⁻¹³) is far more accurate than the
+/// model itself.
+fn gaussian_tanh_loss(gamma: Real) -> Real {
+    let f = |t: Real| {
+        let y = gamma * (t.sqrt() / gamma).tanh();
+        y * y * (-t).exp()
+    };
+    const STEPS: usize = 2000;
+    const TMAX: Real = 30.0;
+    let h = TMAX / STEPS as Real;
+    let mut s = f(0.0) + f(TMAX);
+    for i in 1..STEPS {
+        s += if i % 2 == 1 { 4.0 } else { 2.0 } * f(i as Real * h);
+    }
+    (s * h / 3.0).clamp(1e-9, 1.0)
+}
+
+/// The [`PeakLimit`] `tanh` limiter, with its state (see [`PeakLimit`]).
+#[derive(Debug, Clone)]
+struct Limiter {
+    /// Knee amplitude in baseband units: `γ·√mean_power`.
+    knee: Real,
+    /// Gain restoring the mean power the limiting removes (Gaussian model).
+    norm: Real,
+    /// Samples whose amplitude exceeded the knee so far.
+    limited: u64,
+}
+
+impl Limiter {
+    fn new(limit: PeakLimit, rms: Real) -> Self {
+        let gamma = 10f64.powf(limit.threshold_db / 20.0);
+        Self { knee: gamma * rms, norm: 1.0 / gaussian_tanh_loss(gamma).sqrt(), limited: 0 }
+    }
+
+    /// Limit in place: amplitude `r ↦ A·tanh(r/A)`, phase unchanged, then the power
+    /// normalisation. The `r → 0` limit is `x·(1 − r²/(3A²))`, which the expression
+    /// `A/r·tanh(r/A)` gives without a special case (both factors are `O(r)`).
+    fn apply(&mut self, data: &mut [Cplx]) {
+        let (knee, norm) = (self.knee, self.norm);
+        for v in data.iter_mut() {
+            let r = v.norm();
+            if r > knee {
+                self.limited += 1;
+            }
+            if r > 0.0 {
+                let g = norm * knee / r * (r / knee).tanh();
+                v.re *= g;
+                v.im *= g;
+            }
+        }
+    }
+}
+
+/// Apply the [`PeakLimit`] law to baseband samples whose mean power is `mean_power` (the
+/// [`CellMap::avg_power_per_symbol`] of the signal), in place; returns the number of
+/// samples above the knee.
+///
+/// This is what [`OutputStage`] does before the channel filter, exposed for measurements
+/// and tests (and for anything that produces baseband of its own). The mean power is
+/// restored, so the caller's level convention is unchanged.
+pub fn apply_peak_limit(data: &mut [Cplx], mean_power: Real, limit: PeakLimit) -> u64 {
+    assert!(mean_power > 0.0, "a signal with no power has no peaks to limit");
+    let mut limiter = Limiter::new(limit, mean_power.sqrt());
+    limiter.apply(data);
+    limiter.limited
+}
+
 /// Streaming output stage (see the module docs).
 #[derive(Debug, Clone)]
 pub struct OutputStage {
     cfg: OutputConfig,
     gain: Real,
     filter: Option<BandFilter>,
+    limiter: Option<Limiter>,
     /// Final mixer: from the (filtered) signal's frequency reference to the output
     /// frequency, radians per sample, and its phase.
     mix_step: Real,
@@ -254,12 +396,22 @@ impl OutputStage {
         let map = CellMap::new(layout.mode, layout.occupancy).expect("a ChannelLayout is always valid");
         // Per-channel power of Re{z} (or Im{z}) is P/2 for mean power P.
         let gain = 10f64.powf(cfg.level_dbfs / 20.0) * (2.0 / map.avg_power_per_symbol).sqrt();
+        let limiter = match cfg.peak_limit {
+            Some(limit) => {
+                if !(MIN_PEAK_LIMIT_DB..=MAX_PEAK_LIMIT_DB).contains(&limit.threshold_db) {
+                    return Err(TxError::InvalidPeakLimit { db: limit.threshold_db });
+                }
+                Some(Limiter::new(limit, map.avg_power_per_symbol.sqrt()))
+            }
+            None => None,
+        };
         let filter = cfg.band_limit.then(|| BandFilter::new(layout, cfg.working_rate));
         let center_step = filter.as_ref().map_or(0.0, |f| f.center_step);
         Ok(Self {
             cfg,
             gain,
             filter,
+            limiter,
             mix_step: center_step + 2.0 * PI * shift / fs,
             mix_phase: 0.0,
             clipped: 0,
@@ -291,11 +443,21 @@ impl OutputStage {
         self.clipped
     }
 
+    /// Baseband samples whose amplitude exceeded the limiter's knee so far (0 without a
+    /// limiter). This counts the peaks the limiter is really *for*; it compresses samples
+    /// below the knee as well (see [`PeakLimit`]).
+    pub fn limited_samples(&self) -> u64 {
+        self.limiter.as_ref().map_or(0, |l| l.limited)
+    }
+
     /// Convert baseband samples, appending interleaved `f32` samples to `out`.
     pub fn process(&mut self, baseband: &[Cplx], out: &mut Vec<f32>) {
         let mut w = std::mem::take(&mut self.work);
         w.clear();
         w.extend_from_slice(baseband);
+        if let Some(l) = self.limiter.as_mut() {
+            l.apply(&mut w);
+        }
         if let Some(f) = self.filter.as_mut() {
             f.process(&mut w);
         }
@@ -431,6 +593,34 @@ mod tests {
             } else {
                 assert!((peak_hz - expect_hz).abs() < 1.0, "{cfg:?}: peak at {peak_hz}");
             }
+        }
+    }
+
+    /// The `tanh` limiter: real gain (phase preserved), power restored by the Gaussian
+    /// model, the predicted fraction of samples above the knee, and a bounded peak.
+    #[test]
+    fn the_tanh_limiter_is_phase_preserving_and_power_neutral() {
+        use crate::channel::Rng;
+        let mut rng = Rng::new(3);
+        let x: Vec<Cplx> = (0..200_000).map(|_| rng.complex_gaussian()).collect();
+        let power = |v: &[Cplx]| v.iter().map(|c| c.norm_sqr()).sum::<Real>() / v.len() as Real;
+        let gamma = 10f64.powf(6.0 / 20.0);
+        let mut y = x.clone();
+        let peaks = apply_peak_limit(&mut y, 1.0, PeakLimit::tanh(6.0));
+        // E|z|² = 1 for `complex_gaussian`, so the knee is γ and the tail e^{−γ²}.
+        let got = peaks as Real / x.len() as Real;
+        let want = (-gamma * gamma).exp();
+        assert!((got - want).abs() < 0.2 * want, "{got:.4} above the knee, want ~{want:.4}");
+        // Power conserved to the model's accuracy (0.1 dB), peak bounded near the knee
+        // scaled by the normalisation (the asymptote is γ/√loss ≈ 1.14·γ at this knee).
+        let ratio_db = 10.0 * (power(&y) / power(&x)).log10();
+        assert!(ratio_db.abs() < 0.1, "power changed by {ratio_db:.2} dB");
+        let peak = y.iter().map(|c| c.norm()).fold(0.0, Real::max);
+        assert!(peak <= gamma * 1.2 && peak > gamma * 0.95, "peak {peak:.3} with a knee of {gamma:.3}");
+        // Phase unchanged: y/x is real for every sample (the law is radial).
+        for (a, b) in x.iter().zip(&y) {
+            let cross = (b * a.conj()).im.abs();
+            assert!(cross <= 1e-12 * a.norm() * b.norm() + 1e-15, "phase changed at {a:?} -> {b:?}");
         }
     }
 

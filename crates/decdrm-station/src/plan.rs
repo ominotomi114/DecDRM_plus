@@ -71,7 +71,7 @@ use decdrm_core::mux::service::{AudioCodec, AudioMode, AudioParams};
 use decdrm_codecs::{XHE_AAC_SAMPLE_RATES, XheAacConfig, XheAacEncoder};
 use decdrm_core::params::{ChannelLayout, MAX_SERVICES, MAX_STREAMS, WorkingRate};
 use decdrm_core::tx::output::{
-    OutputConfig, OutputFormat, OutputStage, suggested_if_hz_at,
+    OutputConfig, OutputFormat, OutputStage, PeakLimit, suggested_if_hz_at,
 };
 use decdrm_core::tx::{MscCapacity, Transmitter, TxConfig};
 use decdrm_io::Container;
@@ -541,6 +541,7 @@ pub(crate) fn output_config(
         level_dbfs: out.level_dbfs,
         band_limit: out.band_limit,
         working_rate: rate,
+        peak_limit: out.papr_db.map(PeakLimit::tanh),
     }
 }
 
@@ -578,6 +579,15 @@ fn check_output(cfg: &StationConfig, p: &mut Problems) {
     }
     if !(-60.0..=0.0).contains(&out.level_dbfs) {
         p.push(format!("output: level_dbfs {} is outside -60..0 dBFS", out.level_dbfs));
+    }
+    if let Some(db) = out.papr_db
+        && !(decdrm_core::tx::output::MIN_PEAK_LIMIT_DB..=decdrm_core::tx::output::MAX_PEAK_LIMIT_DB).contains(&db)
+    {
+        p.push(format!(
+            "output: papr_db {db} is outside {}..{} dB above the RMS",
+            decdrm_core::tx::output::MIN_PEAK_LIMIT_DB,
+            decdrm_core::tx::output::MAX_PEAK_LIMIT_DB
+        ));
     }
 }
 

@@ -720,6 +720,12 @@ fn output_card(ui: &mut Ui, tx: &TxSession, pal: &Palette) {
             ui.label(if s.clipped_samples > 0 { clipped.color(pal.error) } else { clipped })
                 .on_hover_text("Output samples limited to full scale so far.");
             ui.end_row();
+            if let Some(db) = s.papr_db {
+                value(ui, "PAPR limit", format!("{db:.1} dB, {} peaks limited", s.limited_samples)).on_hover_text(
+                    "tanh soft limiter: its knee above the RMS, and the baseband samples that exceeded it.",
+                );
+                ui.end_row();
+            }
             if s.mdi.is_some() {
                 // A modulator sends the SDC that comes with the MDI.
                 return;

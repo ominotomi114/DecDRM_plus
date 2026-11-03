@@ -596,6 +596,24 @@ fn modulator_section() {
     assert!(problems("[output]\nfile = \"o.wav\"\n[mdi]\ninput = \"nonsense\"\n").iter().any(|x| x.starts_with("mdi: input")));
 }
 
+/// `[output] papr_db`: the tanh PAPR limiter. Optional, off by default, range-checked, and
+/// round-tripped through TOML.
+#[test]
+fn papr_limiter_setting() {
+    assert_eq!(parse(&base()).output.papr_db, None, "off unless asked for");
+    let cfg = parse(&base().replace("file = \"out.wav\"", "file = \"out.wav\"\npapr_db = 6.0"));
+    assert_eq!(cfg.output.papr_db, Some(6.0));
+    let plan = cfg.validate().unwrap();
+    assert_eq!(plan.output.peak_limit, Some(decdrm_core::tx::output::PeakLimit::tanh(6.0)));
+    let back = parse(&cfg.to_toml_string().unwrap());
+    assert_eq!(back.output.papr_db, Some(6.0));
+
+    for db in ["1.0", "21.0"] {
+        let text = base().replace("file = \"out.wav\"", &format!("file = \"out.wav\"\npapr_db = {db}"));
+        assert!(has(&problems(&text), "papr_db"), "{db} must be refused");
+    }
+}
+
 /// The VHF presets (`[simulate] vhf = ...`): COST 207 taps for DRM+, with the speed and
 /// band validated and the annex B `channel` number left unused.
 #[test]

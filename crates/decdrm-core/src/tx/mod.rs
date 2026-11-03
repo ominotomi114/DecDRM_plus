@@ -79,6 +79,12 @@ pub enum TxError {
     Mlc(String),
     #[error("the signal ({lo_hz:.0} Hz to {hi_hz:.0} Hz) does not fit into the output band")]
     OutsideOutputBand { lo_hz: Real, hi_hz: Real },
+    #[error(
+        "the PAPR limiter threshold {db} dB is outside {min}..{max} dB above the RMS",
+        min = crate::tx::output::MIN_PEAK_LIMIT_DB,
+        max = crate::tx::output::MAX_PEAK_LIMIT_DB
+    )]
+    InvalidPeakLimit { db: Real },
 }
 
 /// Transmitter configuration: the transmission parameters signalled in the FAC plus

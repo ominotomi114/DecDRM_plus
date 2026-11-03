@@ -148,8 +148,12 @@ pub fn run(a: TxArgs) -> Result<()> {
 }
 
 fn print_status(s: &StationStatus) {
+    let limited = match s.papr_db {
+        Some(db) => format!(", {} peaks over {db:.0} dB", s.limited_samples),
+        None => String::new(),
+    };
     println!(
-        "[{:6.1}s] output {:5.1} dBFS rms, {:5.1} dBFS peak, {} clipped; SDC {}/{} bytes{}{}",
+        "[{:6.1}s] output {:5.1} dBFS rms, {:5.1} dBFS peak, {} clipped{limited}; SDC {}/{} bytes{}{}",
         s.seconds,
         s.output_rms_dbfs,
         s.output_peak_dbfs,

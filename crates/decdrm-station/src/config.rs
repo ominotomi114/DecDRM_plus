@@ -229,6 +229,13 @@ pub struct OutputSettings {
     pub level_dbfs: f64,
     /// Apply the transmit channel filter (removes the OFDM side lobes).
     pub band_limit: bool,
+    /// PAPR reduction: knee of a `tanh` soft limiter above the RMS of the baseband, dB
+    /// (e.g. 6 = "compress everything above 2σ"). `None` (the default) leaves the peaks
+    /// alone. With it, the peaks are bounded by an asymptote a little above the knee (7.2 dB
+    /// above the RMS for a 6 dB knee, against ~10 dB raw), so the level can be raised by
+    /// ~3.5 dB before the output clips. It costs in-band distortion (23.5 dB MER at a 6 dB
+    /// knee), so it is a choice, not a free lunch.
+    pub papr_db: Option<f64>,
 }
 
 impl Default for OutputSettings {
@@ -244,6 +251,7 @@ impl Default for OutputSettings {
             iq_swap: false,
             level_dbfs: decdrm_core::tx::output::DEFAULT_LEVEL_DBFS,
             band_limit: true,
+            papr_db: None,
         }
     }
 }

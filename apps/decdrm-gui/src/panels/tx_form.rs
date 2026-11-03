@@ -9,7 +9,9 @@ use super::meter::{MeterKind, meter_with_text};
 use super::source::DeviceLists;
 use decdrm_core::fac::{LANGUAGES, PROGRAMME_TYPES};
 use decdrm_core::params::{ChannelLayout, RobustnessMode, SpectrumOccupancy};
-use decdrm_core::tx::output::{OutputFormat, recommended_if_range_hz, suggested_if_hz};
+use decdrm_core::tx::output::{
+    MAX_PEAK_LIMIT_DB, MIN_PEAK_LIMIT_DB, OutputFormat, recommended_if_range_hz, suggested_if_hz,
+};
 use eframe::egui::{self, Color32, RichText, Ui};
 use std::path::Path;
 use toml_edit::{ArrayOfTables, DocumentMut, InlineTable, Item, Table, TableLike, Value};
@@ -1749,6 +1751,35 @@ fn output(ui: &mut Ui, doc: &mut DocumentMut, ctx: &mut FormCtx) -> bool {
                 changed = true;
             }
             ui.label(RichText::new("OFDM peaks are ~10 dB higher").weak());
+        });
+        ui.end_row();
+        row_label(ui, "PAPR");
+        ui.horizontal(|ui| {
+            let mut on = out.contains_key("papr_db");
+            let mut db = get_num(out, "papr_db").unwrap_or(6.0);
+            let hint = "Soft-limit the peaks with a tanh law, before the channel filter (so the \
+                out-of-band part of the distortion is filtered with the side lobes). Compresses \
+                everything above this level: ~4 dB less peak at the same RMS, at a cost of \
+                ~24 dB MER at 6 dB.";
+            if ui.checkbox(&mut on, "tanh").on_hover_text(hint).changed() {
+                if on {
+                    set(out, "papr_db", db);
+                } else {
+                    remove(out, "papr_db");
+                }
+                changed = true;
+            }
+            if on {
+                let edit = egui::DragValue::new(&mut db)
+                    .range(MIN_PEAK_LIMIT_DB..=MAX_PEAK_LIMIT_DB)
+                    .speed(0.25)
+                    .suffix(" dB above RMS");
+                if ui.add(edit).changed() {
+                    set(out, "papr_db", db);
+                    changed = true;
+                }
+            }
+            ui.label(RichText::new("peaks are ~10 dB above the RMS otherwise").weak());
         });
         ui.end_row();
         row_label(ui, "Filter");

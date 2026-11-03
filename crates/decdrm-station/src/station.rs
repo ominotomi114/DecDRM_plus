@@ -51,6 +51,10 @@ pub struct StationStatus {
     pub output_peak_dbfs: f32,
     /// Output samples clipped to full scale so far.
     pub clipped_samples: u64,
+    /// Knee of the PAPR limiter, dB above the RMS, if one is configured (`[output] papr_db`).
+    pub papr_db: Option<f32>,
+    /// Baseband samples above the limiter's knee so far (0 without a limiter).
+    pub limited_samples: u64,
     /// The output file (resolved path), if any.
     pub output_file: Option<PathBuf>,
     /// Name of the sound card being fed, if any.
@@ -664,6 +668,8 @@ impl Station {
         let st = &mut self.status;
         st.seconds = st.frames as f64 * self.plan.frame_seconds();
         st.clipped_samples = self.output.clipped_samples();
+        st.papr_db = self.plan.output.peak_limit.map(|l| l.threshold_db as f32);
+        st.limited_samples = self.output.limited_samples();
         st.device = self.device.as_ref().map(|d| d.name().to_string());
         st.device_underruns = self.device.as_ref().map_or(0, DeviceSink::underruns);
         st.device_buffer_ms = self.device.as_ref().map(|d| d.queued().as_secs_f64() * 1000.0);

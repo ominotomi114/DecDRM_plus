@@ -36,6 +36,9 @@ format = "real"              # "real" IF signal (1 channel) or "iq" (2 channels,
 # iq_swap = false            # iq: I on the right channel
 level_dbfs = -15             # RMS level per channel; OFDM peaks are ~10 dB higher
 band_limit = true            # transmit channel filter against the OFDM side lobes
+# papr_db = 6                # tanh soft limiter on the peaks (knee above the RMS): ~4 dB less
+                             # peak for ~24 dB MER. Off by default; with it, -11 dBFS keeps the
+                             # real output clear of full scale.
 
 # --- Channel simulator (for testing receivers): impairs the signal before the outputs --
 # [simulate]                 # the CLI's --channel-model N / --snr DB set or override this
