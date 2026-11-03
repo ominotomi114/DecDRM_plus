@@ -244,11 +244,12 @@ struct MdiRx {
 }
 
 impl MdiRx {
-    fn update(&mut self, f: &MdiFrame, fac_ok: Option<bool>) {
+    fn update(&mut self, f: &MdiFrame, mode: Option<RobustnessMode>, fac_ok: Option<bool>) {
         let st = &mut self.status;
-        if let Some(m) = f.robustness {
-            st.mode = Some(RobustnessMode::ALL[usize::from(m.min(3))]);
+        if let Some(m) = mode.or_else(|| f.robustness.map(|m| RobustnessMode::ALL[usize::from(m.min(3))])) {
+            st.mode = Some(m);
         }
+        let frame_s = st.mode.map_or(0.4, |m| f64::from(m.frame_ms()) / 1000.0);
         let r = &f.rsci;
         st.state = match (r.flags, fac_ok) {
             (Some(flags), _) if flags.sync != 0 => RxState::Acquisition,
@@ -291,7 +292,7 @@ impl MdiRx {
                 v.waterfall_rows.drain(..v.waterfall_rows.len() - keep);
             }
             v.spectrum_seq += 1;
-            v.spectrum_row_s = 0.4;
+            v.spectrum_row_s = frame_s;
         }
         if let Some(ir) = &r.impulse_response
             && ir.db.len() >= 2
@@ -563,11 +564,21 @@ impl Session {
 
     /// One MDI or RSCI frame (a session made with [`Self::new_mdi`]): its FAC and SDC
     /// go into the multiplex model as the receiver's would, its streams straight to the
-    /// decoders, its RSCI items into the status. Time advances by a frame (400 ms).
+    /// decoders, its RSCI items into the status. Time advances by one logical frame —
+    /// 400 ms in modes A–D, **100 ms in mode E** (§8.1) — which the frame says by its FAC
+    /// width: `robm` is two bits and names A–D only, while a mode E FAC is 116 bits (§6.3,
+    /// two service parameter sets) where A–D's is 72.
     pub fn push_mdi(&mut self, f: &MdiFrame) -> Vec<SessionEvent> {
-        self.samples_in += 19_200;
+        let fac_bits = f.fac_bits();
+        let mode = fac_bits
+            .as_ref()
+            .and_then(|b| (b.len() >= 116).then_some(RobustnessMode::E))
+            .or_else(|| f.robustness.map(|m| RobustnessMode::ALL[usize::from(m.min(3))]))
+            .or_else(|| self.status().mode);
+        let frame_s = mode.map_or(0.4, |m| f64::from(m.frame_ms()) / 1000.0);
+        self.samples_in += (f64::from(self.rate_hz) * frame_s).round() as u64;
         let mut events = Vec::new();
-        let fac = f.fac_bits().map(|bits| Fac::parse(&bits));
+        let fac = fac_bits.map(|bits| Fac::parse(&bits));
         if let Some(parsed) = &fac {
             match parsed {
                 Some(fac) => events.push(ReceiverEvent::Fac(*fac)),
@@ -594,7 +605,7 @@ impl Session {
                     st.sdc_bad += 1;
                 }
             }
-            m.update(f, fac.as_ref().map(Option::is_some));
+            m.update(f, mode, fac.as_ref().map(Option::is_some));
         }
         let mut out = self.handle(0, events);
         let Some(mux) = self.ens.multiplex() else { return out };
@@ -716,8 +727,9 @@ impl Session {
         out.push(SessionEvent::ServicesChanged);
     }
 
-    /// The robustness mode being received, as far as it is known (`mode` of the status:
-    /// the FAC cannot express mode E, so a pinned receiver is the only source there).
+    /// The robustness mode being received, as far as it is known: the receiver's detection
+    /// or pin, or — for MDI input — the FAC's own signalling (a 116-bit block is mode E,
+    /// §6.3; `robm` cannot name it).
     fn mode(&self) -> RobustnessMode {
         self.status().mode.unwrap_or(RobustnessMode::B)
     }

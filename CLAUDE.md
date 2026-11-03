@@ -30,7 +30,8 @@ milestone checklist (keep it current).
 - `crates/decdrm-mdi` — MDI (TS 102 820), RSCI/RCI (TS 102 349) over DCP (TS 102 821):
   AF/PFT (Reed–Solomon `rs`), TAG items, `MdiFrame`, `RsciStatus`, `RciCommand`,
   recordings (`.rsX`, pcap/pcapng, raw), UDP in Dream's address syntax, `MdiInput`.
-  Engine input `InputSpec::Mdi` (`Session::push_mdi`), `EngineConfig::rci_listen`;
+  **DRM+ is marked by the FAC's width** (`MdiFac`: 72 bits for A–D, 116 for mode E; `robm`
+  names A–D only). Engine input `InputSpec::Mdi` (`Session::push_mdi`), `EngineConfig::rci_listen`;
   the station's modulator (`[mdi]`, `modulator.rs`) and `Station::capture_mdi`
   (`--example mdi_source` makes test MDI). No MDI output role (not asked for).
 - `crates/decdrm-kiwi` — KiwiSDR client (WebSocket protocol after kiwiclient, typed

@@ -62,11 +62,83 @@ fn run_until(engine: &Engine, log: &mut Vec<String>, limit: Duration, done: impl
     false
 }
 
+/// `frames` frames of a mode E (DRM+) station as MDI: 100 ms logical frames whose FACs
+/// are 116 bits, the only marker MDI has for DRM+ (`robm` names A–D).
+fn station_mdi_drm_plus(frames: u64) -> Vec<MdiFrame> {
+    let dir = tempfile::tempdir().unwrap();
+    let toml = r#"
+        [channel]
+        mode = "E"
+        occupancy = 0
+        working_sample_rate = "192"
+        [output]
+        file = "rf.wav"
+        [[service]]
+        label = "DRM+ MDI"
+        id = 0xD0D0E1
+        [service.audio]
+        codec = "he-aac"
+        input = { tone_hz = 1000.0 }
+    "#;
+    let mut cfg = StationConfig::from_toml_str(toml).unwrap();
+    cfg.base_dir = Some(dir.path().to_path_buf());
+    let mut station = Station::new(cfg).unwrap_or_else(|e| panic!("{e}"));
+    station.capture_mdi(true);
+    (0..frames)
+        .map(|_| {
+            station.transmit_frame().unwrap();
+            station.last_mdi().cloned().unwrap()
+        })
+        .collect()
+}
+
+/// A DRM+ content server's MDI: the engine takes the mode from the 116-bit FAC and the
+/// frame duration with it, so a mode E stream is 6 s of signal rather than 24 s.
+#[test]
+fn drm_plus_over_mdi() {
+    let frames = station_mdi_drm_plus(60);
+    assert_eq!(frames[0].fac.as_ref().map(|f| f.bits), Some(116), "a mode E FAC is 116 bits");
+    assert!(frames[0].is_mode_e());
+    assert_eq!(frames[0].robustness, None, "robm cannot name mode E");
+    assert!(frames[0].sdc.is_some() && frames[1].sdc.is_none(), "SDC in the first frame of a super frame");
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("drmplus.rsM");
+    let mut w = DcpFileWriter::create(&path, FileKind::FileIo, 0).unwrap();
+    for (i, f) in frames.iter().enumerate() {
+        w.write_packet(&f.to_af(i as u16).to_bytes(), None).unwrap();
+    }
+    w.finish().unwrap();
+
+    let origin = MdiOrigin::parse(path.to_str().unwrap()).unwrap();
+    let input = InputSpec::Mdi(MdiSpec { origin, realtime: false, rci: None });
+    let engine = Engine::start(EngineConfig { input, ..EngineConfig::default() });
+    let mut log = Vec::new();
+    assert!(run_until(&engine, &mut log, Duration::from_secs(60), |s| s.stopped), "{log:#?}");
+    let snap = engine.snapshot();
+    drop(engine);
+    for l in &log {
+        println!("{l}");
+    }
+    assert_eq!(snap.error, None, "{log:#?}");
+    let mdi = snap.input.mdi.as_ref().expect("MDI status");
+    assert_eq!((mdi.stats.frames, mdi.stats.lost), (60, 0));
+    assert_eq!(snap.rx.mode, Some(decdrm_core::params::RobustnessMode::E), "the FAC's width names the mode");
+    assert!((snap.input.position_s - 6.0).abs() < 1e-9, "60 frames of 100 ms, got {} s", snap.input.position_s);
+    assert!(snap.services.iter().any(|s| s.label == "DRM+ MDI"), "{:?}", snap.services);
+    assert!(snap.rx.fac_ok >= 55 && snap.rx.sdc_ok >= 14, "FAC {} SDC {}", snap.rx.fac_ok, snap.rx.sdc_ok);
+    println!("[mdi] mode E: FAC {}/60, SDC {}, {} s", snap.rx.fac_ok, snap.rx.sdc_ok, snap.input.position_s);
+    // The multiplex arrives; the audio super frame is the known mode E gap (see
+    // `docs/DESIGN.md`: the station still encodes one 400 ms super frame per logical
+    // frame), so this only reports what it made of it.
+    println!("[mdi] mode E audio: {} frames ok, {} bad", snap.audio.frames_ok, snap.audio.frames_bad);
+}
+
 /// An MDI recording (file framing, as Dream writes `.rsA`): decoded to the end.
 #[test]
 fn mdi_recording_through_the_engine() {
     let frames = station_mdi(25);
-    assert_eq!(frames[0].fac.map(|f| f.len()), Some(9));
+    assert_eq!(frames[0].fac.as_ref().map(|f| f.bits), Some(72), "modes A-D have 72-bit FACs");
     assert!(frames[0].sdc.is_some() && frames[1].sdc.is_none(), "SDC in the first frame of a super frame");
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("station.rsM");

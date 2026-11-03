@@ -98,6 +98,9 @@ struct MdiSource {
     /// Sends RCI to the RSCI receiver.
     rci: Option<RciSender>,
     frames: u64,
+    /// Seconds of signal the frames account for: 400 ms per logical frame in modes A–D,
+    /// **100 ms in mode E** (a DRM+ frame's FAC is 116 bits, see `decdrm_mdi::mdi`).
+    seconds: f64,
     /// Protocol of the first frame ("MDI" / "RSCI" and revision).
     protocol: Option<String>,
     /// The latest RSCI receiver status.
@@ -215,7 +218,7 @@ impl Source {
                 if let Some(r) = &rci {
                     log.push(format!("MDI/RSCI: RCI commands go to {}", r.destination()));
                 }
-                let kind = Kind::Mdi(Box::new(MdiSource { input, rci, frames: 0, protocol: None, rsci: RsciStatus::default(), log }));
+                let kind = Kind::Mdi(Box::new(MdiSource { input, rci, frames: 0, seconds: 0.0, protocol: None, rsci: RsciStatus::default(), log }));
                 return Ok(Self { kind, conv: None, out_rate: rate_hz, info, frames_read: 0 });
             }
             InputSpec::Kiwi(cfg) => {
@@ -249,12 +252,12 @@ impl Source {
         }
     }
 
-    /// Seconds of input consumed so far (diversity reception: of the first branch;
-    /// MDI: 400 ms per frame).
+    /// Seconds of input consumed so far (diversity reception: of the first branch; MDI:
+    /// one logical frame per frame — 400 ms in modes A–D, 100 ms in mode E).
     pub fn position_s(&self) -> f64 {
         match &self.kind {
             Kind::Pair(s, _) => s[0].position_s(),
-            Kind::Mdi(m) => m.frames as f64 * 0.4,
+            Kind::Mdi(m) => m.seconds,
             _ => self.frames_read as f64 / f64::from(self.info.sample_rate.max(1)),
         }
     }
@@ -360,6 +363,8 @@ impl Source {
         Ok(match m.input.read(wait)? {
             MdiRead::Frame(f) => {
                 m.frames += 1;
+                // A DRM+ frame is 100 ms: its FAC is 116 bits where A–D's is 72.
+                m.seconds += if f.is_mode_e() { 0.1 } else { 0.4 };
                 if m.protocol.is_none() {
                     let p = f.protocol.map_or_else(
                         || "MDI (no *ptr)".to_string(),

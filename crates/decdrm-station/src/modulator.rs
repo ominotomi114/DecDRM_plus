@@ -341,10 +341,17 @@ impl Modulator {
     fn job(&mut self, f: &MdiFrame, fac: Fac, frame_index: usize) -> Result<Job, String> {
         let sdci = f.sdci.as_ref().ok_or("no sdci item")?;
         let ch = fac.channel;
-        let mode = match f.robustness {
-            Some(m) => RobustnessMode::ALL[usize::from(m.min(3))],
-            None => self.current.map(|(c, _)| c.mode).ok_or("no robm item")?,
+        // `robm` names A–D only: a DRM+ frame is one whose FAC is 116 bits instead of 72.
+        let mode = if f.is_mode_e() {
+            RobustnessMode::E
+        } else {
+            match f.robustness {
+                Some(m) => RobustnessMode::ALL[usize::from(m.min(3))],
+                None => self.current.map(|(c, _)| c.mode).ok_or("no robm item")?,
+            }
         };
+        // A mode E content server needs a transmitter built for a DRM+ rate.
+        decdrm_core::params::check_mode_rate(mode, self.working_rate).map_err(|e| e.to_string())?;
         let hierarchical = ch.msc_mode.is_hierarchical();
         let mux = MultiplexDescription {
             protection_a: sdci.protection_a,
@@ -368,8 +375,9 @@ impl Modulator {
             },
             part_a_bytes,
             afs_index,
-            // Modes A-D run at 48 kHz; mode E (DRM+) would need 120/192 kHz and its own
-            // configuration plumbed through (not yet offered by the station config).
+            // Modes A–D run at 48 kHz. A mode E (DRM+) content server is marked by its
+            // 116-bit FAC, and the station's working rate must then be 120 or 192 kHz
+            // (checked above; the station config supplies the rate).
             working_rate: self.working_rate,
         };
         let geometry = match self.current {

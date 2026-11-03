@@ -1173,14 +1173,35 @@ needs 120 or 192 kHz; the input is resampled to whatever the receiver is configu
   checks the swap, the round trip through the station's parser, and that the speed and band
   survive switching between VHF profiles.
 
-  Not yet done: mode E's station audio is unverified end to end — its audio super frame should
-  be 200 ms (§5.3.1.0), while the station's pipeline is written around 400 ms frames. The DRM+
-  loopback tests decode the multiplex through the receiver, but they bypass the station.
+  *DRM+ over MDI, receive side* (2026-11-03). MDI could not express mode E at all: `robm` is
+  two bits and TS 102 820 names only A–D, and `fac_` was parsed as a fixed 9 bytes, so a DRM+
+  content server's frames were rejected. The FAC is its own marker — §6.3 gives mode E two
+  service parameter sets, so its block is 116 bits where A–D's is 72:
 
-  Next: the tuning pass on `params(E)`/`freq_wiener_len(E)`, and the mode E audio-super-frame
-  question above. MDI for DRM+ is separate: `robm` is two bits and cannot name mode E — the
-  receive side could take the mode from the FAC's RM flag, but `push_mdi` still adds 400 ms of
-  samples per frame, wrong for mode E's 100 ms.
+  - `decdrm_mdi::mdi::MdiFac` keeps the block's exact width (72 or 116 bits);
+    `MdiFrame::is_mode_e()` and `fac_bits()` follow it. A mode E frame carries **no** `robm`.
+  - `Session::push_mdi` takes the mode from that width (else `robm`, else the last status) and
+    advances time by `mode.frame_ms()` — 100 ms per mode E frame instead of the hardcoded
+    400 ms. `Source::position_s` had the same 0.4 s-per-frame assumption for MDI input; it now
+    sums the frames' real durations.
+  - The station's `capture_mdi` writes `fac.to_bits_for(mode)` (116 bits for DRM+) and omits
+    `robm`; its modulator takes the mode from the FAC's width and rejects a mode E stream when
+    the station's working rate cannot carry it.
+
+  Measured with `drm_plus_over_mdi` (60 frames of a mode E station at 192 kHz through a `.rsM`
+  recording and the engine): mode E in the status, the service from the SDC, **FAC 60/60**,
+  SDC 15, and 6.0 s of input — where the old code would have called it 24 s. The audio still
+  decodes to **0 frames**: the station's `AudioChain::next_logical_frame` encodes 400 ms of PCM
+  per *logical* frame, while mode E's audio super frame is 200 ms mapped onto two 100 ms logical
+  frames (§5.3.1.0). The engine's deframer already expects that split
+  (`super_frames_per_logical(E) = 2`), so this is a transmitter-side fix and the next thing to
+  do for DRM+ audio.
+
+  Not yet done: mode E's station audio, now with a measured cause (above) — the audio super
+  frame is 200 ms (§5.3.1.0) while the station's pipeline is written around 400 ms frames. The
+  DRM+ loopback tests decode the multiplex through the receiver, but they bypass the station.
+
+  Next: mode E's audio super frame. The tuning pass on `params(E)` is done (above).
 
   *PAPR reduction, measured* (2026-11-03). There was none: the output stage clipped at ±1 and
   that was the whole story, so a mode B signal (10.7 dB crest; 12.8 dB for the real part at the
