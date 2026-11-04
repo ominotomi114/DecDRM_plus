@@ -906,6 +906,7 @@ dependencies = [
  "ab_glyph",
  "anyhow",
  "clap",
+ "decdrm-codecs",
  "decdrm-core",
  "decdrm-dac",
  "decdrm-data",

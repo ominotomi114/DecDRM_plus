@@ -70,6 +70,7 @@ pub mod fdk;
 pub mod opus;
 pub mod sdc;
 pub mod xhe_enc;
+pub mod xhe_external;
 
 pub use adts::{FdkAdtsDecoder, FdkAdtsEncoder};
 pub use fdk::{
@@ -86,6 +87,7 @@ pub use xhe_enc::{
     XheAacConfig, XheAacEncoder, XheAccessUnit, XheBudget, XheCodingMode, XheEncoderStats,
     XheSbrMode, XheSbrRatio, audio_specific_config_from_drm, xaac_version,
 };
+pub use xhe_external::{ExternalConfig, ExternalInfo, ExternalXheEncoder};
 
 /// A block of decoded audio.
 ///
@@ -220,4 +222,7 @@ pub enum CodecError {
     /// FDK's output could not be converted to DRM syntax.
     #[error("DRM re-packing failed: {0}")]
     Repack(String),
+    /// The optional external xHE-AAC encoder (a 32-bit helper process) failed.
+    #[error("external xHE-AAC encoder: {0}")]
+    External(String),
 }

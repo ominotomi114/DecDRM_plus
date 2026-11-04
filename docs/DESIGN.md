@@ -1351,6 +1351,36 @@ needs 120 or 192 kHz; the input is resampled to whatever the receiver is configu
   `±1` clip at the end of the chain already bounds the output; a level at −10 dBFS leaves it
   ~4 dB of margin.
 
+  *The external xHE-AAC encoder* (2026-11-04). libxaac is the weak point of a DRM+ transmission:
+  its USAC encoder is the one part of a reference decoder that was never meant to be competitive,
+  and at DRM+ bit rates its quality is well below Fraunhofer's. The DLL shipped with the Spark
+  Modulator DRM+ transmitter *is* the genuine Fraunhofer encoder plus their DRM+ superframe
+  assembler — but it is 32-bit and JNI-only, and DecDRM's executables are 64-bit.
+
+  So it is a side tool, not part of the program. `tools/xhe-host` (a ~330-line C shim) loads the
+  DLL in a 32-bit process and speaks a line protocol over stdio — `OK`, `NEED <samples>`,
+  `FRAME <bytes>` — calling the DLL's internal DRM+ entry points directly: the JNI wrappers only
+  marshal arguments and XOR the output, so no JVM is involved. `scripts\build-xhe-host.bat` builds
+  it into `exe\xhe\` beside the portable executables, copying `fhgio.dll` in when it is in
+  `refs\dll`. DecDRM looks for `xhe\decdrm-xhe-host.exe` beside itself: without the folder — or
+  without the tool in it — the external encoder is simply absent, and nothing else changes.
+
+  With the helper present the station offers `codec = "xhe-aac-external"` (GUI: *xHE-AAC (external
+  encoder)*). The DLL returns whole DRM audio super frames (200 ms in DRM+, 400 ms in DRM30) at
+  exactly the stream's bit rate, plus the SDC **type-9 body** — two header bytes (coding 3, mode,
+  rate code) and the xHE-AAC static config. The plan therefore takes the sampling rate and the SDC
+  from the encoder instead of computing them, and the chain has no framer, lead accounting or rate
+  control to run. Two services each get their own helper process (the DLL allows one encoder
+  instance per process), and the helper's own 640 ms start-up delay pads with silence. The DLL's
+  HE-AAC entry never initialised in any probe (its licence profile reports no instances for it),
+  so only xHE-AAC is offered; future encoder options will be named `xhe_ext_*`.
+
+  Measured (mode E, 192 kHz, 16-QAM protection 1): one stereo service at 122.4 kbit/s decodes
+  **141 audio frames of 4 s, none concealed**, the 800 Hz tone intact; two services at 61.2 kbit/s
+  each decode 70 frames each with none concealed — and the reference DRM+ recordings (from the
+  same Spark tool chain) already decode with the built-in path, so the receiver needed nothing
+  new.
+
 ## Conventions
 
 * Cite the spec in doc comments: `ES 201 980 §7.3.2`. When an algorithm is borrowed from

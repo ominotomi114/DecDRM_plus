@@ -927,6 +927,7 @@ const CODECS: &[(&str, &str)] = &[
     ("he-aac", "HE-AAC (AAC + SBR)"),
     ("he-aac-v2", "HE-AAC v2 (SBR + parametric stereo)"),
     ("xhe-aac", "xHE-AAC (USAC)"),
+    ("xhe-aac-external", "xHE-AAC (external encoder)"),
     ("opus", "Opus"),
     ("dac", "DAC (neural codec)"),
 ];
@@ -1009,8 +1010,16 @@ fn audio_settings(
     let mode_e = canon(mode) == "e";
     let codec = get_str(audio, "codec").unwrap_or_else(|| "he-aac".into());
     let c = canon(&codec);
-    let codecs: Vec<(&str, &str)> =
-        CODECS.iter().copied().filter(|(v, _)| *v != "dac" || cfg!(feature = "dac") || canon(v) == c).collect();
+    // The external xHE-AAC encoder exists only when its helper (the `xhe` folder beside
+    // the executable) is there; the entry then appears, and vanishes with it. A file that
+    // already names it keeps showing it even if the helper has gone (the plan will say why).
+    let external = decdrm_codecs::xhe_external::available();
+    let codecs: Vec<(&str, &str)> = CODECS
+        .iter()
+        .copied()
+        .filter(|(v, _)| *v != "dac" || cfg!(feature = "dac") || canon(v) == c)
+        .filter(|(v, _)| *v != "xhe-aac-external" || external || canon(v) == c)
+        .collect();
     grid(ui, ("tx_form_audio", i), |ui| {
         row_label(ui, "Codec");
         if let Some(v) = combo(ui, ("tx_codec", i), &codec, &codecs, 280.0) {

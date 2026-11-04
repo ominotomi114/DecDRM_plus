@@ -562,11 +562,20 @@ impl ServiceSettings {
 /// The audio of an audio service. The stream gets whatever MSC capacity the data
 /// applications leave (split between audio services by `share`), and the encoder's
 /// bit rate follows from the stream length.
+///
+/// Encoder-specific settings live beside the shared ones: DAC reads `bandwidth_kbps` and
+/// `side_bandwidth_kbps`. The external xHE-AAC encoder takes none today — its coding,
+/// sampling rate and SDC config come from the encoder, and its bit rate from the stream
+/// length — and any option it gains will be named `xhe_ext_…`, so the shared fields stay
+/// unambiguous. `deny_unknown_fields` makes a misspelling an error rather than a silently
+/// ignored setting.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AudioSettings {
     /// aac, he-aac (AAC + SBR), he-aac-v2 (AAC + SBR + parametric stereo), xhe-aac
-    /// (MPEG-D USAC), opus or dac (DecDRM's neural codec extension, 24 kHz mono).
+    /// (MPEG-D USAC), xhe-aac-external (USAC through the optional external encoder beside
+    /// the executables, when its `xhe` folder is there), opus or dac (DecDRM's neural
+    /// codec extension, 24 kHz mono).
     pub codec: Codec,
     /// AAC core sampling rate: 12000 (5 frames per 400 ms) or 24000 (10 frames).
     /// Default: 24000 for AAC, 12000 for HE-AAC and HE-AAC v2. Not used by Opus
@@ -1124,6 +1133,11 @@ pub enum Codec {
     HeAacV2,
     /// xHE-AAC: MPEG-D USAC (ES 201 980 §5.3.1), mono or stereo, from about 5 kbit/s.
     XheAac,
+    /// xHE-AAC encoded by the **external** encoder: the optional 32-bit helper beside the
+    /// executables (`decdrm_codecs::xhe_external`), which drives Fraunhofer's DRM xHE-AAC
+    /// DLL. Not another codec on the air — the SDC and the receiver see xHE-AAC — only
+    /// another encoder, offered when the helper folder is present.
+    XheAacExternal,
     /// Opus (Dream's extension; not part of ES 201 980).
     Opus,
     /// DAC, the Descript Audio Codec (DecDRM's neural codec extension, 24 kHz mono,
@@ -1138,16 +1152,20 @@ string_setting!(
         "heaac" | "heaacv1" | "aacsbr" | "aacplus" => Ok(Codec::HeAac),
         "heaacv2" | "aacps" | "eaacplus" => Ok(Codec::HeAacV2),
         "xheaac" | "xhe" | "usac" | "xheaacusac" => Ok(Codec::XheAac),
+        "xheaacexternal" | "xheexternal" | "external" | "xhedll" => Ok(Codec::XheAacExternal),
         "opus" => Ok(Codec::Opus),
         "dac" | "descriptaudiocodec" => Ok(Codec::Dac),
         "encodec" => Err("DecDRM's neural codec is now DAC: use codec = \"dac\" (EnCodec was replaced)".to_string()),
-        _ => Err(format!("unknown codec \"{s}\" (use aac, he-aac, he-aac-v2, xhe-aac, opus or dac)")),
+        _ => Err(format!(
+            "unknown codec \"{s}\" (use aac, he-aac, he-aac-v2, xhe-aac, xhe-aac-external, opus or dac)"
+        )),
     },
     |c: Codec| match c {
         Codec::Aac => "aac",
         Codec::HeAac => "he-aac",
         Codec::HeAacV2 => "he-aac-v2",
         Codec::XheAac => "xhe-aac",
+        Codec::XheAacExternal => "xhe-aac-external",
         Codec::Opus => "opus",
         Codec::Dac => "dac",
     }

@@ -843,6 +843,75 @@ impl XheEncoder {
     }
 }
 
+/// The external xHE-AAC encoder (the optional 32-bit helper beside the executables,
+/// `decdrm_codecs::xhe_external`). It returns whole DRM super frames — the DLL frames them
+/// and runs its own rate control — so there is no framer, lead or padding here; the helper
+/// holds about 640 ms of audio internally and pads with silence until it has enough, which
+/// is the encoder's delay, exactly like libxaac's lead.
+struct XheExternalEncoder {
+    enc: decdrm_codecs::ExternalXheEncoder,
+    config: decdrm_codecs::ExternalConfig,
+    /// The SDC type-9 body the plan announces; the encoder must produce the same.
+    static_config: Vec<u8>,
+    encoder_errors: u64,
+}
+
+impl XheExternalEncoder {
+    fn new(plan: &AudioPlan) -> std::result::Result<Self, CodecError> {
+        // Mode E's audio super frame spans two logical frames (DAC's four); A–D's one.
+        let config = decdrm_codecs::ExternalConfig::new(
+            plan.parts_per_super_frame > 1,
+            plan.input_channels as u8,
+            plan.super_frame_len,
+        );
+        let static_config = plan.params.codec_config.clone();
+        let enc = Self::open(&config, &static_config)?;
+        Ok(Self { enc, config, static_config, encoder_errors: 0 })
+    }
+
+    fn open(
+        config: &decdrm_codecs::ExternalConfig,
+        static_config: &[u8],
+    ) -> std::result::Result<decdrm_codecs::ExternalXheEncoder, CodecError> {
+        let enc = decdrm_codecs::ExternalXheEncoder::open(config)?;
+        // The greeting's type-9 body is the two header bytes plus the static config the
+        // plan kept (`plugins` aside, the header's text flag is ours to choose).
+        if enc.info().type9.get(2..) != Some(static_config) {
+            return Err(CodecError::InvalidConfig(
+                "the external xHE-AAC encoder produced another SDC type-9 config than the plan announces".into(),
+            ));
+        }
+        Ok(enc)
+    }
+
+    /// One super frame of `len` bytes after encoding `pcm`. A helper that died (the DLL
+    /// lives in its own process) is replaced; the frame it owed becomes zeros, which the
+    /// receiver conceals.
+    fn super_frame(&mut self, pcm: &[f32], len: usize, service: &str) -> Result<Vec<u8>> {
+        match self.enc.super_frame(pcm) {
+            Ok(f) if f.len() == len => Ok(f),
+            Ok(f) => {
+                self.encoder_errors += 1;
+                Err(StationError::Codec {
+                    service: service.to_string(),
+                    source: CodecError::InvalidConfig(format!(
+                        "the external xHE-AAC encoder returned {} bytes, the stream holds {len}",
+                        f.len()
+                    )),
+                })
+            }
+            Err(_) => {
+                self.encoder_errors += 1;
+                self.enc = Self::open(&self.config, &self.static_config).map_err(|source| StationError::Codec {
+                    service: service.to_string(),
+                    source,
+                })?;
+                Ok(vec![0; len])
+            }
+        }
+    }
+}
+
 /// DAC encoder producing DecDRM's DAC super frames (the `dac` feature).
 #[cfg(feature = "dac")]
 struct DacEncoder {
@@ -884,6 +953,7 @@ fn open_dac(_plan: &AudioPlan) -> std::result::Result<Encoder, decdrm_codecs::Co
 enum Encoder {
     Aac(AacEncoder),
     Xhe(Box<XheEncoder>),
+    XheExternal(XheExternalEncoder),
     Opus(OpusEncoder),
     #[cfg(feature = "dac")]
     Dac(DacEncoder),
@@ -946,6 +1016,7 @@ impl AudioChain {
         let encoder = match plan.codec {
             Codec::Opus => OpusEncoder::new(plan, stream).map(Encoder::Opus),
             Codec::XheAac => XheEncoder::new(plan).map(|e| Encoder::Xhe(Box::new(e))),
+            Codec::XheAacExternal => XheExternalEncoder::new(plan).map(Encoder::XheExternal),
             Codec::Dac => open_dac(plan),
             _ => AacEncoder::new(plan, stream).map(Encoder::Aac),
         }
@@ -1023,6 +1094,12 @@ impl AudioChain {
             Encoder::Xhe(e) => {
                 let sf = e.super_frame(&self.pcm, len, service_name)?;
                 self.counters.frames_dropped = e.dropped;
+                self.counters.encoder_errors = e.encoder_errors;
+                sf
+            }
+            Encoder::XheExternal(e) => {
+                let sf = e.super_frame(&self.pcm, len, service_name)?;
+                self.counters.frames_dropped = e.encoder_errors;
                 self.counters.encoder_errors = e.encoder_errors;
                 sf
             }

@@ -7,17 +7,26 @@ and talks to DecDRM over stdio.
 
 **It is not built by the workspace and not shipped.** The DLL is a commercial Fraunhofer
 encoder under its embedded licence blob; build this locally, put `fhgio.dll` beside it in
-your `exe\` folder, and keep both out of the repository (the repo is public).
+`exe\xhe\` next to the portable executables, and keep both out of the repository (the repo
+is public). DecDRM looks for `xhe\decdrm-xhe-host.exe` beside itself: with the folder
+absent (or the tool missing from it) the external encoder options are simply not offered.
 
 ## Build (32-bit MSVC)
 
 ```bat
-call "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvarsall.bat" x86
-cl /O2 /nologo /W3 host.c /Fe:decdrm-xhe-host.exe
+scripts\build-xhe-host.bat
 ```
 
-`scripts\build-xhe-host.bat` does the same. The DLL needs the Visual C++ 2010 runtime
-(`MSVCR100.dll`, x86), which Spark Modulator installs — without it the DLL will not load.
+which is the same as
+
+```bat
+call "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvarsall.bat" x86
+cl /O2 /nologo /W3 host.c /Fe:../exe/xhe/decdrm-xhe-host.exe
+```
+
+The script also copies `refs\dll\fhgio.dll` into `exe\xhe\` when it is there. The DLL
+needs the Visual C++ 2010 runtime (`MSVCR100.dll`, x86), which Spark Modulator installs —
+without it the DLL will not load.
 
 ## Usage
 

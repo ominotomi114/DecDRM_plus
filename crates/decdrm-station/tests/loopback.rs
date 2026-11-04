@@ -1053,8 +1053,13 @@ fn drm_plus_audio_roundtrip(audio: &str, min_frames: u64) -> (u64, f64) {
     let (_, plan, status) = transmit(dir.path(), &toml, 40);
     assert_eq!(plan.layout.mode, RobustnessMode::E);
     assert_clean_encoding(&status);
+    decode_tone(&dir.path().join("drmplus.wav"), 0, min_frames)
+}
 
-    let mut reader = FileReader::open(dir.path().join("drmplus.wav")).unwrap();
+/// Decode one audio service of a 192 kHz mode E recording: its decoded frame count and the
+/// strongest tone of the last decoded second (300–3000 Hz).
+fn decode_tone(path: &Path, service: u8, min_frames: u64) -> (u64, f64) {
+    let mut reader = FileReader::open(path).unwrap();
     assert_eq!(reader.format().sample_rate, 192_000);
     let channels = reader.format().channels;
     let mut session = Session::new(ReceiverConfig {
@@ -1064,6 +1069,7 @@ fn drm_plus_audio_roundtrip(audio: &str, min_frames: u64) -> (u64, f64) {
         pinned: Some((RobustnessMode::E, SpectrumOccupancy::SO_0)),
         ..Default::default()
     });
+    session.select_service(service);
     let mut audio = Vec::new();
     let mut frames_ok = 0u64;
     while let Some(block) = reader.read(4800).unwrap() {
@@ -1081,12 +1087,12 @@ fn drm_plus_audio_roundtrip(audio: &str, min_frames: u64) -> (u64, f64) {
     let st = &session.audio_stats;
     let rx = session.status();
     println!(
-        "mode E: {frames_ok} audio frames ({} concealed, {} super frame errors), FAC {} SDC {}",
+        "mode E: service {service}: {frames_ok} audio frames ({} concealed, {} super frame errors), FAC {} SDC {}",
         st.frames_concealed, st.super_frame_errors, rx.fac_ok, rx.sdc_ok
     );
     assert!(frames_ok >= min_frames, "only {frames_ok} audio frames of 4 s decoded");
-    // The 800 Hz tone must be the strongest component of the last decoded second (48 kHz
-    // output: one second is an exact Goertzel bin).
+    // The tone must be the strongest component of the last decoded second (48 kHz output:
+    // one second is an exact Goertzel bin).
     assert!(audio.len() > 48_000, "only {} audio samples", audio.len());
     let seg = &audio[audio.len() - 48_000..];
     let power = |f: f64| {
@@ -1130,6 +1136,76 @@ fn drm_plus_audio_decodes_xhe_aac() {
 fn drm_plus_audio_decodes_opus() {
     let (_, tone) = drm_plus_audio_roundtrip("codec = \"opus\"\ninput = { tone_hz = 800.0 }", 150);
     assert!((tone - 800.0).abs() < 10.0, "strongest decoded tone {tone} Hz, expected 800");
+}
+
+/// The **external** xHE-AAC encoder: the optional helper in `exe\xhe` beside the
+/// executables, driving Fraunhofer's DRM xHE-AAC DLL (`tools/xhe-host`). A mode E station
+/// encodes with it — the SDC type-9 body comes from the encoder, the frames are whole DRM
+/// super frames from it — and the receiver decodes the tone.
+///
+/// Skipped when the helper is not there, so CI (which has neither it nor the DLL) stays
+/// green. Run locally with `scripts\build-xhe-host.bat` (the DLL is copied from `refs\dll`).
+#[test]
+fn drm_plus_audio_decodes_with_the_external_xhe_encoder() {
+    let host = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../exe/xhe/decdrm-xhe-host.exe");
+    if !host.is_file() {
+        eprintln!("skipping: no external xHE-AAC helper at {}", host.display());
+        return;
+    }
+    // SAFETY: this test is the only user of the variable in this process, and it is set
+    // before the plan starts the helper.
+    unsafe { std::env::set_var(decdrm_codecs::xhe_external::HOST_ENV, &host) };
+    let (frames, tone) =
+        drm_plus_audio_roundtrip("codec = \"xhe-aac-external\"\nstereo = true\ninput = { tone_hz = 800.0 }", 40);
+    assert!(frames > 40, "only {frames} audio frames of 4 s decoded");
+    assert!((tone - 800.0).abs() < 10.0, "strongest decoded tone {tone} Hz, expected 800");
+}
+
+/// Two services through the external encoder: the DLL allows **one encoder instance per
+/// process**, so each service needs its own helper process. Both tones must come out of the
+/// recording, each from its own stream.
+#[test]
+fn two_services_use_their_own_external_xhe_encoders() {
+    let host = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../exe/xhe/decdrm-xhe-host.exe");
+    if !host.is_file() {
+        eprintln!("skipping: no external xHE-AAC helper at {}", host.display());
+        return;
+    }
+    // SAFETY: as in the single-service test above.
+    unsafe { std::env::set_var(decdrm_codecs::xhe_external::HOST_ENV, &host) };
+    let dir = tempfile::tempdir().unwrap();
+    let toml = r#"
+        [channel]
+        mode = "E"
+        occupancy = 0
+        working_sample_rate = "192"
+        [output]
+        file = "two.wav"
+        format = "iq"
+        sample_format = "float32"
+        [[service]]
+        label = "Ext A"
+        id = 0x00A002
+        [service.audio]
+        codec = "xhe-aac-external"
+        stereo = true
+        input = { tone_hz = 500.0 }
+        [[service]]
+        label = "Ext B"
+        id = 0x00A003
+        [service.audio]
+        codec = "xhe-aac-external"
+        stereo = true
+        input = { tone_hz = 1500.0 }
+    "#;
+    let (_, plan, status) = transmit(dir.path(), toml, 40);
+    assert_eq!(plan.services.iter().filter(|s| s.audio.is_some()).count(), 2, "two audio services");
+    assert_clean_encoding(&status);
+    let (fa, ta) = decode_tone(&dir.path().join("two.wav"), 0, 40);
+    let (fb, tb) = decode_tone(&dir.path().join("two.wav"), 1, 40);
+    assert!((ta - 500.0).abs() < 10.0, "service 0 tone {ta} Hz, expected 500");
+    assert!((tb - 1_500.0).abs() < 10.0, "service 1 tone {tb} Hz, expected 1500");
+    assert!(fa > 40 && fb > 40, "{fa} and {fb} audio frames");
 }
 
 /// Sound-card output: 3 s to a (virtual) device. Never run automatically.

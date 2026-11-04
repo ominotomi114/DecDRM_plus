@@ -30,6 +30,11 @@ milestone checklist (keep it current).
   unpinned too: above 48 kHz `rx::freqacq` matches the 95 kHz spectrum plateau (its two
   edges put the carrier within a few Hz) and `rx::Receiver::track_cp_frequency` refines it
   from the guard interval, so `ReceiverConfig::pinned` is a shortcut, not a requirement.
+  **External xHE-AAC encoder** (optional, `codec = "xhe-aac-external"`): the 32-bit helper
+  `exe\xhe\decdrm-xhe-host.exe` (`tools\xhe-host`, around Fraunhofer's DRM xHE-AAC DLL,
+  never committed) does the encoding in its own process and returns whole super frames plus
+  the SDC type-9 body; `decdrm_codecs::xhe_external` finds it beside the executable. Without
+  the folder the codec is not offered. Future options are named `xhe_ext_*`.
 - `crates/decdrm-schedule` — DRM broadcast schedules (Dream's DRMDX `DRMSchedule.ini`,
   EiBi CSV): what is on the air now; GUI Schedule tab, `decdrm schedule`. Downloads only
   on the user's request (curl/wget); `src/eibi_tables.rs` is generated from Dream.
@@ -93,7 +98,9 @@ milestone checklist (keep it current).
   weights, ~300 MB; needs `decdrm models download dac`) and
   `scripts\build-portable-noweights.bat` (without the codec, much smaller), both wrappers
   around `build-portable.ps1` (`-NoWeights` is the flag behind the second). Writes
-  `exe\decdrm-gui.exe` and `exe\decdrm.exe`.
+  `exe\decdrm-gui.exe` and `exe\decdrm.exe`. The optional external xHE-AAC encoder's
+  32-bit helper is built by `scripts\build-xhe-host.bat` into `exe\xhe\` (with the
+  Fraunhofer DLL when it is in `refs\dll`); see `tools\xhe-host\README.md`.
 
 ## Conventions
 - DSP in `f64` (`Real`, `Cplx`); PCM audio is `f32`. Working sample rate 48 kHz.

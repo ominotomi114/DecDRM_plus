@@ -239,6 +239,7 @@ impl AudioPlan {
                 format!("xHE-AAC {ch}, {} kHz (no SBR)", khz(self.input_rate))
             }
             Codec::XheAac => format!("xHE-AAC {ch}, {} kHz ({} kHz core)", khz(self.input_rate), khz(self.core_rate)),
+            Codec::XheAacExternal => format!("xHE-AAC {ch}, {} kHz (external encoder)", khz(self.params.sample_rate_hz)),
             Codec::Dac => match self.dac {
                 Some(c) if c.is_stereo() => format!("{}, 24 kHz", c.describe()),
                 Some(c) => format!("{}, 24 kHz mono", c.describe()),
@@ -408,6 +409,8 @@ fn default_core_rate(codec: Codec, mode: RobustnessMode) -> u32 {
         Codec::HeAac | Codec::HeAacV2 if mode.is_drm_plus() => 24_000,
         Codec::HeAac | Codec::HeAacV2 => 12_000,
         Codec::Opus => 48_000,
+        // The external xHE-AAC encoder feeds on 48 kHz PCM and has no core rate setting.
+        Codec::XheAacExternal => 48_000,
     }
 }
 
@@ -1120,25 +1123,43 @@ fn check_audio(cfg: &StationConfig, name: &str, a: &crate::config::AudioSettings
     } else if a.bandwidth_kbps.is_some() || a.side_bandwidth_kbps.is_some() {
         p.push(format!("{name}: bandwidth_kbps and side_bandwidth_kbps are only used by codec = \"dac\""));
     }
-    if a.codec == Codec::XheAac {
-        if a.core_rate.is_some() {
-            p.push(format!("{name}: xHE-AAC has no core_rate setting; set its sampling rate with sample_rate"));
+    match a.codec {
+        Codec::XheAac => {
+            if a.core_rate.is_some() {
+                p.push(format!("{name}: xHE-AAC has no core_rate setting; set its sampling rate with sample_rate"));
+            }
+            if let Some(r) = a.sample_rate
+                && !XHE_AAC_SAMPLE_RATES.contains(&r)
+            {
+                let list: Vec<String> = XHE_AAC_SAMPLE_RATES.iter().map(u32::to_string).collect();
+                p.push(format!("{name}: xHE-AAC sample_rate {r} Hz is not allowed (use {})", list.join(", ")));
+            }
         }
-        if let Some(r) = a.sample_rate
-            && !XHE_AAC_SAMPLE_RATES.contains(&r)
-        {
-            let list: Vec<String> = XHE_AAC_SAMPLE_RATES.iter().map(u32::to_string).collect();
-            p.push(format!("{name}: xHE-AAC sample_rate {r} Hz is not allowed (use {})", list.join(", ")));
+        Codec::XheAacExternal => {
+            // The DLL chooses the sampling rate and the SBR ratio; the plan takes them
+            // from it (and the SDC type-9 body with them).
+            for (set, field) in [
+                (a.core_rate.is_some(), "core_rate"),
+                (a.sample_rate.is_some(), "sample_rate"),
+                (a.sbr_ratio.is_some(), "sbr_ratio"),
+            ] {
+                if set {
+                    p.push(format!(
+                        "{name}: the external xHE-AAC encoder chooses the coding itself; {field} is not used"
+                    ));
+                }
+            }
         }
-    } else {
-        if a.sample_rate.is_some() {
-            p.push(format!(
-                "{name}: sample_rate is only used by codec = \"xhe-aac\"{}",
-                if a.codec.is_aac() { " (AAC has core_rate)" } else { "" }
-            ));
-        }
-        if a.sbr_ratio.is_some() {
-            p.push(format!("{name}: sbr_ratio is only used by codec = \"xhe-aac\""));
+        _ => {
+            if a.sample_rate.is_some() {
+                p.push(format!(
+                    "{name}: sample_rate is only used by codec = \"xhe-aac\"{}",
+                    if a.codec.is_aac() { " (AAC has core_rate)" } else { "" }
+                ));
+            }
+            if a.sbr_ratio.is_some() {
+                p.push(format!("{name}: sbr_ratio is only used by codec = \"xhe-aac\""));
+            }
         }
     }
     if !(a.share.is_finite() && a.share > 0.0) {
@@ -1182,6 +1203,8 @@ fn check_audio(cfg: &StationConfig, name: &str, a: &crate::config::AudioSettings
         // Without sample_rate the highest rate the plan may choose; it checks the tone
         // against the rate it chooses.
         Codec::XheAac => a.sample_rate.unwrap_or(48_000),
+        // The external encoder always takes 48 kHz PCM.
+        Codec::XheAacExternal => 48_000,
         c if c.sbr() => 2 * rate,
         _ => rate,
     };
@@ -1325,6 +1348,7 @@ fn audio_plan(
     match a.codec {
         Codec::Dac => return dac_plan(a, stream, mode),
         Codec::XheAac => return xhe_plan(a, stream, mode),
+        Codec::XheAacExternal => return xhe_external_plan(a, stream, mode),
         _ => {}
     }
     let codec = a.codec;
@@ -1519,6 +1543,102 @@ fn xhe_plan(
         params,
         dac: None,
         xhe: Some(config),
+    })
+}
+
+/// xHE-AAC parameters of a service encoded by the **external** encoder — the optional
+/// 32-bit helper beside the executables that drives Fraunhofer's DRM xHE-AAC DLL
+/// (`decdrm_codecs::xhe_external`).
+///
+/// The multiplex decides how many bytes a super frame holds, and so the bit rate; the DLL
+/// then decides everything about the coding: the sampling rate (48 kHz PCM in), the SBR
+/// ratio and the SDC type-9 body. The plan therefore asks it for a real configuration
+/// (`xhe_external::probe`, cached) instead of computing one, and reports its refusals with
+/// the limits its own API documents. A missing helper is an error here, which means the
+/// codec is only listed by the user interfaces when it can actually be used.
+fn xhe_external_plan(
+    a: &crate::config::AudioSettings,
+    stream: &StreamPlan,
+    mode: RobustnessMode,
+) -> std::result::Result<AudioPlan, String> {
+    let parts = decdrm_core::mux::audio::super_frames_per_logical(mode);
+    let frame_s = f64::from(mode.frame_ms()) / 1000.0;
+    let text = has_text(a);
+    let text_bytes = if text { TEXT_MESSAGE_BYTES } else { 0 };
+    let super_frame_len = stream.bytes().saturating_sub(text_bytes) * parts;
+    let channels = if a.stereo { 2 } else { 1 };
+    let drm_plus = mode.is_drm_plus();
+    let config = decdrm_codecs::ExternalConfig::new(drm_plus, channels, super_frame_len);
+    let bitrate = config.bitrate();
+    let what = format!(
+        "xHE-AAC {}, external encoder, {:.1} kbit/s",
+        if a.stereo { "stereo" } else { "mono" },
+        f64::from(bitrate) / 1000.0
+    );
+    // The DLL's limits (refs/dll/fhgio-api.md): a clearer message than an encoder error code.
+    let refused = if !(6_000..=163_920).contains(&bitrate) {
+        Some("it takes 6.0–163.9 kbit/s")
+    } else if a.stereo && bitrate < 12_000 {
+        Some("its stereo mode needs at least 12.0 kbit/s")
+    } else if !a.stereo && bitrate > 39_999 {
+        Some("its mono mode takes at most 39.9 kbit/s")
+    } else if !drm_plus && bitrate > 71_960 {
+        Some("in DRM30 (modes A–D) it takes at most 71.9 kbit/s")
+    } else {
+        None
+    };
+    if let Some(reason) = refused {
+        let hint = if bitrate < 12_000 {
+            "give the audio stream more of the channel (a wider channel or a lower protection level)"
+        } else {
+            stream_remedy(stream)
+        };
+        return Err(format!("{what}: {reason}; {super_frame_len} bytes per super frame — {hint}"));
+    }
+    let info = decdrm_codecs::xhe_external::probe(&config).map_err(|e| format!("{what}: {e}"))?;
+    // The greeting's type-9 body is two header bytes (coding, SBR, mode, rate code) followed
+    // by the xHE-AAC static config; `AudioParams` writes the header itself, so only the
+    // config is kept. Its rate code names the USAC output rate (e.g. 6 = 38.4 kHz), which
+    // is what the plan must signal — not the 48 kHz the encoder takes as PCM.
+    let type9 = decdrm_codecs::AudioInfo::from_type9_bytes(&info.type9)
+        .map_err(|e| format!("{what}: its SDC type-9 body: {e}"))?;
+    if type9.coding != decdrm_codecs::AudioCodingField::XheAac {
+        return Err(format!("{what}: the encoder announced another coding ({:?})", type9.coding));
+    }
+    if type9.xhe_aac_config.is_empty() {
+        return Err(format!("{what}: the encoder returned no xHE-AAC static config"));
+    }
+    let rate = XHE_AAC_SAMPLE_RATES[usize::from(type9.sample_rate_code & 7)];
+    let audio_mode = if a.stereo { AudioMode::Stereo } else { AudioMode::Mono };
+    let announced_stereo = type9.mode == decdrm_codecs::AudioMode::Stereo;
+    if announced_stereo != a.stereo {
+        return Err(format!(
+            "{what}: the encoder announced {} audio",
+            if announced_stereo { "stereo" } else { "mono" }
+        ));
+    }
+    let params =
+        AudioParams::new(stream.id, AudioCodec::XheAac, false, audio_mode, rate, text, type9.xhe_aac_config.clone());
+    Ok(AudioPlan {
+        stream: stream.id,
+        codec: Codec::XheAacExternal,
+        core_rate: rate,
+        stereo: a.stereo,
+        // The encoder's PCM: the helper takes 48 kHz.
+        input_rate: info.sample_rate,
+        input_channels: usize::from(channels),
+        text,
+        // The DLL frames the super frame itself; nothing here builds AAC frames.
+        frames_per_super_frame: 0,
+        parts_per_super_frame: parts,
+        frame_seconds: frame_s,
+        super_frame_len: info.frame_bytes,
+        payload_len: info.frame_bytes,
+        encoder_bitrate: bitrate,
+        opus_packet_bytes: 0,
+        params,
+        dac: None,
+        xhe: None,
     })
 }
 
