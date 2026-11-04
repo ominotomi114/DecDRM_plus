@@ -1,6 +1,14 @@
 * text=auto eol=lf
-*.flac binary
-*.wav binary
 *.png binary
 *.jpg binary
 *.pdf binary
+*.dll binary
+*.exe binary
+*.lib binary
+*.obj binary
+*.pdb binary
+*.wav binary
+*.flac binary
+*.iq binary
+*.pcap binary
+*.pcapng binary

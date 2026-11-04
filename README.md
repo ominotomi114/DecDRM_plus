@@ -1,12 +1,13 @@
 # DecDRM
 
-A Digital Radio Mondiale (DRM30) receiver **and transmitter** written in Rust.
+A Digital Radio Mondiale (DRM30 and DRM+) receiver **and transmitter** written in Rust.
 
-DecDRM decodes DRM robustness modes A–D in every channel bandwidth (4.5–20 kHz) from
-recordings or a live sound card (for example a virtual audio cable fed by a web SDR such
-as a KiwiSDR), and generates DRM signals from a station description. The signal
-processing is a spec-first reimplementation of ETSI ES 201 980 that borrows proven
-algorithms from [Dream](https://sourceforge.net/projects/drm/); audio uses Fraunhofer
+DecDRM decodes DRM robustness modes A–D in every channel bandwidth (4.5–20 kHz) and
+DRM+ (mode E, 100 kHz) from recordings or a live sound card (for example a virtual audio
+cable fed by a web SDR such as a KiwiSDR), and generates DRM signals of both from a
+station description. The signal processing is a spec-first reimplementation of ETSI
+ES 201 980 that borrows proven algorithms from
+[Dream](https://sourceforge.net/projects/drm/); audio uses Fraunhofer
 FDK-AAC (AAC, HE-AAC v1/v2, xHE-AAC decoding; AAC/HE-AAC encoding), libxaac (xHE-AAC
 encoding) and libopus.
 
@@ -21,8 +22,9 @@ encoding) and libopus.
 > **Status:** the receiver decodes audio, text messages and data services from every
 > DRM test recording available here (modes A/B/C, 9–20 kHz, real and I/Q inputs,
 > inverted spectra, clock offsets up to 1250 ppm, AAC/HE-AAC/xHE-AAC/Opus). The
-> transmitter produces complete multiplexes that the receiver decodes. See
-> [docs/DESIGN.md](docs/DESIGN.md) for the plan and milestone status.
+> transmitter produces complete multiplexes that the receiver decodes. DRM+ works in
+> both directions too. See [docs/DESIGN.md](docs/DESIGN.md) for the plan and milestone
+> status.
 
 ## Highlights
 
@@ -33,6 +35,11 @@ encoding) and libopus.
   --release -p decdrm-core --example bercurve -- 1 A 14.6 14.8 15`).
 - Automatic frequency, robustness-mode, spectrum-occupancy and spectrum-inversion
   detection; no need to set the IF or flip the spectrum by hand.
+- **DRM+ (mode E) without pinning.** The receiver finds a 100 kHz DRM+ signal on its
+  own: it locates the 95 kHz spectrum plateau by matching both of its edges and then
+  refines the carrier from the guard-interval phase, so nobody has to say where the
+  signal is. The transmitter composes mode E's 100 ms logical frames and 200 ms audio
+  super frames (AAC/HE-AAC/xHE-AAC/Opus) with 16- or 4-QAM in the MSC.
 - Sample-rate-offset estimation that is robust on fading channels (cross-correlation of
   impulse-response snapshots, lag-compensated tracking); pilot-slope acquisition for
   clock errors beyond 1000 ppm.
@@ -183,3 +190,9 @@ The vendored FDK-AAC library has its own licence (see `third_party/fdk-aac/NOTIC
 which is generally regarded as incompatible with the GPL: fine for personal use, but
 check before distributing binaries. AAC, xHE-AAC (MPEG-D USAC) and DRM technologies are
 covered by patents licensed through Via LA.
+
+The optional external xHE-AAC encoder (`codec = "xhe-aac-external"`) is not part of this
+repository either: [`tools/xhe-host`](tools/xhe-host/README.md) is a small 32-bit host
+process that loads Fraunhofer IIS's commercial DRM encoder DLL, which users must supply
+themselves and which is never committed, bundled or redistributed here. Without the
+helper (or without the DLL beside it) DecDRM simply does not offer those codec options.
