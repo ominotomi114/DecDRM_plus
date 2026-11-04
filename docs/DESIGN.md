@@ -1375,6 +1375,15 @@ needs 120 or 192 kHz; the input is resampled to whatever the receiver is configu
   HE-AAC entry never initialised in any probe (its licence profile reports no instances for it),
   so only xHE-AAC is offered; future encoder options will be named `xhe_ext_*`.
 
+  The seam brought two user-interface traps with it. The helper is a console program, so Windows
+  opened a console window for every probe; it is now started with `CREATE_NO_WINDOW` (a GUI
+  program has no console of its own). And a probe *is* a process start — ~40 ms once the DLL is
+  in the OS cache, over a second on the first one while it loads — which the transmitter tab
+  used to do on the UI thread, so every edit that changed the multiplex froze the window. Checks
+  now run on their own thread and the result is applied when it arrives; the synchronous path
+  survives only where a result is needed on the spot (pressing *Transmit*), and it is fast
+  because the background check has already cached that configuration.
+
   Measured (mode E, 192 kHz, 16-QAM protection 1): one stereo service at 122.4 kbit/s decodes
   **141 audio frames of 4 s, none concealed**, the 800 Hz tone intact; two services at 61.2 kbit/s
   each decode 70 frames each with none concealed — and the reference DRM+ recordings (from the

@@ -21,6 +21,7 @@ use decdrm_station::{JournalineStatus, MultiplexPlan, StationConfig, WebStreamSt
 use eframe::egui::{self, Color32, RichText, Ui};
 use rfd::{MessageButtons, MessageDialog, MessageDialogResult, MessageLevel};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
 /// Which view of the configuration the tab shows.
@@ -34,6 +35,16 @@ enum View {
 enum Checked {
     Ok { plan: String, output: String },
     Problems(tx_config::Problems),
+}
+
+/// A check running on its own thread. Checking is mostly parsing and arithmetic, but a
+/// station with the external xHE-AAC encoder starts a helper process to probe the DLL,
+/// which takes up to a second or two the first time (the DLL has to load); the window
+/// must not wait for that.
+struct CheckJob {
+    /// The text it was started for.
+    text: String,
+    rx: Receiver<Result<(StationConfig, MultiplexPlan), tx_config::Problems>>,
 }
 
 /// State of the Transmitter tab (the editor; the running station is a
@@ -57,6 +68,10 @@ pub struct TxPage {
     bar: Option<PlanBar>,
     /// Check again at this time (after form edits settle).
     recheck_at: Option<Instant>,
+    /// A check running in the background (see [`CheckJob`]).
+    job: Option<CheckJob>,
+    /// A check was asked for while one was running: check again when it finishes.
+    check_again: bool,
 }
 
 impl TxPage {
@@ -79,6 +94,8 @@ impl TxPage {
             doc: None,
             bar: None,
             recheck_at: None,
+            job: None,
+            check_again: false,
         };
         if let Some(path) = settings.station_config.clone()
             && let Err(e) = page.load(&path)
@@ -98,6 +115,9 @@ impl TxPage {
         self.saved = text;
         self.path = Some(path.to_path_buf());
         self.checked = None;
+        // A check of the previous file's text would show its multiplex here.
+        self.job = None;
+        self.check_again = false;
         Ok(())
     }
 
@@ -227,26 +247,86 @@ impl TxPage {
     /// returns the configuration if it is valid.
     fn check(&mut self, settings: &Settings) -> Option<(StationConfig, MultiplexPlan)> {
         let base = self.base_dir();
-        let (checked, result) =
-            match tx_config::check(&self.text, &base, &Self::overrides(settings)) {
-                Ok((cfg, plan)) => {
-                    // A modulator's multiplex comes with the MDI.
-                    self.bar = plan.mdi.is_none().then(|| PlanBar::of(&cfg, &plan));
-                    (
-                        Checked::Ok {
-                            plan: plan.describe(&cfg),
-                            output: tx_config::describe_output(&cfg, &plan),
-                        },
-                        Some((cfg, plan)),
-                    )
-                }
-                Err(problems) => {
-                    self.scroll_to_error = problems.location.is_some();
-                    (Checked::Problems(problems), None)
-                }
-            };
-        self.checked = Some((checked, self.text.clone()));
+        let result = tx_config::check(&self.text, &base, &Self::overrides(settings));
+        let text = self.text.clone();
+        self.apply_check(result, text)
+    }
+
+    /// Keep the result of a check for display, and return the configuration if it is
+    /// valid (`text` is the configuration it was made for).
+    fn apply_check(
+        &mut self,
+        result: Result<(StationConfig, MultiplexPlan), tx_config::Problems>,
+        text: String,
+    ) -> Option<(StationConfig, MultiplexPlan)> {
+        let (checked, result) = match result {
+            Ok((cfg, plan)) => {
+                // A modulator's multiplex comes with the MDI.
+                self.bar = plan.mdi.is_none().then(|| PlanBar::of(&cfg, &plan));
+                (
+                    Checked::Ok {
+                        plan: plan.describe(&cfg),
+                        output: tx_config::describe_output(&cfg, &plan),
+                    },
+                    Some((cfg, plan)),
+                )
+            }
+            Err(problems) => {
+                self.scroll_to_error = problems.location.is_some();
+                (Checked::Problems(problems), None)
+            }
+        };
+        self.checked = Some((checked, text));
         result
+    }
+
+    /// Check in the background, so the window keeps drawing while the external encoder's
+    /// helper process starts and loads its DLL. [`Self::poll_check`] applies the result.
+    fn start_check(&mut self, settings: &Settings) {
+        if self.job.is_some() {
+            // One at a time: check the text again when the running check finishes.
+            self.check_again = true;
+            return;
+        }
+        let text = self.text.clone();
+        let base = self.base_dir();
+        let ov = Self::overrides(settings);
+        let checked_text = text.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let spawned = std::thread::Builder::new().name("tx-check".into()).spawn(move || {
+            let result = tx_config::check(&checked_text, &base, &ov);
+            // The page may have moved on; a failed send just drops the result.
+            let _ = tx.send(result);
+        });
+        match spawned {
+            Ok(_) => self.job = Some(CheckJob { text, rx }),
+            Err(e) => self.notice = Some(format!("cannot check the configuration: {e}")),
+        }
+    }
+
+    /// Apply the result of a background check once it is there, and start the next one if
+    /// the text changed in the meantime.
+    fn poll_check(&mut self, ctx: &egui::Context, settings: &Settings) {
+        let received = match self.job.as_ref().map(|job| job.rx.try_recv()) {
+            None => return,
+            Some(Ok(result)) => result,
+            Some(Err(TryRecvError::Empty)) => {
+                // Keep drawing so the result appears as soon as it is ready.
+                ctx.request_repaint_after(Duration::from_millis(30));
+                return;
+            }
+            Some(Err(TryRecvError::Disconnected)) => {
+                self.job = None;
+                self.check_again = false;
+                return;
+            }
+        };
+        let text = self.job.take().expect("a job was polled").text;
+        self.apply_check(received, text);
+        if self.check_again || self.checked.as_ref().is_some_and(|(_, t)| t != &self.text) {
+            self.check_again = false;
+            self.start_check(settings);
+        }
     }
 
     /// Line (from 1) of the last TOML syntax error, while the text is unchanged.
@@ -297,6 +377,7 @@ impl TxPage {
         tx: &mut TxSession,
         allow_device: bool,
     ) {
+        self.poll_check(ui.ctx(), settings);
         egui::Panel::top("tx_toolbar").show(ui, |ui| {
             self.toolbar(ui, settings, devices);
         });
@@ -310,7 +391,7 @@ impl TxPage {
             let now = Instant::now();
             if now >= at {
                 self.recheck_at = None;
-                self.check(settings);
+                self.start_check(settings);
             } else {
                 ui.ctx().request_repaint_after(at - now);
             }
@@ -421,7 +502,7 @@ impl TxPage {
                 .on_hover_text("Check the configuration (with the output and duration below) and show the multiplex")
                 .clicked()
             {
-                self.check(settings);
+                self.start_check(settings);
             }
         });
         ui.horizontal_wrapped(|ui| {

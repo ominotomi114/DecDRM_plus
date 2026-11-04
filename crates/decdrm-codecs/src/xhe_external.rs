@@ -113,6 +113,22 @@ fn failed(what: impl Into<String>) -> CodecError {
     CodecError::External(what.into())
 }
 
+/// On Windows, start the helper without a console window (`CREATE_NO_WINDOW`). DecDRM's
+/// GUI program has no console of its own, so Windows would otherwise open one for the
+/// console-subsystem helper every time it starts — and it starts once per configuration
+/// that gets checked.
+#[cfg(windows)]
+fn no_console_window(cmd: &mut Command) {
+    // Rust note: `CommandExt` is a Windows-only extension trait; importing it brings
+    // `creation_flags` into scope.
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    cmd.creation_flags(CREATE_NO_WINDOW);
+}
+
+#[cfg(not(windows))]
+fn no_console_window(_cmd: &mut Command) {}
+
 fn spawn(cfg: &ExternalConfig, probe: bool) -> Result<(Child, ChildStdin, BufReader<ChildStdout>, ExternalInfo), CodecError> {
     let path = host_path().ok_or_else(|| failed(format!("no external xHE-AAC encoder (looked for {HOST_DIR}\\{HOST_FILE} beside the executable; set {HOST_ENV} to override)")))?;
     let mut cmd = Command::new(&path);
@@ -127,6 +143,7 @@ fn spawn(cfg: &ExternalConfig, probe: bool) -> Result<(Child, ChildStdin, BufRea
     if probe {
         cmd.arg("--probe");
     }
+    no_console_window(&mut cmd);
     let mut child = cmd.spawn().map_err(|e| failed(format!("cannot start {}: {e}", path.display())))?;
     let stdin = child.stdin.take().expect("piped stdin");
     let stdout = child.stdout.take().expect("piped stdout");
