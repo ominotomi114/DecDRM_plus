@@ -33,8 +33,8 @@ encoding) and libopus.
 - **Samplerates**: Added support for different samplerates both in RX and TX modes (48 kHz, 96 kHz, 120 kHz and 192 kHz).
 - **VHF channel simulators:** New VHF channel simulators that recreate different types of multipath propagation, such as rural, urban and hilly terrain, with an option to simulate receiver's movement with certain speed, like 100 km/h.
 - **Mode E auto-detection and pinning**: The receiver is capable of accurately detecting DRM+ on the input and picking precise DC frequency. As an alternative, manual Mode E tuning is available.
-- **Dropout concealment**: Simple cosmetic feature that masks brief audio dropouts with a reverb-like effect, making them less noticable.
-- **External xHE-AAC encoder**: If you own a licensed copy of [Spark Modulator](https://www.drm-sender.de/), the encoder can theoretically utilize it's `fhgio.dll` from `lib32` with a separately compiled utility. (The compilation script is `scripts/build-xhe-host.bat`) This method provides highest quality xHE-AAC encoding, but I do not recommend it at all. It is too risky.
+- **Dropout concealment**: Simple cosmetic feature that masks brief audio dropouts with a reverb-like effect, making them less noticeable.
+- **External xHE-AAC encoder**: If you own a licensed copy of [Spark Modulator](https://www.drm-sender.de/), the encoder is capable of utilize its `fhgio.dll` from `lib32` with a separately compiled utility (the compilation script is `scripts/build-xhe-host.bat`). This method provides highest quality xHE-AAC encoding, but I do not recommend it as the DLL is commercial, and it is unknown whether you can use it outside the product it came with is a question for it's licensor.
 
 ![DecDRM decoding DRM+ encoded by another DecDRM instance with channel simulator enabled](docs/images/drm_plus_rx.png) 
 
@@ -108,8 +108,8 @@ encoding) and libopus.
 ## Building
 
 ```bash
-git clone --recursive https://github.com/CasualArclamp/DecDRM.git
-cd DecDRM
+git clone --recursive https://github.com/ominotomi114/DecDRM_plus.git
+cd DecDRM_plus
 cargo build --release
 ```
 
@@ -120,9 +120,8 @@ development package (`libasound2-dev`).
 **Portable Windows executables**: `decdrm-gui.exe` and `decdrm.exe` that run on any
 64-bit Windows 10/11 with nothing installed (C runtime linked statically, DAC with its
 weights built in, about 320 MB each) are attached to the
-[releases](https://github.com/CasualArclamp/DecDRM/releases), or built into `exe\`
-with `powershell -ExecutionPolicy Bypass -File scripts\build-portable.ps1` (after
-`decdrm models download dac`).
+[releases](https://github.com/ominotomi114/DecDRM_plus/releases), or built into `exe\`
+using the `.bat` scripts in the `scripts/` folder.
 
 ## Usage
 
@@ -202,11 +201,11 @@ covered by patents licensed through Via LA.
 
 The optional external xHE-AAC encoder (`codec = "xhe-aac-external"`) is not part of this
 repository: [`tools/xhe-host`](tools/xhe-host/README.md) is a small 32-bit host process
-that loads Fraunhofer IIS's commercial DRM xHE-AAC/HE-AAC encoder DLL. DecDRM does not
+that loads Fraunhofer IIS's commercial DRM xHE-AAC/HE-AAC encoder DLL. This repository does not
 include, download or redistribute that DLL, and no release contains it. If you own a
 licensed copy — for example as part of the commercial
 [Spark Modulator](https://www.drm-sender.de/) DRM+ transmitter, whose `lib32` folder
-holds it — the helper can load it; whether that licence allows using it outside the
+holds it — DecDRM can use it via provided side utility; whether that licence allows using it outside the
 product it came with is between you and your licensor. The helper does not touch the
 DLL's embedded licence blob: the DLL itself decides what it will encode. Without the
 helper, or without the DLL beside it, DecDRM simply does not offer those codec options.
