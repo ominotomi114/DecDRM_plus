@@ -14,12 +14,12 @@ FDK-AAC (AAC, HE-AAC v1/v2, xHE-AAC decoding; AAC/HE-AAC encoding), libxaac (xHE
 encoding) and libopus.
 
 ![DecDRM receiving a Deutsche Welle recording: spectrum, FAC/SDC/MSC constellations, the service with its text message, HE-AAC v2 audio and Journaline news pages](docs/images/receiver.png)
-
 *Receiving a Deutsche Welle recording (mode B, 10 kHz, 64-QAM): HE-AAC v2 stereo audio, text messages, the broadcast clock and Journaline news pages.*
 
-![The DecDRM transmitter on the air: the station form with the multiplex bar, channel and service settings, and the status panel with live meters, the output spectrum and the services](docs/images/transmitter.png)
 
+![The DecDRM transmitter on the air: the station form with the multiplex bar, channel and service settings, and the status panel with live meters, the output spectrum and the services](docs/images/transmitter.png)
 *Transmitting live into a virtual audio cable: an xHE-AAC stereo service with text messages, a slideshow and a programme guide in the more strongly protected part A (outlined), plus a Journaline news service; live input and output meters and the output spectrum on the right.*
+
 
 > **Status:** the receiver decodes audio, text messages and data services from every
 > DRM test recording available here (modes A/B/C, 9–20 kHz, real and I/Q inputs,
@@ -37,12 +37,12 @@ encoding) and libopus.
 - **External xHE-AAC encoder**: If you own a licensed copy of [Spark Modulator](https://www.drm-sender.de/), the encoder is capable of utilize its `fhgio.dll` from `lib32` with a separately compiled utility (the compilation script is `scripts/build-xhe-host.bat`). This method provides highest quality xHE-AAC encoding, but I do not recommend it as the DLL is commercial, and it is unknown whether you can use it outside the product it came with is a question for it's licensor.
 
 ![DecDRM decoding DRM+ encoded by another DecDRM instance with channel simulator enabled](docs/images/drm_plus_rx.png) 
-
 *Decoding DRM+ signal encoded by another DecDRM instance with channel simulator enabled.*
 
-![DecDRM decoding real DRM+ recording](docs/images/drm_plus_real_rx.png) 
 
+![DecDRM decoding real DRM+ recording](docs/images/drm_plus_real_rx.png) 
 *Decoding DRM+ signal from a real recording.*
+
 
 ## Highlights
 
