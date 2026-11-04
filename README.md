@@ -40,6 +40,10 @@ encoding) and libopus.
 
 *Decoding DRM+ signal encoded by another DecDRM instance with channel simulator enabled.*
 
+![DecDRM decoding real DRM+ recording](docs/images/drm_plus_real_rx.png) 
+
+*Decoding DRM+ signal from a real recording.*
+
 ## Highlights
 
 - **Sensitivity close to the theoretical limit.** MSC bit error rate 10⁻⁴ after decoding
