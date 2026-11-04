@@ -2,7 +2,7 @@
 
 A Digital Radio Mondiale (DRM30 and DRM+) receiver **and transmitter** written in Rust.
 
-> This is a fork of the [original DecDRM](https://github.com/CasualArclamp/DecDRM) with new additional features, with the most noticable being full DRM+ support.
+> This is a fork of the [original DecDRM](https://github.com/CasualArclamp/DecDRM) with new additional features, with the most noticeable being full DRM+ support.
 
 DecDRM decodes DRM robustness modes A–D in every channel bandwidth (4.5–20 kHz) and
 DRM+ (mode E, 100 kHz) from recordings or a live sound card (for example a virtual audio
@@ -34,7 +34,7 @@ encoding) and libopus.
 - **VHF channel simulators:** New VHF channel simulators that recreate different types of multipath propagation, such as rural, urban and hilly terrain, with an option to simulate receiver's movement with certain speed, like 100 km/h.
 - **Mode E auto-detection and pinning**: The receiver is capable of accurately detecting DRM+ on the input and picking precise DC frequency. As an alternative, manual Mode E tuning is available.
 - **Dropout concealment**: Simple cosmetic feature that masks brief audio dropouts with a reverb-like effect, making them less noticeable.
-- **External xHE-AAC encoder**: If you own a licensed copy of [Spark Modulator](https://www.drm-sender.de/), the encoder is capable of utilize its `fhgio.dll` from `lib32` with a separately compiled utility (the compilation script is `scripts/build-xhe-host.bat`). This method provides highest quality xHE-AAC encoding, but I do not recommend it as the DLL is commercial, and it is unknown whether you can use it outside the product it came with is a question for it's licensor.
+- **External xHE-AAC encoder**: If you own a licensed copy of [Spark Modulator](https://www.drm-sender.de/), the encoder is capable of utilize its `fhgio.dll` from `lib32` with a separately compiled utility (the compilation script is `scripts/build-xhe-host.bat`).This method gives the highest quality xHE-AAC encoding. However, I don't recommend it: the DLL is commercial, and whether your licence permits using it outside the product it came with is a question for its licensor.
 
 ![DecDRM decoding DRM+ encoded by another DecDRM instance with channel simulator enabled](docs/images/drm_plus_rx.png) 
 *Decoding DRM+ signal encoded by another DecDRM instance with channel simulator enabled.*
@@ -209,7 +209,7 @@ that loads Fraunhofer IIS's commercial DRM xHE-AAC/HE-AAC encoder DLL. This repo
 include, download or redistribute that DLL, and no release contains it. If you own a
 licensed copy — for example as part of the commercial
 [Spark Modulator](https://www.drm-sender.de/) DRM+ transmitter, whose `lib32` folder
-holds it — DecDRM can use it via provided side utility; whether that licence allows using it outside the
+holds it — DecDRM can use it through side utility in [`tools/xhe-host`](tools/xhe-host/README.md); whether that licence allows using it outside the
 product it came with is between you and your licensor. The helper does not touch the
 DLL's embedded licence blob: the DLL itself decides what it will encode. Without the
-helper, or without the DLL beside it, DecDRM simply does not offer those codec options.
+helper, or without the DLL beside it, DecDRM simply does not offer those codec options. Use it at your own risk.
