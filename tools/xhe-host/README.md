@@ -1,9 +1,9 @@
 # decdrm-xhe-host
 
 A 32-bit bridge to Fraunhofer IIS's DRM xHE-AAC / HE-AAC encoder DLL (`fhgio.dll` or
-`fhgxaac.dll` — the library shipped with the *Spark Modulator* DRM+ transmitter). DecDRM's
-own executables are 64-bit and cannot load it, so this small host process does the encoding
-and talks to DecDRM over stdio.
+`fhgxaac.dll`) — a commercial component that you must hold a licence for (see
+[Licensing](#licensing) below). DecDRM's own executables are 64-bit and cannot load it,
+so this small host process does the encoding and talks to DecDRM over stdio.
 
 **It is not built by the workspace and not shipped.** The DLL is a commercial Fraunhofer
 encoder under its embedded licence blob; build this locally, put `fhgio.dll` beside it in
@@ -61,12 +61,13 @@ Then, repeatedly:
 
 ```text
 NEED <n>       the host reads n f32 samples (little-endian) from stdin
-FRAME <len>    followed by len bytes of single super frame (plain, not XORed)
+FRAME <len>    followed by len bytes of single super frame (plain bytes)
 ERROR <code> <text>   the encoder failed; the host exits
 ```
 
-The JNI wrappers in the DLL XOR the output with a key; calling the internal entry points
-directly (as here) returns plain bytes, so no de-obfuscation is needed.
+The DLL's JNI exports expect a Java VM, which DecDRM has no reason to embed, so the host
+calls the encoder entry points of the module it loaded. Nothing in the DLL's licence blob
+is touched: the blob still decides which profiles may be instantiated.
 
 ## Parameters and limits (from the DLL itself)
 
@@ -74,3 +75,17 @@ directly (as here) returns plain bytes, so no de-obfuscation is needed.
   DRM30 needs ≤ 71960 (DRM+ up to 96 kbit/s verified).
 * One encoder instance per process; close exactly once (closing an invalid handle crashes).
 * Not thread-safe: one process, one stream.
+
+## Licensing
+
+DecDRM neither includes, downloads nor redistributes the DLL, and it must never appear in a
+commit or a release (`.gitignore` refuses `*.dll` anywhere in the tree). You need a copy
+licensed to you — a commercial DRM transmitter that bundles it is one source, and whether
+its licence permits use outside that product is between you and your licensor. The helper
+does not defeat or modify the DLL's embedded licence blob: the blob still decides which
+profiles may be instantiated (in our build the HE-AAC profile reports no instances, so only
+xHE-AAC is available), so this is not a way around the licensing.
+
+**Never redistribute it.** If you ever package `exe\` for somebody else, delete
+`exe\xhe\fhgio.dll` first — a zip with the DLL in it is a redistribution of a commercial
+binary, and no licence of ours covers it.

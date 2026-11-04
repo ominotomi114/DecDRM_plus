@@ -1359,8 +1359,8 @@ needs 120 or 192 kHz; the input is resampled to whatever the receiver is configu
 
   So it is a side tool, not part of the program. `tools/xhe-host` (a ~330-line C shim) loads the
   DLL in a 32-bit process and speaks a line protocol over stdio — `OK`, `NEED <samples>`,
-  `FRAME <bytes>` — calling the DLL's internal DRM+ entry points directly: the JNI wrappers only
-  marshal arguments and XOR the output, so no JVM is involved. `scripts\build-xhe-host.bat` builds
+  `FRAME <bytes>` — calling the DLL's DRM+ entry points directly, so no JVM is involved.
+  `scripts\build-xhe-host.bat` builds
   it into `exe\xhe\` beside the portable executables, copying `fhgio.dll` in when it is in
   `refs\dll`. DecDRM looks for `xhe\decdrm-xhe-host.exe` beside itself: without the folder — or
   without the tool in it — the external encoder is simply absent, and nothing else changes.

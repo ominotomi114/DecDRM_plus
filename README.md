@@ -192,7 +192,12 @@ check before distributing binaries. AAC, xHE-AAC (MPEG-D USAC) and DRM technolog
 covered by patents licensed through Via LA.
 
 The optional external xHE-AAC encoder (`codec = "xhe-aac-external"`) is not part of this
-repository either: [`tools/xhe-host`](tools/xhe-host/README.md) is a small 32-bit host
-process that loads Fraunhofer IIS's commercial DRM encoder DLL, which users must supply
-themselves and which is never committed, bundled or redistributed here. Without the
-helper (or without the DLL beside it) DecDRM simply does not offer those codec options.
+repository: [`tools/xhe-host`](tools/xhe-host/README.md) is a small 32-bit host process
+that loads Fraunhofer IIS's commercial DRM xHE-AAC/HE-AAC encoder DLL. DecDRM does not
+include, download or redistribute that DLL, and no release contains it. If you own a
+licensed copy — for example as part of the commercial
+[Spark Modulator](https://www.drm-sender.de/) DRM+ transmitter, whose `lib32` folder
+holds it — the helper can load it; whether that licence allows using it outside the
+product it came with is between you and your licensor. The helper does not touch the
+DLL's embedded licence blob: the DLL itself decides what it will encode. Without the
+helper, or without the DLL beside it, DecDRM simply does not offer those codec options.
