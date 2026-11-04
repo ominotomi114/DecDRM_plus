@@ -931,6 +931,20 @@ const CODECS: &[(&str, &str)] = &[
     ("opus", "Opus"),
     ("dac", "DAC (neural codec)"),
 ];
+
+/// The codecs the picker offers: DAC when it is built in, and the external xHE-AAC encoder
+/// when its helper is beside the executable — the one codec that depends on an optional
+/// folder. Either stays listed when the document already names it, so a service does not
+/// silently lose its codec and the plan can say what is missing.
+fn codec_choices(current: &str, dac_built: bool, external: bool) -> Vec<(&'static str, &'static str)> {
+    let c = canon(current);
+    CODECS
+        .iter()
+        .copied()
+        .filter(|(v, _)| *v != "dac" || dac_built || canon(v) == c)
+        .filter(|(v, _)| *v != "xhe-aac-external" || external || canon(v) == c)
+        .collect()
+}
 const CORE_RATES: &[(&str, &str)] = &[("12000", "12 kHz core (5 frames per 400 ms)"), ("24000", "24 kHz core (10 frames)")];
 /// Mode E's AAC super frame is 200 ms, so its core rates are 24 and 48 kHz (§5.4.1); 48 kHz
 /// is only allowed without SBR, so a codec that always uses SBR has one option.
@@ -1011,15 +1025,9 @@ fn audio_settings(
     let codec = get_str(audio, "codec").unwrap_or_else(|| "he-aac".into());
     let c = canon(&codec);
     // The external xHE-AAC encoder exists only when its helper (the `xhe` folder beside
-    // the executable) is there; the entry then appears, and vanishes with it. A file that
-    // already names it keeps showing it even if the helper has gone (the plan will say why).
+    // the executable) is there; the entry then appears, and vanishes with it.
     let external = decdrm_codecs::xhe_external::available();
-    let codecs: Vec<(&str, &str)> = CODECS
-        .iter()
-        .copied()
-        .filter(|(v, _)| *v != "dac" || cfg!(feature = "dac") || canon(v) == c)
-        .filter(|(v, _)| *v != "xhe-aac-external" || external || canon(v) == c)
-        .collect();
+    let codecs = codec_choices(&codec, cfg!(feature = "dac"), external);
     grid(ui, ("tx_form_audio", i), |ui| {
         row_label(ui, "Codec");
         if let Some(v) = combo(ui, ("tx_codec", i), &codec, &codecs, 280.0) {
@@ -2334,10 +2342,28 @@ hierarchical = true
         assert_eq!(values(core_rates(true, false)), ["24000", "48000"]);
     }
 
+    /// The external xHE-AAC encoder is offered only when its helper is beside the
+    /// executable, and a document that already names it keeps the entry (so the plan can
+    /// say what is missing instead of the codec silently changing).
+    #[test]
+    fn the_external_encoder_is_offered_only_with_its_helper() {
+        let has = |list: &[(&str, &str)], v: &str| list.iter().any(|(name, _)| *name == v);
+        let without = codec_choices("aac", true, false);
+        assert!(has(&without, "aac"), "the other codecs stay");
+        assert!(!has(&without, "xhe-aac-external"), "no helper, no entry");
+        assert!(has(&codec_choices("aac", true, true), "xhe-aac-external"), "helper found");
+        assert!(
+            has(&codec_choices("xhe-aac-external", true, false), "xhe-aac-external"),
+            "a document naming it keeps the entry"
+        );
+        // DAC follows the same rule with its build feature.
+        assert!(!has(&codec_choices("aac", false, false), "dac"));
+        assert!(has(&codec_choices("aac", true, false), "dac"));
+    }
+
     /// The mode E rules must not touch a document already in order.
     #[test]
-    fn a_valid_mode_e_document_is_left_alone() {
-        let mut doc: DocumentMut = "[channel]\nmode = \"E\"\noccupancy = 0\nmsc_mode = \"16-QAM\"\nsdc_mode = \"4-QAM\"\ninterleaving = \"long\"\n"
+    fn a_valid_mode_e_document_is_left_alone() {        let mut doc: DocumentMut = "[channel]\nmode = \"E\"\noccupancy = 0\nmsc_mode = \"16-QAM\"\nsdc_mode = \"4-QAM\"\ninterleaving = \"long\"\n"
             .parse()
             .unwrap();
         assert!(!repair_channel_for_mode(&mut doc), "nothing to repair");
