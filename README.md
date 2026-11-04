@@ -34,7 +34,7 @@ encoding) and libopus.
 - **VHF channel simulators:** New VHF channel simulators that recreate different types of multipath propagation, such as rural, urban and hilly terrain, with an option to simulate receiver's movement with certain speed, like 100 km/h.
 - **Mode E auto-detection and pinning**: The receiver is capable of accurately detecting DRM+ on the input and picking precise DC frequency. As an alternative, manual Mode E tuning is available.
 - **Dropout concealment**: Simple cosmetic feature that masks brief audio dropouts with a reverb-like effect, making them less noticeable.
-- **External xHE-AAC encoder**: If you own a licensed copy of [Spark Modulator](https://www.drm-sender.de/), the encoder is capable of utilize its `fhgio.dll` from `lib32` with a separately compiled utility (the compilation script is `scripts/build-xhe-host.bat`).This method gives the highest quality xHE-AAC encoding. However, I don't recommend it: the DLL is commercial, and whether your licence permits using it outside the product it came with is a question for its licensor.
+- **External xHE-AAC encoder**: If you own a licensed copy of [Spark Modulator](https://www.drm-sender.de/), the encoder is capable of using its `fhgio.dll` from `lib32` with a separately compiled utility (the compilation script is `scripts/build-xhe-host.bat`). This method gives the highest quality xHE-AAC encoding. However, I don't recommend it: the DLL is commercial, and whether your licence permits using it outside the product it came with is a question for its licensor.
 
 ![DecDRM decoding DRM+ encoded by another DecDRM instance with channel simulator enabled](docs/images/drm_plus_rx.png) 
 *Decoding DRM+ signal encoded by another DecDRM instance with channel simulator enabled.*
