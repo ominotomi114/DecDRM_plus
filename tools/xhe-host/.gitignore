@@ -1,0 +1,6 @@
+# The built host, and the Fraunhofer DLL copied in for local use, stay out of git.
+*.exe
+*.obj
+*.pdb
+fhgio.dll
+fhgxaac.dll
