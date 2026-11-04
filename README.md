@@ -41,7 +41,7 @@ encoding) and libopus.
 
 
 ![DecDRM decoding real DRM+ recording](docs/images/drm_plus_real_rx.png) 
-*Decoding DRM+ signal from a real recording.*
+*Decoding DRM+ signal from a [real recording](https://www.dropbox.com/s/a5t2f0v69ju2j5p/DRM_20200803_073256Z.wav?dl=1) from [this radioscanner.ru thread](https://www.radioscanner.ru/forum/topic38832.html). You can download the recording and try decoding it in DecDRM yourself.*
 
 
 ## Highlights
