@@ -18,7 +18,7 @@
 use crate::afs::AfsSettings;
 use crate::error::{Result, StationError};
 use decdrm_core::fac::{Interleaving, LANGUAGES, MscMode, PROGRAMME_TYPES, SdcMode};
-use decdrm_core::params::{RobustnessMode, SpectrumOccupancy};
+use decdrm_core::params::{RobustnessMode, SpectrumOccupancy, WorkingRate};
 use serde::de::{self, Visitor};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt;
@@ -142,7 +142,8 @@ pub(crate) fn line_column(text: &str, offset: usize) -> (usize, usize) {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct ChannelSettings {
-    /// Robustness mode A–D (ES 201 980 §8.1).
+    /// Robustness mode A–E (ES 201 980 §8.1). Mode E is DRM+ (VHF, 100 kHz raster) and
+    /// needs a working sample rate of at least 100 kHz: it is rejected at 48 and 96 kHz.
     pub mode: Mode,
     /// Spectrum occupancy 0–5: 4.5, 5, 9, 10, 18 or 20 kHz. Modes C and D only exist
     /// with 3 and 5.
@@ -162,6 +163,15 @@ pub struct ChannelSettings {
     pub protection_b: u8,
     /// Protection level of the hierarchical stream (HMsym/HMmix only), 0–3.
     pub protection_hierarchical: u8,
+    /// Working sample rate of the transmit chain: 48 (default), 96, 120 or 192 kHz. Modes
+    /// A–D run at 48 kHz; robustness mode E (DRM+) needs 120 or 192 kHz, because its
+    /// carriers reach ±47.11 kHz.
+    ///
+    /// Named `working_sample_rate` rather than `sample_rate` to keep it distinct from the
+    /// *audio* codec's `[audio] sample_rate`, which is a different thing (the rate the
+    /// encoder runs at). Omitted from the file when it is the 48 kHz default.
+    #[serde(skip_serializing_if = "RateSetting::is_default")]
+    pub working_sample_rate: RateSetting,
 }
 
 impl Default for ChannelSettings {
@@ -175,6 +185,7 @@ impl Default for ChannelSettings {
             protection_a: 0,
             protection_b: 1,
             protection_hierarchical: 0,
+            working_sample_rate: RateSetting(WorkingRate::R48),
         }
     }
 }
@@ -215,9 +226,22 @@ pub struct OutputSettings {
     /// I/Q output: I on the right channel instead of the left.
     pub iq_swap: bool,
     /// RMS level of each output channel, dBFS (the OFDM peaks are about 10 dB higher).
+    /// A `[simulate]` channel adds fading gain on top: there, leave about 6 dB more
+    /// headroom (about −21 dBFS), or use `papr_db`.
     pub level_dbfs: f64,
     /// Apply the transmit channel filter (removes the OFDM side lobes).
     pub band_limit: bool,
+    /// PAPR reduction: knee of the limiter above the RMS of the baseband, dB (e.g. 6 =
+    /// "compress everything above 2σ"). `None` (the default) leaves the peaks alone. With
+    /// it, the peaks are bounded by the knee (a clip) or a little above it (tanh), so the
+    /// level can be raised by ~4.6 dB (clip) or ~3.5 dB (tanh) at a 6 dB knee before the
+    /// output clips. It costs in-band distortion — 31.6 dB MER for a clip, 23.6 dB for tanh
+    /// at a 6 dB knee — so it is a choice, not a free lunch.
+    pub papr_db: Option<f64>,
+    /// Which limiter `papr_db` uses: `"clip"` (hard, transparent below the knee; the
+    /// default and the better in-band trade) or `"tanh"` (smooth, wider-spectrum
+    /// distortion, but ~11 dB worse MER for the same peak).
+    pub papr_law: PaprLaw,
 }
 
 impl Default for OutputSettings {
@@ -233,6 +257,8 @@ impl Default for OutputSettings {
             iq_swap: false,
             level_dbfs: decdrm_core::tx::output::DEFAULT_LEVEL_DBFS,
             band_limit: true,
+            papr_db: None,
+            papr_law: PaprLaw::Clip,
         }
     }
 }
@@ -287,8 +313,43 @@ impl MdiSettings {
     }
 }
 
-/// receiver clock error and white noise before it reaches the outputs — a test signal
-/// for receivers. See [`decdrm_core::channel`].
+/// A VHF propagation preset for DRM+ (mode E): the COST 207 delay profiles of
+/// [`decdrm_core::channel::vhf`], every tap fading with a classical Doppler spectrum at
+/// `speed_kmh` on `carrier_mhz` — and not fading at all when parked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum VhfProfile {
+    /// Rural area: four taps within 0.6 µs.
+    Ra,
+    /// Typical urban: six taps over 5 µs.
+    Tu6,
+    /// Hilly terrain: eight taps in two clusters out to 17.2 µs.
+    Ht,
+}
+
+impl VhfProfile {
+    pub const ALL: [Self; 3] = [Self::Ra, Self::Tu6, Self::Ht];
+
+    /// Name as written in a station file (and offered by the form).
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Ra => "ra",
+            Self::Tu6 => "tu6",
+            Self::Ht => "ht",
+        }
+    }
+}
+
+impl std::fmt::Display for VhfProfile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
+/// The channel simulator (`[simulate]`): the signal passes through a channel model — ES
+/// 201 980 annex B's HF models, or the COST 207 VHF ones for DRM+ — with a frequency
+/// offset, a receiver clock error and white noise before it reaches the outputs: a test
+/// signal for receivers. See [`decdrm_core::channel`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SimulateSettings {
@@ -310,6 +371,19 @@ pub struct SimulateSettings {
     /// Seed of the fading and noise generators (the same seed gives the same signal).
     #[serde(default = "default_seed")]
     pub seed: u64,
+    /// A VHF propagation preset (DRM+). When set, `channel` is ignored and the taps come
+    /// from COST 207 for `speed_kmh` on `carrier_mhz` — the profiles mode E's guard and
+    /// bandwidth were designed against. Leave unset for the annex B HF models.
+    #[serde(default)]
+    pub vhf: Option<VhfProfile>,
+    /// Speed of the simulated receiver, km/h; 0 (the default) is parked: multipath but no
+    /// fading. Only used with `vhf`.
+    #[serde(default)]
+    pub speed_kmh: f64,
+    /// Carrier frequency of the simulated VHF band, MHz — Band I 47–68, Band II 87.5–108,
+    /// Band III 174–230. Only used with `vhf`.
+    #[serde(default = "default_carrier_mhz")]
+    pub carrier_mhz: f64,
 }
 
 fn default_channel_model() -> u8 {
@@ -320,16 +394,45 @@ fn default_seed() -> u64 {
     1
 }
 
+fn default_carrier_mhz() -> f64 {
+    200.0
+}
+
 impl SimulateSettings {
     /// A simulation of DRM channel `channel` at `snr_db` (none: no noise).
     pub fn new(channel: u8, snr_db: Option<f64>) -> Self {
-        Self { channel, snr_db, frequency_offset_hz: 0.0, sample_rate_offset_ppm: 0.0, seed: default_seed() }
+        Self {
+            channel,
+            snr_db,
+            frequency_offset_hz: 0.0,
+            sample_rate_offset_ppm: 0.0,
+            seed: default_seed(),
+            vhf: None,
+            speed_kmh: 0.0,
+            carrier_mhz: default_carrier_mhz(),
+        }
+    }
+
+    /// A VHF (COST 207) simulation at `speed_kmh` on `carrier_mhz`, at `snr_db`.
+    pub fn vhf(profile: VhfProfile, speed_kmh: f64, carrier_mhz: f64, snr_db: Option<f64>) -> Self {
+        Self { vhf: Some(profile), speed_kmh, carrier_mhz, ..Self::new(1, snr_db) }
     }
 
     /// The simulator's settings; `None` for an invalid channel model number.
     pub fn channel_config(&self) -> Option<decdrm_core::channel::ChannelConfig> {
+        let model = match self.vhf {
+            Some(profile) => {
+                let carrier_hz = self.carrier_mhz * 1e6;
+                match profile {
+                    VhfProfile::Ra => decdrm_core::channel::vhf::cost207_ra(self.speed_kmh, carrier_hz),
+                    VhfProfile::Tu6 => decdrm_core::channel::vhf::cost207_tu6(self.speed_kmh, carrier_hz),
+                    VhfProfile::Ht => decdrm_core::channel::vhf::cost207_ht(self.speed_kmh, carrier_hz),
+                }
+            }
+            None => decdrm_core::channel::ChannelModel::drm(self.channel)?,
+        };
         Some(decdrm_core::channel::ChannelConfig {
-            model: decdrm_core::channel::ChannelModel::drm(self.channel)?,
+            model,
             snr_db: self.snr_db,
             freq_offset_hz: self.frequency_offset_hz,
             sample_rate_offset_ppm: self.sample_rate_offset_ppm,
@@ -337,13 +440,20 @@ impl SimulateSettings {
         })
     }
 
-    /// One-line description, e.g. `DRM channel 3 (US Consortium), SNR 15.0 dB`.
+    /// One-line description, e.g. `DRM channel 3 (US Consortium), SNR 15.0 dB` or
+    /// `VHF tu6 (COST 207), 100 km/h at 200 MHz, SNR 20.0 dB`.
     pub fn describe(&self) -> String {
-        let mut s = format!(
-            "DRM channel {} ({})",
-            self.channel,
-            decdrm_core::channel::ChannelModel::drm_name(self.channel)
-        );
+        let mut s = match self.vhf {
+            Some(profile) => format!(
+                "VHF {profile} (COST 207), {:.0} km/h at {:.0} MHz",
+                self.speed_kmh, self.carrier_mhz
+            ),
+            None => format!(
+                "DRM channel {} ({})",
+                self.channel,
+                decdrm_core::channel::ChannelModel::drm_name(self.channel)
+            ),
+        };
         match self.snr_db {
             Some(snr) => s += &format!(", SNR {snr:.1} dB"),
             None => s += ", no noise",
@@ -452,11 +562,20 @@ impl ServiceSettings {
 /// The audio of an audio service. The stream gets whatever MSC capacity the data
 /// applications leave (split between audio services by `share`), and the encoder's
 /// bit rate follows from the stream length.
+///
+/// Encoder-specific settings live beside the shared ones: DAC reads `bandwidth_kbps` and
+/// `side_bandwidth_kbps`. The external xHE-AAC encoder takes none today — its coding,
+/// sampling rate and SDC config come from the encoder, and its bit rate from the stream
+/// length — and any option it gains will be named `xhe_ext_…`, so the shared fields stay
+/// unambiguous. `deny_unknown_fields` makes a misspelling an error rather than a silently
+/// ignored setting.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AudioSettings {
     /// aac, he-aac (AAC + SBR), he-aac-v2 (AAC + SBR + parametric stereo), xhe-aac
-    /// (MPEG-D USAC), opus or dac (DecDRM's neural codec extension, 24 kHz mono).
+    /// (MPEG-D USAC), xhe-aac-external (USAC through the optional external encoder beside
+    /// the executables, when its `xhe` folder is there), opus or dac (DecDRM's neural
+    /// codec extension, 24 kHz mono).
     pub codec: Codec,
     /// AAC core sampling rate: 12000 (5 frames per 400 ms) or 24000 (10 frames).
     /// Default: 24000 for AAC, 12000 for HE-AAC and HE-AAC v2. Not used by Opus
@@ -843,9 +962,40 @@ string_setting!(
         "b" => Ok(Mode(RobustnessMode::B)),
         "c" => Ok(Mode(RobustnessMode::C)),
         "d" => Ok(Mode(RobustnessMode::D)),
-        _ => Err(format!("unknown robustness mode \"{s}\" (use A, B, C or D)")),
+        "e" | "drm" | "drmplus" => Ok(Mode(RobustnessMode::E)),
+        _ => Err(format!("unknown robustness mode \"{s}\" (use A, B, C, D or E)")),
     },
     |m: Mode| m.0.to_string()
+);
+
+/// Working sample rate of the transmit chain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct RateSetting(pub WorkingRate);
+
+impl RateSetting {
+    /// The default (48 kHz), which is not written to the file.
+    pub fn is_default(&self) -> bool {
+        self.0 == WorkingRate::R48
+    }
+}
+
+string_setting!(
+    RateSetting,
+    |s: &str| {
+        let n: u32 = norm(s)
+            .trim_end_matches("khz")
+            .trim_end_matches("hz")
+            .trim()
+            .parse()
+            .map_err(|_| format!("unknown sample rate \"{s}\" (use 48, 96, 120 or 192 kHz)"))?;
+        // Accept both kHz (48) and Hz (48000) spellings.
+        let hz = if n < 1000 { n * 1000 } else { n };
+        WorkingRate::new(hz)
+            .map(RateSetting)
+            .ok_or_else(|| format!("unsupported sample rate {hz} Hz (use 48000, 96000, 120000 or 192000)"))
+    },
+    |r: RateSetting| format!("{}kHz", r.0.hz() / 1000)
 );
 
 /// MSC constellation.
@@ -856,13 +1006,16 @@ pub struct MscModeSetting(pub MscMode);
 string_setting!(
     MscModeSetting,
     |s: &str| match norm(s).as_str() {
+        "4qam" | "qam4" | "qpsk" | "4" => Ok(MscModeSetting(MscMode::Qam4)),
         "16qam" | "qam16" | "16qamsm" | "16" => Ok(MscModeSetting(MscMode::Qam16Sm)),
         "64qam" | "qam64" | "64qamsm" | "64" | "sm" => Ok(MscModeSetting(MscMode::Qam64Sm)),
         "hmsym" | "64qamhmsym" | "qam64hmsym" => Ok(MscModeSetting(MscMode::Qam64HmSym)),
         "hmmix" | "64qamhmmix" | "qam64hmmix" => Ok(MscModeSetting(MscMode::Qam64HmMix)),
-        _ => Err(format!("unknown MSC mode \"{s}\" (use 16-QAM, 64-QAM, HMsym or HMmix)")),
+        _ => Err(format!("unknown MSC mode \"{s}\" (use 4-QAM, 16-QAM, 64-QAM, HMsym or HMmix)")),
     },
     |m: MscModeSetting| match m.0 {
+        // The 4-QAM MSC exists only in mode E (§8.1); the station form rejects it elsewhere.
+        MscMode::Qam4 => "4-QAM",
         MscMode::Qam16Sm => "16-QAM",
         MscMode::Qam64Sm => "64-QAM",
         MscMode::Qam64HmSym => "HMsym",
@@ -880,11 +1033,13 @@ string_setting!(
     SdcModeSetting,
     |s: &str| match norm(s).as_str() {
         "4qam" | "qam4" | "qpsk" | "4" => Ok(SdcModeSetting(SdcMode::Qam4)),
+        "4qamr14" | "qam4r14" | "rate1/4" | "1/4" => Ok(SdcModeSetting(SdcMode::Qam4Rate25)),
         "16qam" | "qam16" | "16" => Ok(SdcModeSetting(SdcMode::Qam16)),
-        _ => Err(format!("unknown SDC mode \"{s}\" (use 4-QAM or 16-QAM)")),
+        _ => Err(format!("unknown SDC mode \"{s}\" (use 4-QAM, 16-QAM or 4-QAM rate 1/4)")),
     },
     |m: SdcModeSetting| match m.0 {
         SdcMode::Qam4 => "4-QAM",
+        SdcMode::Qam4Rate25 => "4-QAM rate 1/4",
         SdcMode::Qam16 => "16-QAM",
     }
     .to_string()
@@ -939,6 +1094,33 @@ string_setting!(
     .to_string()
 );
 
+/// PAPR limiter law of `[output] papr_db`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub enum PaprLaw {
+    /// Hard clip at the knee: exactly transparent below it, with a corner at it. The
+    /// default, and ~8 dB better in-band (MER) than `Tanh` at a 6 dB knee.
+    #[default]
+    Clip,
+    /// `tanh` soft limiter: smooth, so its distortion products decay faster, but it
+    /// compresses below the knee as well — ~11 dB worse MER than `Clip` at a 6 dB knee.
+    Tanh,
+}
+
+string_setting!(
+    PaprLaw,
+    |s: &str| match norm(s).as_str() {
+        "clip" | "hard" => Ok(PaprLaw::Clip),
+        "tanh" | "soft" => Ok(PaprLaw::Tanh),
+        _ => Err(format!("unknown PAPR limiter law \"{s}\" (use clip or tanh)")),
+    },
+    |l: PaprLaw| match l {
+        PaprLaw::Clip => "clip",
+        PaprLaw::Tanh => "tanh",
+    }
+    .to_string()
+);
+
 /// Audio codec of an audio service.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
@@ -951,6 +1133,11 @@ pub enum Codec {
     HeAacV2,
     /// xHE-AAC: MPEG-D USAC (ES 201 980 §5.3.1), mono or stereo, from about 5 kbit/s.
     XheAac,
+    /// xHE-AAC encoded by the **external** encoder: the optional 32-bit helper beside the
+    /// executables (`decdrm_codecs::xhe_external`), which drives Fraunhofer's DRM xHE-AAC
+    /// DLL. Not another codec on the air — the SDC and the receiver see xHE-AAC — only
+    /// another encoder, offered when the helper folder is present.
+    XheAacExternal,
     /// Opus (Dream's extension; not part of ES 201 980).
     Opus,
     /// DAC, the Descript Audio Codec (DecDRM's neural codec extension, 24 kHz mono,
@@ -965,16 +1152,20 @@ string_setting!(
         "heaac" | "heaacv1" | "aacsbr" | "aacplus" => Ok(Codec::HeAac),
         "heaacv2" | "aacps" | "eaacplus" => Ok(Codec::HeAacV2),
         "xheaac" | "xhe" | "usac" | "xheaacusac" => Ok(Codec::XheAac),
+        "xheaacexternal" | "xheexternal" | "external" | "xhedll" => Ok(Codec::XheAacExternal),
         "opus" => Ok(Codec::Opus),
         "dac" | "descriptaudiocodec" => Ok(Codec::Dac),
         "encodec" => Err("DecDRM's neural codec is now DAC: use codec = \"dac\" (EnCodec was replaced)".to_string()),
-        _ => Err(format!("unknown codec \"{s}\" (use aac, he-aac, he-aac-v2, xhe-aac, opus or dac)")),
+        _ => Err(format!(
+            "unknown codec \"{s}\" (use aac, he-aac, he-aac-v2, xhe-aac, xhe-aac-external, opus or dac)"
+        )),
     },
     |c: Codec| match c {
         Codec::Aac => "aac",
         Codec::HeAac => "he-aac",
         Codec::HeAacV2 => "he-aac-v2",
         Codec::XheAac => "xhe-aac",
+        Codec::XheAacExternal => "xhe-aac-external",
         Codec::Opus => "opus",
         Codec::Dac => "dac",
     }
@@ -1253,6 +1444,60 @@ code_setting_serde!(ProgrammeType, "programme type");
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mode_e_and_the_working_rate_round_trip() {
+        // Both spellings of the rate are accepted, in kHz and Hz.
+        assert_eq!("120".parse::<RateSetting>().unwrap().0, WorkingRate::R120);
+        assert_eq!("120kHz".parse::<RateSetting>().unwrap().0, WorkingRate::R120);
+        assert_eq!("192000".parse::<RateSetting>().unwrap().0, WorkingRate::R192);
+        assert_eq!("48".parse::<RateSetting>().unwrap().0, WorkingRate::R48);
+        assert!("100".parse::<RateSetting>().unwrap_err().contains("48000"), "the message lists the options");
+
+        // Mode E, and its spellings.
+        assert_eq!("e".parse::<Mode>().unwrap().0, RobustnessMode::E);
+        // `norm` strips punctuation, so the file spelling is "drmplus" or a bare "e" — and also
+        // "drm" ("DRM+" with the "+" stripped), which the station accepts.
+        assert_eq!("drmplus".parse::<Mode>().unwrap().0, RobustnessMode::E);
+        assert_eq!("DRM+".parse::<Mode>().unwrap().0, RobustnessMode::E);
+        // The mode error now names E too.
+        assert!("z".parse::<Mode>().unwrap_err().contains("E"));
+
+        // A default station is 48 kHz and writes no rate (it is the default), but a mode E
+        // station writes the one it needs.
+        let plain = ChannelSettings::default();
+        assert_eq!(plain.working_sample_rate.0, WorkingRate::R48);
+        assert!(RateSetting(WorkingRate::R48).is_default());
+        assert!(!RateSetting(WorkingRate::R192).is_default());
+    }
+
+    #[test]
+    fn mode_e_at_48_khz_is_rejected_with_a_reason() {
+        // The configuration check must refuse mode E at 48 kHz, and say why and what to do.
+        let text = "[channel]
+mode = \"E\"
+occupancy = 0
+";
+        let cfg = StationConfig::from_toml_str(text).unwrap();
+        assert_eq!(cfg.channel.working_sample_rate.0, WorkingRate::R48, "the rate defaults");
+        let e = cfg.validate().unwrap_err();
+        let msg = e.to_string();
+        assert!(msg.contains("100 kHz"), "{msg}");
+        assert!(msg.contains("mode E") || msg.contains("mode E (DRM+)"), "{msg}");
+
+        // At 192 kHz the same station is accepted.
+        let text = "[channel]
+mode = \"E\"
+occupancy = 0
+working_sample_rate = \"192\"
+";
+        let cfg = StationConfig::from_toml_str(text).unwrap();
+        assert_eq!(cfg.channel.working_sample_rate.0, WorkingRate::R192);
+        // (Whatever else it complains about, it must not be the rate.)
+        if let Err(e) = cfg.validate() {
+            assert!(!e.to_string().contains("100 kHz"), "{e}");
+        }
+    }
 
     #[test]
     fn parse_errors_have_a_location() {

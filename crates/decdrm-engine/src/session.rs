@@ -15,7 +15,7 @@
 //! RSCI receiver's status items stand in for the receiver's status and plots.
 
 use decdrm_codecs::{DrmAudioCoding, DrmAudioDecoder, PcmFrame, open_decoder};
-use decdrm_io::HighBandSmoother;
+use decdrm_io::{DropoutConcealer, HighBandSmoother};
 use decdrm_core::fac::{Fac, LANGUAGES, PROGRAMME_TYPES};
 use decdrm_core::params::RobustnessMode;
 use decdrm_core::mux::audio::AudioDeframer;
@@ -79,12 +79,33 @@ struct AudioPipeline {
     text: TextMessageDecoder,
     /// The SBR band smoother while it is on (see [`Session::set_smooth_sbr`]).
     smoother: Option<HighBandSmoother>,
+    /// Masks dropouts with a decaying repeat of the last good audio, while it is on (see
+    /// [`Session::set_conceal_dropouts`]). Runs last, on the audio that leaves the pipeline.
+    concealer: Option<DropoutConcealer>,
 }
 
 impl AudioPipeline {
     /// Decoded audio on its way out: through the SBR band smoother when `smooth` is on and
-    /// the stream has SBR (made anew when the audio format changes).
-    fn post(&mut self, mut pcm: PcmFrame, smooth: bool) -> PcmFrame {
+    /// the stream has SBR, then through the dropout concealer when `conceal` is on (both
+    /// made anew when the audio format changes). Rebuilt the same way for concealed frames,
+    /// so a gap that starts before the format is known is still concealed consistently.
+    fn post(&mut self, mut pcm: PcmFrame, smooth: bool, conceal: bool) -> PcmFrame {
+        if conceal {
+            let ch = usize::from(pcm.channels);
+            if self
+                .concealer
+                .as_ref()
+                .is_none_or(|c| c.sample_rate() != pcm.sample_rate || c.channels() != ch)
+            {
+                self.concealer = Some(DropoutConcealer::new(pcm.sample_rate, ch));
+            }
+            if let Some(c) = self.concealer.as_mut() {
+                pcm.samples = c.process(&pcm.samples, pcm.concealed);
+            }
+        } else {
+            self.concealer = None;
+        }
+
         let crossover = self.params.sbr_crossover_hz().filter(|_| smooth);
         let Some(crossover) = crossover else {
             self.smoother = None;
@@ -223,11 +244,12 @@ struct MdiRx {
 }
 
 impl MdiRx {
-    fn update(&mut self, f: &MdiFrame, fac_ok: Option<bool>) {
+    fn update(&mut self, f: &MdiFrame, mode: Option<RobustnessMode>, fac_ok: Option<bool>) {
         let st = &mut self.status;
-        if let Some(m) = f.robustness {
-            st.mode = Some(RobustnessMode::ALL[usize::from(m.min(3))]);
+        if let Some(m) = mode.or_else(|| f.robustness.map(|m| RobustnessMode::ALL[usize::from(m.min(3))])) {
+            st.mode = Some(m);
         }
+        let frame_s = st.mode.map_or(0.4, |m| f64::from(m.frame_ms()) / 1000.0);
         let r = &f.rsci;
         st.state = match (r.flags, fac_ok) {
             (Some(flags), _) if flags.sync != 0 => RxState::Acquisition,
@@ -270,7 +292,7 @@ impl MdiRx {
                 v.waterfall_rows.drain(..v.waterfall_rows.len() - keep);
             }
             v.spectrum_seq += 1;
-            v.spectrum_row_s = 0.4;
+            v.spectrum_row_s = frame_s;
         }
         if let Some(ir) = &r.impulse_response
             && ir.db.len() >= 2
@@ -301,35 +323,43 @@ pub struct Session {
     pub msc_stats: MscStats,
     /// See [`Session::set_smooth_sbr`].
     smooth_sbr: bool,
+    /// See [`Session::set_conceal_dropouts`].
+    conceal_dropouts: bool,
     text: Option<String>,
     samples_in: u64,
+    /// Working rate of the input frames, Hz: 48 kHz for modes A–D, more for mode E
+    /// (DRM+). The sample counts above are turned into seconds with it.
+    rate_hz: u32,
     /// `samples_in` when the last multiplex frame was decoded.
     last_msc_at: Option<u64>,
     last_channel: Option<decdrm_core::fac::ChannelParams>,
 }
 
 /// Diversity reception shows the combined cells of the last multiplex frame for this
-/// long (three frames), then, while none is decoded, the branch's cells as they come.
-const COMBINED_CELLS_SHOWN: u64 = 3 * 19_200;
+/// many seconds (three multiplex frames), then, while none is decoded, the branch's
+/// cells as they come. In samples, so it follows the working rate.
+const COMBINED_CELLS_S: f64 = 1.2;
 
 impl Session {
     pub fn new(cfg: ReceiverConfig) -> Self {
-        Self::with(Rx::Single(Box::new(Receiver::new(cfg))))
+        let rate_hz = cfg.working_rate.hz();
+        Self::with(Rx::Single(Box::new(Receiver::new(cfg))), rate_hz)
     }
 
     /// Diversity reception from two inputs (branches 0 and 1, see
     /// [`Self::push_branch`]).
     pub fn new_diversity(cfg: [ReceiverConfig; 2]) -> Self {
-        Self::with(Rx::Diversity(Box::new(DiversityReceiver::new(cfg))))
+        let rate_hz = cfg[0].working_rate.hz();
+        Self::with(Rx::Diversity(Box::new(DiversityReceiver::new(cfg))), rate_hz)
     }
 
     /// MDI or RSCI input: frames of the multiplex as decoded elsewhere (see
     /// [`Self::push_mdi`]).
     pub fn new_mdi() -> Self {
-        Self::with(Rx::Mdi(Box::default()))
+        Self::with(Rx::Mdi(Box::default()), 48_000)
     }
 
-    fn with(rx: Rx) -> Self {
+    fn with(rx: Rx, rate_hz: u32) -> Self {
         Self {
             rx,
             ens: Ensemble::new(),
@@ -340,9 +370,11 @@ impl Session {
             evs: Vec::new(),
             audio_stats: AudioStats::default(),
             smooth_sbr: false,
+            conceal_dropouts: false,
             msc_stats: MscStats::default(),
             text: None,
             samples_in: 0,
+            rate_hz,
             last_msc_at: None,
             last_channel: None,
         }
@@ -359,7 +391,8 @@ impl Session {
     /// RSCI input the receiver's spectrum and impulse response.
     pub fn visuals(&mut self) -> Visuals {
         let shown = self.rx.shown();
-        let combined = self.last_msc_at.is_some_and(|t| self.samples_in.saturating_sub(t) <= COMBINED_CELLS_SHOWN);
+        let shown_s = COMBINED_CELLS_S * f64::from(self.rate_hz.max(1));
+        let combined = self.last_msc_at.is_some_and(|t| self.samples_in.saturating_sub(t) <= shown_s as u64);
         match &mut self.rx {
             Rx::Single(r) => r.visuals(),
             Rx::Mdi(m) => m.visuals.clone(),
@@ -393,6 +426,7 @@ impl Session {
                     recent: d.recent_mix().clone(),
                     carriers: d.carrier_mix().cloned(),
                     spacing_hz: mode.map_or(0.0, |m| m.carrier_spacing()),
+                    frame_seconds: mode.map_or(0.4, |m| f64::from(m.frame_ms()) / 1000.0),
                     msc: [a.msc_cells(), b.msc_cells()],
                 })
             }
@@ -454,17 +488,18 @@ impl Session {
         self.last_channel = None;
     }
 
-    /// Seconds of 48 kHz input processed.
+    /// Seconds of input processed, at the receiver's working rate.
     pub fn time_s(&self) -> f64 {
-        self.samples_in as f64 / 48_000.0
+        self.samples_in as f64 / f64::from(self.rate_hz.max(1))
     }
 
-    /// Feed interleaved 48 kHz frames (diversity reception: of branch 0).
+    /// Feed interleaved frames at the working rate (diversity reception: of branch 0).
     pub fn push(&mut self, frames: &[f32]) -> Vec<SessionEvent> {
         self.push_branch(0, frames)
     }
 
-    /// Feed interleaved 48 kHz frames of input `branch` (0 or 1; one receiver: 0).
+    /// Feed interleaved frames of input `branch` at the working rate (0 or 1; one
+    /// receiver: 0).
     pub fn push_branch(&mut self, branch: usize, frames: &[f32]) -> Vec<SessionEvent> {
         let ch = self.rx.channels(branch);
         if branch == 0 {
@@ -506,6 +541,22 @@ impl Session {
         self.smooth_sbr
     }
 
+    /// Mask audio dropouts: while the audio is lost (synchronisation, lost multiplex frames,
+    /// or a codec's own concealment), the last clean audio is repeated at a falling level, so
+    /// a short gap is heard as a dip instead of a cut to silence and back. On by default, as
+    /// it only fills gaps the receiver already has; see [`decdrm_io::dropout_conceal`].
+    pub fn set_conceal_dropouts(&mut self, on: bool) {
+        self.conceal_dropouts = on;
+        if !on && let Some(a) = self.audio.as_mut() {
+            a.concealer = None;
+        }
+    }
+
+    /// Dropout concealment is switched on (see [`Self::set_conceal_dropouts`]).
+    pub fn conceal_dropouts(&self) -> bool {
+        self.conceal_dropouts
+    }
+
     /// Where the SBR band of the current audio starts, Hz; `None` without SBR (nothing to
     /// smooth).
     pub fn sbr_crossover_hz(&self) -> Option<f64> {
@@ -514,11 +565,21 @@ impl Session {
 
     /// One MDI or RSCI frame (a session made with [`Self::new_mdi`]): its FAC and SDC
     /// go into the multiplex model as the receiver's would, its streams straight to the
-    /// decoders, its RSCI items into the status. Time advances by a frame (400 ms).
+    /// decoders, its RSCI items into the status. Time advances by one logical frame —
+    /// 400 ms in modes A–D, **100 ms in mode E** (§8.1) — which the frame says by its FAC
+    /// width: `robm` is two bits and names A–D only, while a mode E FAC is 116 bits (§6.3,
+    /// two service parameter sets) where A–D's is 72.
     pub fn push_mdi(&mut self, f: &MdiFrame) -> Vec<SessionEvent> {
-        self.samples_in += 19_200;
+        let fac_bits = f.fac_bits();
+        let mode = fac_bits
+            .as_ref()
+            .and_then(|b| (b.len() >= 116).then_some(RobustnessMode::E))
+            .or_else(|| f.robustness.map(|m| RobustnessMode::ALL[usize::from(m.min(3))]))
+            .or_else(|| self.status().mode);
+        let frame_s = mode.map_or(0.4, |m| f64::from(m.frame_ms()) / 1000.0);
+        self.samples_in += (f64::from(self.rate_hz) * frame_s).round() as u64;
         let mut events = Vec::new();
-        let fac = f.fac_bits().map(|bits| Fac::parse(&bits));
+        let fac = fac_bits.map(|bits| Fac::parse(&bits));
         if let Some(parsed) = &fac {
             match parsed {
                 Some(fac) => events.push(ReceiverEvent::Fac(*fac)),
@@ -545,7 +606,7 @@ impl Session {
                     st.sdc_bad += 1;
                 }
             }
-            m.update(f, fac.as_ref().map(Option::is_some));
+            m.update(f, mode, fac.as_ref().map(Option::is_some));
         }
         let mut out = self.handle(0, events);
         let Some(mux) = self.ens.multiplex() else { return out };
@@ -667,6 +728,13 @@ impl Session {
         out.push(SessionEvent::ServicesChanged);
     }
 
+    /// The robustness mode being received, as far as it is known: the receiver's detection
+    /// or pin, or — for MDI input — the FAC's own signalling (a 116-bit block is mode E,
+    /// §6.3; `robm` cannot name it).
+    fn mode(&self) -> RobustnessMode {
+        self.status().mode.unwrap_or(RobustnessMode::B)
+    }
+
     /// (Re)create the audio pipeline for the selected service and a data pipeline for
     /// every application, keeping those whose parameters did not change.
     fn rebuild_pipelines(&mut self, out: &mut Vec<SessionEvent>) {
@@ -691,7 +759,7 @@ impl Session {
                 if !same {
                     self.audio = None;
                     if let Some(stream) = stream {
-                        match build_audio(short_id, &params, stream) {
+                        match build_audio(short_id, &params, stream, self.mode()) {
                             Ok(p) => {
                                 self.audio_stats =
                                     AudioStats { codec: p.decoder.describe(), ..AudioStats::default() };
@@ -758,10 +826,24 @@ impl Session {
         // Content checks of this multiplex frame (passed, failed).
         let (mut good, mut bad) = (0u64, 0u64);
 
+        // Mode E's audio super frame spans two logical frames (four for DAC, whose super
+        // frame is 400 ms by construction), and the DRM super frame's frame identities say
+        // which pair: 0 and 2 begin one (§8.1). That holds for MDI, whose frames carry
+        // their own FAC. A receiver's MSC event can arrive after the FAC of a later frame,
+        // so there the deframer finds the phase from the audio frame structure itself.
+        let mdi = matches!(self.rx, Rx::Mdi(_));
+        let parts = self.audio.as_ref().map_or(1, |a| a.deframer.parts_per_super_frame());
+        let starts_super_frame =
+            self.last_channel.is_none_or(|c| (c.frame_index as usize) % parts.max(1) == 0);
+
         if let Some(a) = self.audio.as_mut()
             && let Some(Some(lf)) = logical.get(a.stream_id as usize)
         {
-            let sf = a.deframer.push_frame(lf);
+            let sf = if mdi {
+                a.deframer.push_frame_at(lf, starts_super_frame)
+            } else {
+                a.deframer.push_frame(lf)
+            };
             // Mute while the long interleaver is still filling: CRC-8 alone lets the
             // occasional garbage frame through.
             if complete {
@@ -787,7 +869,7 @@ impl Session {
                     for _ in 0..sf.nominal_frames.unwrap_or(0) {
                         if let Ok(pcm) = a.decoder.conceal() {
                             self.audio_stats.frames_concealed += 1;
-                            out.push(SessionEvent::Audio(a.post(pcm, self.smooth_sbr)));
+                            out.push(SessionEvent::Audio(a.post(pcm, self.smooth_sbr, self.conceal_dropouts)));
                         }
                     }
                 }
@@ -810,13 +892,13 @@ impl Session {
                                 good += 1;
                                 self.audio_stats.frames_ok += 1;
                             }
-                            out.push(SessionEvent::Audio(a.post(pcm, self.smooth_sbr)));
+                            out.push(SessionEvent::Audio(a.post(pcm, self.smooth_sbr, self.conceal_dropouts)));
                         }
                         Err(_) => {
                             bad += 1;
                             self.audio_stats.frames_concealed += 1;
                             if let Ok(pcm) = a.decoder.conceal() {
-                                out.push(SessionEvent::Audio(a.post(pcm, self.smooth_sbr)));
+                                out.push(SessionEvent::Audio(a.post(pcm, self.smooth_sbr, self.conceal_dropouts)));
                             }
                         }
                     }
@@ -860,15 +942,16 @@ impl Session {
     /// is described as that audio (not decodable).
     pub fn service_views(&self) -> Vec<crate::snapshot::ServiceView> {
         let lengths = self.ens.stream_lengths();
+        let mode = self.mode();
         self.ens
             .services()
             .map(|s| {
-                let mut v = service_view(s, &lengths);
+                let mut v = service_view(s, &lengths, mode);
                 if v.audio.is_none()
                     && let Some(c) = self.evs.iter().find(|c| c.short_id == s.short_id && c.locked())
                 {
                     v.audio = Some(evs_view(c));
-                    v.audio_bitrate = stream_bitrate(&lengths, c.app.stream_id);
+                    v.audio_bitrate = stream_bitrate(&lengths, c.app.stream_id, mode);
                     v.decodable = false;
                     v.warning = Some(EVS_WARNING.into());
                 }
@@ -923,12 +1006,17 @@ fn evs_view(c: &EvsChannel) -> crate::snapshot::AudioCodingView {
     }
 }
 
-/// Bit rate of a stream of `lengths` (bytes per 400 ms multiplex frame), bit/s.
-fn stream_bitrate(lengths: &[StreamLengths], stream: u8) -> Option<f64> {
-    lengths.get(usize::from(stream)).map(|l| (l.part_a + l.part_b) as f64 * 8.0 / 0.4)
+/// Bit rate of a stream of `lengths` (bytes per *logical* frame of `mode`), bit/s.
+///
+/// A logical frame is 400 ms in modes A–D but **100 ms in mode E** (§8.1: "the logical
+/// frames are each 100 ms long"), so the duration has to come from the mode — a fixed
+/// 400 ms reports every DRM+ stream at a quarter of its real rate.
+fn stream_bitrate(lengths: &[StreamLengths], stream: u8, mode: RobustnessMode) -> Option<f64> {
+    let frame_s = f64::from(mode.frame_ms()) / 1000.0;
+    lengths.get(usize::from(stream)).map(|l| (l.part_a + l.part_b) as f64 * 8.0 / frame_s)
 }
 
-fn service_view(s: &ServiceInfo, lengths: &[StreamLengths]) -> crate::snapshot::ServiceView {
+fn service_view(s: &ServiceInfo, lengths: &[StreamLengths], mode: RobustnessMode) -> crate::snapshot::ServiceView {
     let audio_stream = s.audio.as_ref().map(|a| a.stream_id);
     let audio_lengths = audio_stream.and_then(|id| lengths.get(usize::from(id)));
     let fac_language = s.fac.filter(|f| f.language != 0).and_then(|_| s.fac_language());
@@ -944,7 +1032,7 @@ fn service_view(s: &ServiceInfo, lengths: &[StreamLengths]) -> crate::snapshot::
             .or_else(|| s.language_code.clone().filter(|c| !c.is_empty() && c != "---"))
             .unwrap_or_default(),
         audio: s.audio.as_ref().map(audio_view),
-        audio_bitrate: audio_stream.and_then(|id| stream_bitrate(lengths, id)),
+        audio_bitrate: audio_stream.and_then(|id| stream_bitrate(lengths, id, mode)),
         audio_part_a_percent: audio_lengths
             .filter(|l| l.part_a + l.part_b > 0)
             .map(|l| 100.0 * l.part_a as f64 / (l.part_a + l.part_b) as f64),
@@ -959,7 +1047,7 @@ fn service_view(s: &ServiceInfo, lengths: &[StreamLengths]) -> crate::snapshot::
                     stream_id: a.stream_id,
                     packet_mode: a.packet_mode,
                     packet_id: a.packet_id,
-                    stream_bitrate: stream_bitrate(lengths, a.stream_id),
+                    stream_bitrate: stream_bitrate(lengths, a.stream_id, mode),
                 }
             })
             .collect(),
@@ -1023,7 +1111,12 @@ fn app_name(app: UserApplication) -> String {
     }
 }
 
-fn build_audio(short_id: u8, params: &AudioParams, stream: StreamLengths) -> Result<AudioPipeline, String> {
+fn build_audio(
+    short_id: u8,
+    params: &AudioParams,
+    stream: StreamLengths,
+    mode: RobustnessMode,
+) -> Result<AudioPipeline, String> {
     let coding = match params.codec {
         AudioCodec::Aac => Some(DrmAudioCoding::Aac),
         AudioCodec::XheAac => Some(DrmAudioCoding::XheAac),
@@ -1032,7 +1125,17 @@ fn build_audio(short_id: u8, params: &AudioParams, stream: StreamLengths) -> Res
         AudioCodec::Encodec => return Err(decdrm_dac::ConfigError::Encodec.to_string()),
         AudioCodec::Reserved => return Err("reserved audio coding (CELP/HVXC are not supported)".into()),
     };
-    let deframer = AudioDeframer::new(params, stream).map_err(|e| e.to_string())?;
+    let mut deframer = AudioDeframer::new_at(params, stream, mode).map_err(|e| e.to_string())?;
+    if params.codec == AudioCodec::Dac
+        && let Ok(cfg) = decdrm_dac::DacConfig::from_codec_config(&params.codec_config)
+    {
+        // DAC's super frame has no structural check in core, and a mode E one spans four
+        // logical frames whose first the receiver may not know: its framing CRCs tell a
+        // real super frame from an assembly that started one logical frame late.
+        deframer.set_whole_check(Box::new(move |sf: &[u8]| {
+            decdrm_dac::unpack_super_frame(cfg, sf).is_ok_and(|(p, _)| p.failed == 0)
+        }));
+    }
     let decoder = match coding {
         Some(coding) => open_decoder(coding, &params.type9_bytes).map_err(|e| e.to_string())?,
         None => open_dac(params)?,
@@ -1046,6 +1149,7 @@ fn build_audio(short_id: u8, params: &AudioParams, stream: StreamLengths) -> Res
         decoder,
         text: TextMessageDecoder::new(),
         smoother: None,
+        concealer: None,
     })
 }
 
@@ -1186,7 +1290,7 @@ mod tests {
                 type9_bytes: info.to_type9_bytes(),
             };
             let mut session = Session::new(ReceiverConfig::default());
-            session.audio = Some(build_audio(0, &params, StreamLengths { part_a: 0, part_b: len }).unwrap());
+            session.audio = Some(build_audio(0, &params, StreamLengths { part_a: 0, part_b: len }, RobustnessMode::B).unwrap());
             (session, Self { enc, framer: Default::default(), len, t: 0 })
         }
 
@@ -1297,7 +1401,7 @@ mod tests {
             applications: vec![app(1, 0, 0x002)],
             conditional_access: Vec::new(),
         };
-        let v = service_view(&audio, &lengths);
+        let v = service_view(&audio, &lengths, RobustnessMode::B);
         let a = v.audio.as_ref().unwrap();
         assert_eq!((a.codec.as_str(), a.sbr, a.parametric_stereo, a.stereo), ("AAC", true, true, false));
         assert_eq!((a.sample_rate_hz, a.output_rate_hz, a.text), (24_000, 48_000, true));
@@ -1317,11 +1421,27 @@ mod tests {
             applications: vec![app(1, 1, 0x44A), app(1, 2, 0x123)],
             ..Default::default()
         };
-        let v = service_view(&data, &lengths);
+        let v = service_view(&data, &lengths, RobustnessMode::B);
         assert!(v.audio.is_none() && v.audio_bitrate.is_none() && !v.decodable && v.ca);
         let names: Vec<&str> = v.apps.iter().map(|a| a.name.as_str()).collect();
         assert_eq!(names, ["Journaline", "application 0x123"]);
         assert_eq!(v.programme_type, None);
         assert_eq!(v.language, "", "no FAC language and no SDC code");
+    }
+
+    /// A logical frame is 400 ms in modes A–D but 100 ms in mode E (§8.1), so the same
+    /// bytes per frame mean four times the bit rate in DRM+. Reporting a DRM+ stream at
+    /// its mode A rate is the bug this pins.
+    #[test]
+    fn stream_bitrate_uses_the_modes_frame_duration() {
+        let lengths = [StreamLengths { part_a: 100, part_b: 500 }, StreamLengths { part_a: 0, part_b: 60 }];
+        assert_eq!(stream_bitrate(&lengths, 0, RobustnessMode::B), Some(12_000.0), "600 B / 400 ms");
+        assert_eq!(stream_bitrate(&lengths, 0, RobustnessMode::E), Some(48_000.0), "600 B / 100 ms");
+        assert_eq!(stream_bitrate(&lengths, 1, RobustnessMode::E), Some(4_800.0), "60 B / 100 ms");
+        // A–D all keep the 400 ms frame; only E is shorter.
+        for m in [RobustnessMode::A, RobustnessMode::C, RobustnessMode::D] {
+            assert_eq!(stream_bitrate(&lengths, 0, m), Some(12_000.0), "mode {m} frame is 400 ms");
+        }
+        assert_eq!(stream_bitrate(&lengths, 2, RobustnessMode::E), None, "no such stream");
     }
 }

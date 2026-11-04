@@ -15,3 +15,5 @@ tracing.workspace = true
 
 [dev-dependencies]
 claxon = "0.4"
+# The `spectrum` example reads WAV as well as FLAC.
+hound = "3.5"

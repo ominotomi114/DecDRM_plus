@@ -19,7 +19,6 @@
 use crate::cellmap::CellMap;
 use crate::dsp::fft::Fft;
 use crate::dsp::{hamming, iir1_lambda};
-use crate::params::SAMPLE_RATE;
 use crate::{Cplx, Real};
 use std::collections::VecDeque;
 
@@ -98,6 +97,9 @@ pub struct PdsTracker {
     pub sro_acquisition: bool,
     // Sample-rate offset estimation.
     sym_rate: Real,
+    /// Working sample rate (Hz): `sam_off_hz` reports a frequency, so it needs the rate the
+    /// drift was measured at, not the 48 kHz constant.
+    fs_hz: Real,
     acq_cnt_max: usize,
     acq_settle: usize,
     acq_cnt: usize,
@@ -127,16 +129,34 @@ pub struct PdsTracker {
 impl PdsTracker {
     /// `sym_delay` = channel-estimation delay + 1 (Dream's `iLenHistBuff`).
     pub fn new(map: &CellMap, num_pil: usize, sym_delay: usize) -> Self {
+        Self::new_at(map, num_pil, sym_delay, crate::params::WorkingRate::R48)
+    }
+
+    /// [`Self::new`] at an explicit working sample rate (mode E needs 120 or 192 kHz).
+    ///
+    /// The rate matters here twice over. `ir_per_sample` (impulse-response bins per input
+    /// sample) and everything derived from it must use the **same rate's** samples: a timing
+    /// shift arrives in working-rate samples, so converting it with a 48 kHz-derived factor
+    /// scales it by the rate ratio (4x at 192 kHz), which rotates the averaged PDS too far
+    /// and reports the wrong timing correction. The pairs that are ratios of two such
+    /// quantities (`guard_ir`, `sym_len_ir`, `ir_step_ms`) are rate-invariant either way, so
+    /// switching them together keeps them right.
+    pub fn new_at(
+        map: &CellMap,
+        num_pil: usize,
+        sym_delay: usize,
+        rate: crate::params::WorkingRate,
+    ) -> Self {
         let mode = map.mode();
-        let fft_len = mode.fft_size();
+        let fft_len = mode.fft_size_at(rate);
         let ir_per_sample = (num_pil * map.scattered.freq_int) as Real / fft_len as Real;
-        let guard_ir = mode.guard_len() as Real * ir_per_sample;
+        let guard_ir = mode.guard_len_at(rate) as Real * ir_per_sample;
         let st_po_rot = if guard_ir as usize > num_pil {
             num_pil
         } else {
             (guard_ir + ((num_pil as Real - guard_ir) / 2.0).ceil() + 1.0) as usize
         };
-        let sym_rate = Real::from(SAMPLE_RATE) / mode.symbol_len() as Real;
+        let sym_rate = Real::from(rate.hz()) / mode.symbol_len_at(rate) as Real;
         let acq_cnt_max = (SAM_OFF_ACQ_LEN_S * sym_rate) as usize;
         let xc_period = ((SRO_STEP_S * sym_rate).round() as usize).max(1);
         Self {
@@ -159,6 +179,7 @@ impl PdsTracker {
             tracking: false,
             sro_acquisition: true,
             sym_rate,
+            fs_hz: Real::from(rate.hz()),
             acq_cnt_max,
             acq_settle: (SAM_OFF_ACQ_SETTLE_S * sym_rate) as usize,
             acq_cnt: acq_cnt_max,
@@ -169,9 +190,11 @@ impl PdsTracker {
             drift_max: ((HIST_LEN_SAM_OFF_S * sym_rate) as usize / xc_period).max(1),
             applied_hz: 0.0,
             frame_pos: 0.0,
-            sym_len_ir: mode.symbol_len() as Real * ir_per_sample,
-            ir_step_ms: 1e3 / (ir_per_sample * Real::from(SAMPLE_RATE)),
-            guard_ms: mode.guard_len() as Real / Real::from(SAMPLE_RATE) * 1e3,
+            // These three are ratios of two rate-scaled quantities, so they keep their values
+            // (and their meaning) once every part uses the same rate.
+            sym_len_ir: mode.symbol_len_at(rate) as Real * ir_per_sample,
+            ir_step_ms: 1e3 / (ir_per_sample * Real::from(rate.hz())),
+            guard_ms: mode.guard_len_at(rate) as Real / Real::from(rate.hz()) * 1e3,
             pds_begin: 0.0,
             pds_end: guard_ir,
         }
@@ -390,7 +413,7 @@ impl PdsTracker {
     /// bins per symbol.
     fn sam_off_hz(&self, slope: Real) -> Real {
         let norm = slope / self.sym_len_ir;
-        Real::from(SAMPLE_RATE) * (1.0 - 1.0 / (1.0 + norm))
+        self.fs_hz * (1.0 - 1.0 / (1.0 + norm))
     }
 }
 

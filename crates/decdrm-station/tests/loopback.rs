@@ -15,7 +15,7 @@
 
 use decdrm_core::fac::{Interleaving, MscMode, SdcMode};
 use decdrm_core::mux::service::AudioParams;
-use decdrm_core::params::SpectrumOccupancy;
+use decdrm_core::params::{RobustnessMode, SpectrumOccupancy};
 use decdrm_data::DataEvent;
 use decdrm_data::journaline::{NmlBody, ObjectStatus};
 use decdrm_engine::{InputFormat, RealChannel, ReceiverConfig, Session, SessionEvent};
@@ -985,6 +985,227 @@ fn finite_input_file_ends() {
     assert!(status.services[0].audio.as_ref().unwrap().input_finished);
     let written = FileReader::open(dir.path().join("out.wav")).unwrap().total_frames().unwrap();
     assert!((frames * 19_200..frames * 19_200 + 2_000).contains(&written), "{written} frames in the file");
+}
+
+/// A DRM+ station through a VHF channel: the simulator must be built at the station's own
+/// rate (192 kHz), where COST 207's sub-microsecond taps still exist as sub-sample delays
+/// — at 48 kHz they would round away, and the noise reference would be 4× too low.
+#[test]
+fn drm_plus_transmits_through_a_vhf_channel() {
+    let dir = tempfile::tempdir().unwrap();
+    let toml = r#"
+        [channel]
+        mode = "E"
+        occupancy = 0
+        working_sample_rate = "192"
+        [output]
+        file = "vhf.wav"
+        # The simulator's fading adds gain on top of the signal's own peaks: 6 dB of
+        # headroom, and the limiter for the deepest constructive peak (at the default
+        # -15 dBFS this channel clipped ~2000 samples in 30 s).
+        level_dbfs = -21
+        papr_db = 6
+        [[service]]
+        label = "VHF"
+        id = 0x00A001
+        [service.audio]
+        codec = "he-aac"
+        input = { tone_hz = 800.0 }
+        [simulate]
+        vhf = "tu6"
+        speed_kmh = 100
+        carrier_mhz = 200
+        snr_db = 20
+    "#;
+    let (_, plan, status) = transmit(dir.path(), toml, 20);
+    assert_eq!(plan.layout.mode, RobustnessMode::E);
+    assert_eq!(plan.output.working_rate, decdrm_core::params::WorkingRate::R192);
+    assert!(status.seconds > 1.9, "{} s", status.seconds);
+    assert_eq!(status.clipped_samples, 0, "the level check must keep the output inside full scale");
+    let bytes = std::fs::metadata(dir.path().join("vhf.wav")).unwrap().len();
+    assert!(bytes > 300_000, "{bytes} bytes of 192 kHz signal");
+}
+
+/// A DRM+ station's audio, end to end at 192 kHz: mode E writes 4 s of I/Q, and a receiver
+/// pinned to mode E decodes the tone. (Pinned for a deterministic start — unpinned
+/// acquisition is `mode_e_rx.rs`'s and works here too.) This is the audio super frame the
+/// station used to get wrong: 200 ms over two 100 ms logical frames (§5.3.1.0), split at
+/// the FAC's frame identities.
+fn drm_plus_audio_roundtrip(audio: &str, min_frames: u64) -> (u64, f64) {
+    let dir = tempfile::tempdir().unwrap();
+    let toml = format!(
+        r#"
+        [channel]
+        mode = "E"
+        occupancy = 0
+        working_sample_rate = "192"
+        [output]
+        file = "drmplus.wav"
+        format = "iq"
+        sample_format = "float32"
+        [[service]]
+        label = "DRM+ Audio"
+        id = 0x00A002
+        [service.audio]
+        {audio}
+    "#
+    );
+    let (_, plan, status) = transmit(dir.path(), &toml, 40);
+    assert_eq!(plan.layout.mode, RobustnessMode::E);
+    assert_clean_encoding(&status);
+    decode_tone(&dir.path().join("drmplus.wav"), 0, min_frames)
+}
+
+/// Decode one audio service of a 192 kHz mode E recording: its decoded frame count and the
+/// strongest tone of the last decoded second (300–3000 Hz).
+fn decode_tone(path: &Path, service: u8, min_frames: u64) -> (u64, f64) {
+    let mut reader = FileReader::open(path).unwrap();
+    assert_eq!(reader.format().sample_rate, 192_000);
+    let channels = reader.format().channels;
+    let mut session = Session::new(ReceiverConfig {
+        input: InputFormat::Iq { swap: false },
+        channels,
+        working_rate: decdrm_core::params::WorkingRate::R192,
+        pinned: Some((RobustnessMode::E, SpectrumOccupancy::SO_0)),
+        ..Default::default()
+    });
+    session.select_service(service);
+    let mut audio = Vec::new();
+    let mut frames_ok = 0u64;
+    while let Some(block) = reader.read(4800).unwrap() {
+        for ev in session.push(&block) {
+            match ev {
+                SessionEvent::Audio(pcm) if !pcm.concealed => {
+                    frames_ok += 1;
+                    audio.extend(pcm.samples.iter().step_by(usize::from(pcm.channels)).map(|&v| f64::from(v)));
+                }
+                SessionEvent::Log(l) => println!("rx: {l}"),
+                _ => {}
+            }
+        }
+    }
+    let st = &session.audio_stats;
+    let rx = session.status();
+    println!(
+        "mode E: service {service}: {frames_ok} audio frames ({} concealed, {} super frame errors), FAC {} SDC {}",
+        st.frames_concealed, st.super_frame_errors, rx.fac_ok, rx.sdc_ok
+    );
+    assert!(frames_ok >= min_frames, "only {frames_ok} audio frames of 4 s decoded");
+    // The tone must be the strongest component of the last decoded second (48 kHz output:
+    // one second is an exact Goertzel bin).
+    assert!(audio.len() > 48_000, "only {} audio samples", audio.len());
+    let seg = &audio[audio.len() - 48_000..];
+    let power = |f: f64| {
+        let w = 2.0 * std::f64::consts::PI * f / 48_000.0;
+        let (c, mut s1, mut s2) = (2.0 * w.cos(), 0.0, 0.0);
+        for &v in seg {
+            let s0 = v + c * s1 - s2;
+            s2 = s1;
+            s1 = s0;
+        }
+        s1 * s1 + s2 * s2 - c * s1 * s2
+    };
+    let (mut best, mut best_p) = (0.0, 0.0);
+    for f in 300..=3_000 {
+        let p = power(f64::from(f));
+        if p > best_p {
+            (best, best_p) = (f64::from(f), p);
+        }
+    }
+    (frames_ok, best)
+}
+
+#[test]
+fn drm_plus_audio_decodes_through_the_receiver() {
+    let (_, tone) = drm_plus_audio_roundtrip("codec = \"he-aac\"\ncore_rate = 24000\ninput = { tone_hz = 800.0 }", 60);
+    assert!((tone - 800.0).abs() < 10.0, "strongest decoded tone {tone} Hz, expected 800");
+}
+
+/// xHE-AAC in mode E: its audio super frame is 200 ms over the two logical frames, and the
+/// receiver finds the pair from the super frame's header CRC (the reference DRM+
+/// recordings decode this way; now the station makes one too).
+#[test]
+fn drm_plus_audio_decodes_xhe_aac() {
+    let (_, tone) = drm_plus_audio_roundtrip("codec = \"xhe-aac\"\ninput = { tone_hz = 800.0 }", 40);
+    assert!((tone - 800.0).abs() < 10.0, "strongest decoded tone {tone} Hz, expected 800");
+}
+
+/// Opus in mode E: ten 20 ms packets in the 200 ms super frame. The station used to build
+/// the DRM30 format's twenty borders for it and fail to produce a super frame at all.
+#[test]
+fn drm_plus_audio_decodes_opus() {
+    let (_, tone) = drm_plus_audio_roundtrip("codec = \"opus\"\ninput = { tone_hz = 800.0 }", 150);
+    assert!((tone - 800.0).abs() < 10.0, "strongest decoded tone {tone} Hz, expected 800");
+}
+
+/// The **external** xHE-AAC encoder: the optional helper in `exe\xhe` beside the
+/// executables, driving Fraunhofer's DRM xHE-AAC DLL (`tools/xhe-host`). A mode E station
+/// encodes with it — the SDC type-9 body comes from the encoder, the frames are whole DRM
+/// super frames from it — and the receiver decodes the tone.
+///
+/// Skipped when the helper is not there, so CI (which has neither it nor the DLL) stays
+/// green. Run locally with `scripts\build-xhe-host.bat` (the DLL is copied from `refs\dll`).
+#[test]
+fn drm_plus_audio_decodes_with_the_external_xhe_encoder() {
+    let host = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../exe/xhe/decdrm-xhe-host.exe");
+    if !host.is_file() {
+        eprintln!("skipping: no external xHE-AAC helper at {}", host.display());
+        return;
+    }
+    // SAFETY: this test is the only user of the variable in this process, and it is set
+    // before the plan starts the helper.
+    unsafe { std::env::set_var(decdrm_codecs::xhe_external::HOST_ENV, &host) };
+    let (frames, tone) =
+        drm_plus_audio_roundtrip("codec = \"xhe-aac-external\"\nstereo = true\ninput = { tone_hz = 800.0 }", 40);
+    assert!(frames > 40, "only {frames} audio frames of 4 s decoded");
+    assert!((tone - 800.0).abs() < 10.0, "strongest decoded tone {tone} Hz, expected 800");
+}
+
+/// Two services through the external encoder: the DLL allows **one encoder instance per
+/// process**, so each service needs its own helper process. Both tones must come out of the
+/// recording, each from its own stream.
+#[test]
+fn two_services_use_their_own_external_xhe_encoders() {
+    let host = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../exe/xhe/decdrm-xhe-host.exe");
+    if !host.is_file() {
+        eprintln!("skipping: no external xHE-AAC helper at {}", host.display());
+        return;
+    }
+    // SAFETY: as in the single-service test above.
+    unsafe { std::env::set_var(decdrm_codecs::xhe_external::HOST_ENV, &host) };
+    let dir = tempfile::tempdir().unwrap();
+    let toml = r#"
+        [channel]
+        mode = "E"
+        occupancy = 0
+        working_sample_rate = "192"
+        [output]
+        file = "two.wav"
+        format = "iq"
+        sample_format = "float32"
+        [[service]]
+        label = "Ext A"
+        id = 0x00A002
+        [service.audio]
+        codec = "xhe-aac-external"
+        stereo = true
+        input = { tone_hz = 500.0 }
+        [[service]]
+        label = "Ext B"
+        id = 0x00A003
+        [service.audio]
+        codec = "xhe-aac-external"
+        stereo = true
+        input = { tone_hz = 1500.0 }
+    "#;
+    let (_, plan, status) = transmit(dir.path(), toml, 40);
+    assert_eq!(plan.services.iter().filter(|s| s.audio.is_some()).count(), 2, "two audio services");
+    assert_clean_encoding(&status);
+    let (fa, ta) = decode_tone(&dir.path().join("two.wav"), 0, 40);
+    let (fb, tb) = decode_tone(&dir.path().join("two.wav"), 1, 40);
+    assert!((ta - 500.0).abs() < 10.0, "service 0 tone {ta} Hz, expected 500");
+    assert!((tb - 1_500.0).abs() < 10.0, "service 1 tone {tb} Hz, expected 1500");
+    assert!(fa > 40 && fb > 40, "{fa} and {fb} audio frames");
 }
 
 /// Sound-card output: 3 s to a (virtual) device. Never run automatically.

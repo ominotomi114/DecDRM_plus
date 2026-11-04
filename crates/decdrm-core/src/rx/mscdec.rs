@@ -4,10 +4,10 @@
 //! two branches (see `diversity`).
 
 use super::chain::{MscConfig, MscFrame};
-use crate::fac::Interleaving;
 use crate::fec::mlc::{MlcDecoder, MlcParams};
 use crate::fec::qam::{EqCell, MetricKind};
 use crate::interleave::CellDeinterleaver;
+use crate::params::RobustnessMode;
 
 pub(crate) struct MscDecoder {
     config: MscConfig,
@@ -20,10 +20,29 @@ pub(crate) struct MscDecoder {
 }
 
 impl MscDecoder {
-    /// A decoder for multiplex frames of `cells` cells.
-    pub fn new(config: MscConfig, cells: usize, iterations: usize, metric: MetricKind) -> Self {
-        let depth = if config.interleaving == Interleaving::Long { 5 } else { 1 };
-        let mut dec = MlcDecoder::new(MlcParams::msc(config.mode.mapping(), cells, config.protection, config.part_a_bytes), iterations);
+    /// A decoder for multiplex frames of `cells` cells of robustness mode `mode`.
+    ///
+    /// The interleaver depth is the mode's (§7.6: D = 5 for modes A–D, **6 for mode E**):
+    /// taking it from the FAC's interleaving flag alone would use 5 for mode E and scramble
+    /// every multiplex frame. `interleave::interleaver_depth` is the shared rule, so the
+    /// transmitter's interleaver and this deinterleaver cannot disagree.
+    pub fn new(
+        config: MscConfig,
+        mode: RobustnessMode,
+        cells: usize,
+        iterations: usize,
+        metric: MetricKind,
+    ) -> Self {
+        let depth = crate::interleave::interleaver_depth(mode, config.interleaving);
+        // The **mode's** protection tables: mode E's 16-QAM rates (table 31) differ from
+        // modes A-D's (table 30) at every level except its last, so `MlcParams::msc`
+        // (hardcoded to mode B) would decode a DRM+ 16-QAM multiplex frame into noise —
+        // except at protection level 3, whose rate coincides, which is what made the
+        // fault look like a signal-quality problem.
+        let mut dec = MlcDecoder::new(
+            MlcParams::msc_for(mode, config.mode.mapping(), cells, config.protection, config.part_a_bytes),
+            iterations,
+        );
         dec.metric = metric;
         Self { config, deint: CellDeinterleaver::new(cells, depth), dec, cells, since_reset: 0 }
     }

@@ -18,7 +18,8 @@ use egui_plot::{
 /// A value of a record (a series of the plots over time).
 type Value = fn(&MixRecord) -> Option<f64>;
 
-/// One record per multiplex frame: 400 ms.
+/// One record per multiplex frame: 400 ms in modes A–D, 100 ms in mode E (§8.1), where the
+/// session's `frame_seconds` says so.
 const FRAME_S: f64 = 0.4;
 /// Seconds of the plots over time.
 const SPAN_S: f64 = 120.0;
@@ -68,6 +69,8 @@ pub fn show(ui: &mut Ui, view: Option<(&DiversityView, &DiversityHistory)>, comb
         return;
     };
     let c = Colors::new(ui, pal);
+    // One record per multiplex frame: the mode's own duration (§8.1).
+    let frame_s = if d.frame_seconds > 0.0 { d.frame_seconds } else { FRAME_S };
     egui::ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
         ui.add(
             egui::Label::new(
@@ -81,11 +84,11 @@ pub fn show(ui: &mut Ui, view: Option<(&DiversityView, &DiversityHistory)>, comb
             )
             .wrap(),
         );
-        summary(ui, d, history, &c);
+        summary(ui, d, history, &c, frame_s);
         ui.separator();
         carriers(ui, d, &c);
         ui.separator();
-        over_time(ui, history, &c);
+        over_time(ui, history, &c, frame_s);
         ui.separator();
         ui.label(RichText::new("MSC constellations of the last frame").strong());
         let side = ((ui.available_width() - 24.0) / 3.0).clamp(80.0, 240.0);
@@ -99,7 +102,7 @@ pub fn show(ui: &mut Ui, view: Option<(&DiversityView, &DiversityHistory)>, comb
 }
 
 /// The weight split, the SNRs, the frame counts and the pairing.
-fn summary(ui: &mut Ui, d: &DiversityView, history: &DiversityHistory, c: &Colors) {
+fn summary(ui: &mut Ui, d: &DiversityView, history: &DiversityHistory, c: &Colors, frame_s: f64) {
     let s = &d.stats;
     if let Some(share) = s.share {
         share_bar(ui, share, c);
@@ -136,8 +139,8 @@ fn summary(ui: &mut Ui, d: &DiversityView, history: &DiversityHistory, c: &Color
          stalled or lags too far); late frames came after their turn and were dropped.",
     );
     let pairing = match s.lead_frames {
-        Some(l) if l > 0 => format!("KiwiSDR 2's signal arrives {:.1} s after KiwiSDR 1's ({l} frames)", l as f64 * FRAME_S),
-        Some(l) if l < 0 => format!("KiwiSDR 1's signal arrives {:.1} s after KiwiSDR 2's ({} frames)", -l as f64 * FRAME_S, -l),
+        Some(l) if l > 0 => format!("KiwiSDR 2's signal arrives {:.1} s after KiwiSDR 1's ({l} frames)", l as f64 * frame_s),
+        Some(l) if l < 0 => format!("KiwiSDR 1's signal arrives {:.1} s after KiwiSDR 2's ({} frames)", -l as f64 * frame_s, -l),
         Some(_) => "Both KiwiSDRs' signals arrive together".to_string(),
         None => "Not paired yet: frames are matched by their content first".to_string(),
     };
@@ -259,14 +262,14 @@ fn segments(records: &[&MixRecord], t: impl Fn(&MixRecord) -> f64, value: impl F
 }
 
 /// The SNRs and the weight split frame by frame, the last two minutes.
-fn over_time(ui: &mut Ui, history: &DiversityHistory, c: &Colors) {
+fn over_time(ui: &mut Ui, history: &DiversityHistory, c: &Colors, frame_s: f64) {
     ui.label(RichText::new("Frame by frame, the last two minutes").strong());
     let records = history.records();
     let Some(last) = records.back() else {
         placeholder(ui, "No frames yet.");
         return;
     };
-    let t = |r: &MixRecord| (r.seq as f64 - last.seq as f64) * FRAME_S;
+    let t = |r: &MixRecord| (r.seq as f64 - last.seq as f64) * frame_s;
     let shown: Vec<&MixRecord> = records.iter().filter(|r| t(r) >= -SPAN_S).collect();
     let x0 = shown.first().map_or(-SPAN_S, |r| t(r)).min(-10.0);
     let values = shown.iter().flat_map(|r| r.snr_db.iter().flatten().chain(r.combined_db.iter()));

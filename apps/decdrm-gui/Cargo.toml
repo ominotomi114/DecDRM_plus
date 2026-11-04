@@ -29,6 +29,8 @@ decdrm-data = { path = "../../crates/decdrm-data" }
 decdrm-io = { path = "../../crates/decdrm-io" }
 decdrm-schedule = { path = "../../crates/decdrm-schedule" }
 decdrm-station = { path = "../../crates/decdrm-station" }
+# For the optional external xHE-AAC encoder (the `xhe` helper beside the executable).
+decdrm-codecs = { path = "../../crates/decdrm-codecs" }
 # Only to switch on its `embed-weights` feature.
 decdrm-dac = { path = "../../crates/decdrm-dac", optional = true }
 anyhow.workspace = true

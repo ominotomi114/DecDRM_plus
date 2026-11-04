@@ -10,7 +10,7 @@
 
 use super::meter::{GOOD, HOT, MeterKind, WARN, level_meter, meter_with_text};
 use super::plots::spectrum_plot;
-use super::source::DeviceLists;
+use super::source::{DeviceLists, NamedDevice};
 use super::tx_form::{self, FormCtx, PlanBar, capacity_bar, card};
 use super::{Palette, placeholder, value};
 use crate::indicators::fmt_time;
@@ -269,7 +269,7 @@ impl TxPage {
             return;
         };
         let frames = if settings.tx_duration_enabled {
-            tx_config::frames_for(settings.tx_duration_s)
+            tx_config::frames_for(settings.tx_duration_s, plan.frame_seconds())
         } else {
             None
         };
@@ -720,6 +720,13 @@ fn output_card(ui: &mut Ui, tx: &TxSession, pal: &Palette) {
             ui.label(if s.clipped_samples > 0 { clipped.color(pal.error) } else { clipped })
                 .on_hover_text("Output samples limited to full scale so far.");
             ui.end_row();
+            if let Some(db) = s.papr_db {
+                let law = s.papr_law.unwrap_or("clip");
+                value(ui, "PAPR limit", format!("{db:.1} dB {law}, {} peaks limited", s.limited_samples)).on_hover_text(
+                    "The limiter's knee above the RMS (a tanh law or a hard clip), and the baseband samples that exceeded it.",
+                );
+                ui.end_row();
+            }
             if s.mdi.is_some() {
                 // A modulator sends the SDC that comes with the MDI.
                 return;
@@ -1013,17 +1020,24 @@ fn output_file_picker(ui: &mut Ui, settings: &mut Settings) {
 }
 
 fn output_device_picker(ui: &mut Ui, settings: &mut Settings, devices: &mut DeviceLists) {
-    let current = settings
-        .tx_output_device
-        .clone()
-        .unwrap_or_else(|| "Default output".into());
+    // Rate-labelled, like the receiver's picker: a virtual cable may be listed twice, the
+    // two entries sharing a name and differing only in the rates they accept.
+    let current = match &settings.tx_output_device {
+        None => "Default output".to_string(),
+        Some(want) => devices
+            .outputs()
+            .iter()
+            .find(|d| &d.name == want)
+            .map(NamedDevice::label)
+            .unwrap_or_else(|| want.clone()),
+    };
     egui::ComboBox::from_id_salt("tx_output_device")
         .width(240.0)
         .selected_text(current)
         .show_ui(ui, |ui| {
             ui.selectable_value(&mut settings.tx_output_device, None, "Default output");
-            for name in devices.outputs().to_vec() {
-                ui.selectable_value(&mut settings.tx_output_device, Some(name.clone()), name);
+            for d in devices.outputs().to_vec() {
+                ui.selectable_value(&mut settings.tx_output_device, Some(d.name.clone()), d.label());
             }
         });
     if ui

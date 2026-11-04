@@ -9,6 +9,7 @@
 //! written by older versions still load after new fields are added (and unknown fields
 //! from newer versions are ignored).
 
+use decdrm_core::params::{RobustnessMode, SpectrumOccupancy, WorkingRate};
 use decdrm_engine::{EngineConfig, InputFormat, InputSpec, RealChannel, ReceiverConfig};
 use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
@@ -349,6 +350,41 @@ pub enum Page {
     Transmitter,
 }
 
+/// Which robustness mode the receiver decodes.
+///
+/// The automatic search covers the DRM30 modes A–D and reads their spectrum occupancy from
+/// the FAC. At 120/192 kHz it finds DRM+ (mode E) too: the plateau of its spectrum, then the
+/// mode, then its carrier from the guard interval. Pinning mode E is a shortcut — it skips
+/// that search, at the price of having to know where the carrier is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ReceiverMode {
+    /// Search for a signal (modes A–D any occupancy, and mode E at 120/192 kHz).
+    #[default]
+    Auto,
+    /// Pin mode E (DRM+); its occupancy is always 0.
+    ModeE,
+}
+
+impl ReceiverMode {
+    pub const ALL: [ReceiverMode; 2] = [Self::Auto, Self::ModeE];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "Auto",
+            Self::ModeE => "Mode E (DRM+)",
+        }
+    }
+
+    /// The mode to pin, or `None` to search. Mode E's only occupancy is 0 (§8.1).
+    pub fn pinned(self) -> Option<(RobustnessMode, SpectrumOccupancy)> {
+        match self {
+            Self::Auto => None,
+            Self::ModeE => Some((RobustnessMode::E, SpectrumOccupancy::SO_0)),
+        }
+    }
+}
+
 /// Where the transmitter's signal goes, overriding the station file's `[output]`
 /// without editing it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -386,12 +422,27 @@ pub struct Settings {
     pub input_device: Option<String>,
     pub format: SignalFormat,
     pub real_channel: ChannelChoice,
+    /// Working sample rate of the receiver, Hz. Modes A–D are demodulated at 48 kHz;
+    /// robustness mode E (DRM+) needs 96/120/192 kHz, because its 213 carriers reach
+    /// ±47.11 kHz. The input is resampled to it (see [`Self::engine_config`]).
+    pub working_rate_hz: u32,
     /// Mirror the spectrum.
     pub flip: bool,
     /// Also accept spectrally inverted signals during acquisition.
     pub auto_flip: bool,
+    /// Decode this robustness mode instead of searching for one (see
+    /// [`ReceiverConfig::pinned`]). Not needed for mode E (DRM+): at 120/192 kHz the search
+    /// finds it, identifies it and tracks its carrier from the guard interval. Pinning skips
+    /// that, which is a shortcut on a weak signal. Modes A–D are found (and their occupancy
+    /// read from the FAC) anyway, so there is nothing to pin for them.
+    pub receiver_mode: ReceiverMode,
     /// Pace recordings to real time (otherwise decode as fast as possible).
     pub realtime: bool,
+    /// DC carrier frequency of the input, Hz, for a pinned receiver (see
+    /// [`ReceiverConfig::dc_hz`]). A pinned receiver does not search for the carrier, so a
+    /// DRM+ recording whose carrier is off centre needs it; the guard interval then corrects
+    /// a few tens of Hz of residual.
+    pub dc_hz: f64,
     pub play_audio: bool,
     /// Sound-card output by name (`None` = system default).
     pub output_device: Option<String>,
@@ -402,6 +453,9 @@ pub struct Settings {
     /// Stations whose SBR band is smoothed (the Audio panel's *Smooth SBR*), by DRM
     /// service ID.
     pub smooth_sbr_services: Vec<u32>,
+    /// Mask audio dropouts (the Audio panel's *Conceal dropouts*): the last clean audio is
+    /// repeated at a falling level while the audio is lost. On by default.
+    pub conceal_dropouts: bool,
     /// Save received data objects (slides, website files, programme guides) below this
     /// directory (the engine's `data_dir`); `None` saves nothing but the website files
     /// the browser needs (see `website`).
@@ -444,14 +498,18 @@ impl Default for Settings {
             input_device: None,
             format: SignalFormat::Real,
             real_channel: ChannelChoice::Mix,
+            working_rate_hz: WorkingRate::R48.hz(),
             flip: false,
             auto_flip: true,
+            receiver_mode: ReceiverMode::Auto,
             realtime: true,
+            dc_hz: 0.0,
             play_audio: true,
             output_device: None,
             volume: 100.0,
             record_dir: None,
             smooth_sbr_services: Vec::new(),
+            conceal_dropouts: true,
             data_dir: None,
             theme: ThemeChoice::System,
             plot_tab: PlotTab::Overview,
@@ -474,6 +532,13 @@ impl Default for Settings {
 }
 
 impl Settings {
+    /// The receiver's working rate: the rate it demodulates at, which the input is
+    /// resampled to. A file's own rate does not matter; this is what the OFDM chain runs
+    /// at, and robustness mode E (DRM+) needs more than 48 kHz.
+    pub fn working_rate(&self) -> WorkingRate {
+        WorkingRate::new(self.working_rate_hz).unwrap_or(WorkingRate::R48)
+    }
+
     /// The receiver's input format.
     pub fn input_format(&self) -> InputFormat {
         match self.format {
@@ -524,6 +589,15 @@ impl Settings {
                 input: self.input_format(),
                 flip: self.flip,
                 auto_flip: self.auto_flip,
+                // The rate the OFDM chain demodulates at. Modes A–D are fine at 48 kHz;
+                // mode E needs 120 kHz or more (see `WorkingRate`).
+                working_rate: self.working_rate(),
+                // A pinned mode needs its occupancy too. Mode E exists at occupancy 0 only
+                // (§8.1; its 213 carriers at 4.444 kHz spacing), which is why the picker
+                // offers no other mode to pin: A–D are expressed by the FAC and found by
+                // the search, so there is nothing to gain by pinning them.
+                pinned: self.receiver_mode.pinned(),
+                dc_hz: self.dc_hz,
                 ..ReceiverConfig::default()
             },
             play_audio: self.play_audio,
@@ -578,7 +652,16 @@ impl Settings {
     /// Select a newly opened recording and guess its signal format from the name
     /// (DecDRM/Dream recordings of I/Q signals carry an `IQ` token, e.g.
     /// `Test_Mode_B_10kHz_IQ_Pos_26dB_SNR.flac`). Returns the guessed format.
+    ///
+    /// The working sample rate follows the file's own rate, rounded to one DecDRM
+    /// demodulates, whenever the header can be read — which is what makes a 192 kHz DRM+
+    /// recording decode without touching the rate picker (at the 48 kHz default its 100 kHz
+    /// signal would be resampled away). An MDI recording has no rate of its own and leaves
+    /// the picker alone.
     pub fn open_file(&mut self, path: PathBuf) -> SignalFormat {
+        if let Some(rate) = decdrm_io::probe_sample_rate(&path) {
+            self.working_rate_hz = WorkingRate::closest(rate).hz();
+        }
         let iq = path
             .file_stem()
             .is_some_and(|s| name_has_iq_token(&s.to_string_lossy()));
@@ -714,14 +797,18 @@ mod tests {
             input_device: Some("CABLE-A Output".into()),
             format: SignalFormat::IqSwapped,
             real_channel: ChannelChoice::Diff,
+            working_rate_hz: 120_000,
             flip: true,
             auto_flip: false,
+            receiver_mode: ReceiverMode::ModeE,
             realtime: false,
+            dc_hz: 20_000.0,
             play_audio: false,
             output_device: Some("Speakers".into()),
             volume: 35.0,
             record_dir: Some(PathBuf::from("recordings")),
             smooth_sbr_services: vec![1, 0xD0D003],
+            conceal_dropouts: false,
             data_dir: Some(PathBuf::from("received")),
             theme: ThemeChoice::Light,
             plot_tab: PlotTab::History,
@@ -760,6 +847,7 @@ mod tests {
         assert!(text.contains("plot_tab = \"history\""), "{text}");
         assert!(text.contains("volume = 35.0"), "{text}");
         assert!(text.contains("smooth_sbr_services = ["), "{text}");
+        assert!(text.contains("conceal_dropouts = false"), "{text}");
         assert!(text.contains("[schedule]"), "{text}");
         assert_eq!(parse(&text).unwrap(), s);
         let partial = parse("[schedule]\nfreq = \"6140\"\n").unwrap();
@@ -788,6 +876,23 @@ mod tests {
         assert!(matches!(cfg.input, InputSpec::File { realtime: true, .. }));
         assert_eq!(cfg.receiver.input, InputFormat::Real(RealChannel::Mix));
         assert!(cfg.receiver.auto_flip && !cfg.receiver.flip);
+        // Modes A–D run at 48 kHz; the setting reaches the receiver, so DRM+ can be received.
+        assert_eq!(cfg.receiver.working_rate, WorkingRate::R48);
+        s.working_rate_hz = WorkingRate::R120.hz();
+        assert_eq!(s.engine_config().unwrap().receiver.working_rate, WorkingRate::R120);
+        s.working_rate_hz = 123_456; // not a rate DecDRM supports
+        assert_eq!(s.working_rate(), WorkingRate::R48, "an unknown rate falls back to 48 kHz");
+        s.working_rate_hz = WorkingRate::R48.hz();
+        // The automatic search leaves the receiver to find the mode and its occupancy.
+        assert_eq!(cfg.receiver.pinned, None);
+        // Pinning DRM+ is how a mode E signal becomes reachable: the search cannot find it.
+        // Its occupancy is always 0, so the GUI derives that rather than storing it.
+        s.receiver_mode = ReceiverMode::ModeE;
+        assert_eq!(
+            s.engine_config().unwrap().receiver.pinned,
+            Some((RobustnessMode::E, SpectrumOccupancy::SO_0))
+        );
+        s.receiver_mode = ReceiverMode::Auto;
         assert_eq!(cfg.data_dir, None);
         s.data_dir = Some("received".into());
         assert_eq!(
@@ -932,6 +1037,61 @@ mod tests {
         assert!(!store.is_dirty(&s));
         let (_, loaded, _) = SettingsStore::load(Some(path.clone()));
         assert_eq!(loaded, s);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A minimal 16-bit stereo PCM WAV: enough for the reader to report the rate.
+    fn write_wav(path: &Path, sample_rate: u32) {
+        let (channels, bits) = (2u16, 16u16);
+        let block = channels * bits / 8; // block alignment, bytes per frame (a u16 field)
+        let data = u32::from(block) * 480;
+        let mut v = Vec::with_capacity(44 + data as usize);
+        v.extend_from_slice(b"RIFF");
+        v.extend_from_slice(&(36 + data).to_le_bytes());
+        v.extend_from_slice(b"WAVEfmt ");
+        v.extend_from_slice(&16u32.to_le_bytes());
+        v.extend_from_slice(&1u16.to_le_bytes());
+        v.extend_from_slice(&channels.to_le_bytes());
+        v.extend_from_slice(&sample_rate.to_le_bytes());
+        v.extend_from_slice(&(sample_rate * u32::from(block)).to_le_bytes());
+        v.extend_from_slice(&block.to_le_bytes());
+        v.extend_from_slice(&bits.to_le_bytes());
+        v.extend_from_slice(b"data");
+        v.extend_from_slice(&data.to_le_bytes());
+        v.extend(std::iter::repeat_n(0u8, data as usize));
+        std::fs::write(path, &v).unwrap();
+    }
+
+    /// Opening a recording demodulates it at its own rate: a 192 kHz DRM+ file would lose
+    /// its 100 kHz signal at the 48 kHz default, and a DRM30 file at 44.1 kHz has no reason
+    /// to be resampled up to 96.
+    #[test]
+    fn opening_a_recording_takes_its_own_rate() {
+        let dir = std::env::temp_dir().join(format!("decdrm-rate-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut s = Settings::default();
+        s.working_rate_hz = WorkingRate::R48.hz();
+        let wide = dir.join("drmplus_IQ_192k.wav");
+        write_wav(&wide, 192_000);
+        assert_eq!(
+            decdrm_io::probe_sample_rate(&wide),
+            Some(192_000),
+            "the reader must see the file's rate"
+        );
+        s.open_file(wide);
+        assert_eq!(s.working_rate_hz, 192_000, "a 192 kHz recording is demodulated at 192 kHz");
+
+        let narrow = dir.join("drm30_44k.wav");
+        write_wav(&narrow, 44_100);
+        s.open_file(narrow);
+        assert_eq!(s.working_rate_hz, 48_000, "44.1 kHz rounds to 48, not up to 96");
+
+        // A file the reader cannot open (an MDI recording) leaves the picker alone.
+        s.working_rate_hz = 120_000;
+        s.open_file(dir.join("recording.mdi"));
+        assert_eq!(s.working_rate_hz, 120_000);
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

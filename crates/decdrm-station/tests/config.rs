@@ -3,7 +3,7 @@
 use decdrm_core::fac::MscMode;
 use decdrm_core::mux::sdc::StreamLengths;
 use decdrm_core::mux::service::{AudioCodec, AudioMode};
-use decdrm_station::{AppKind, Codec, Part, StationConfig, StationError, StreamContent};
+use decdrm_station::{AppKind, Codec, PaprLaw, Part, StationConfig, StationError, StreamContent};
 use std::path::Path;
 
 /// A minimal valid configuration: one HE-AAC tone service, output to `out.wav`.
@@ -391,7 +391,7 @@ fn every_problem_is_reported() {
     "#;
     let p = problems(text);
     for needle in [
-        "only defined with occupancy 3 or 5",
+        "is not defined with occupancy 2 (mode E uses 0; modes C and D use 3 or 5)",
         "set `file` and/or `device`",
         "not an ISO 8601 time",
         "longer than 16 characters",
@@ -594,4 +594,88 @@ fn modulator_section() {
     assert!(p.iter().any(|x| x.contains("buffer_frames 99")), "{p:?}");
     assert!(problems("[mdi]\ninput = \"8000\"\n").iter().any(|x| x.contains("output: set")));
     assert!(problems("[output]\nfile = \"o.wav\"\n[mdi]\ninput = \"nonsense\"\n").iter().any(|x| x.starts_with("mdi: input")));
+}
+
+/// The plan warns when a channel simulator is combined with too little output headroom:
+/// the fading adds gain on top of the signal's own peaks (at the default −15 dBFS, a mode E
+/// VHF station clipped ~2000 samples in 30 s).
+#[test]
+fn simulator_headroom_warning() {
+    let default_level = parse(&format!("{}\n[simulate]\nsnr_db = 20\n", base()));
+    let text = default_level.validate().unwrap().describe(&default_level);
+    assert!(text.contains("headroom"), "{text}");
+    assert!(text.contains("level_dbfs"), "{text}");
+    // 6 dB lower: the warning goes away.
+    let low = base().replace("file = \"out.wav\"", "file = \"out.wav\"\nlevel_dbfs = -21");
+    let low = parse(&format!("{low}\n[simulate]\nsnr_db = 20\n"));
+    assert!(!low.validate().unwrap().describe(&low).contains("headroom"));
+    // A peak limiter holds the peaks down: no warning even at the default level.
+    let limited = base().replace("file = \"out.wav\"", "file = \"out.wav\"\npapr_db = 6");
+    let limited = parse(&format!("{limited}\n[simulate]\nsnr_db = 20\n"));
+    assert!(!limited.validate().unwrap().describe(&limited).contains("headroom"));
+    // Without a simulator the default level is not warned about.
+    assert!(!parse(&base()).validate().unwrap().describe(&parse(&base())).contains("headroom"));
+}
+
+/// `[output] papr_db` / `papr_law`: the PAPR limiter. Optional, off by default, the law
+/// defaults to a hard clip, range-checked and round-tripped through TOML.
+#[test]
+fn papr_limiter_setting() {
+    assert_eq!(parse(&base()).output.papr_db, None, "off unless asked for");
+    assert_eq!(parse(&base()).output.papr_law, PaprLaw::Clip, "clip is the default law");
+    let cfg = parse(&base().replace("file = \"out.wav\"", "file = \"out.wav\"\npapr_db = 6.0"));
+    assert_eq!(cfg.output.papr_db, Some(6.0));
+    let plan = cfg.validate().unwrap();
+    assert_eq!(plan.output.peak_limit, Some(decdrm_core::tx::output::PeakLimit::clip(6.0)));
+    let back = parse(&cfg.to_toml_string().unwrap());
+    assert_eq!(back.output.papr_db, Some(6.0));
+
+    let tanh = parse(&base().replace("file = \"out.wav\"", "file = \"out.wav\"\npapr_db = 6.0\npapr_law = \"tanh\""));
+    assert_eq!(tanh.output.papr_law, PaprLaw::Tanh);
+    assert_eq!(tanh.validate().unwrap().output.peak_limit, Some(decdrm_core::tx::output::PeakLimit::tanh(6.0)));
+
+    for db in ["1.0", "21.0"] {
+        let text = base().replace("file = \"out.wav\"", &format!("file = \"out.wav\"\npapr_db = {db}"));
+        assert!(has(&problems(&text), "papr_db"), "{db} must be refused");
+    }
+    let bad_law = base().replace("file = \"out.wav\"", "file = \"out.wav\"\npapr_law = \"softish\"");
+    assert!(StationConfig::from_toml_str(&bad_law).unwrap_err().to_string().contains("unknown PAPR limiter law"));
+}
+
+/// The VHF presets (`[simulate] vhf = ...`): COST 207 taps for DRM+, with the speed and
+/// band validated and the annex B `channel` number left unused.
+#[test]
+fn vhf_simulation_presets() {
+    let cfg = parse(&format!(
+        "{}\n[simulate]\nvhf = \"tu6\"\nspeed_kmh = 100\ncarrier_mhz = 200\nsnr_db = 20\n",
+        base()
+    ));
+    let sim = cfg.simulate.clone().unwrap();
+    assert_eq!(sim.vhf, Some(decdrm_station::VhfProfile::Tu6));
+    let c = sim.channel_config().unwrap();
+    assert_eq!(c.model.paths.len(), 6, "TU6 has six taps");
+    assert!(c.model.paths.iter().all(|p| p.doppler_spread_hz > 0.0), "100 km/h fades");
+    assert_eq!(c.snr_db, Some(20.0));
+    let text = sim.describe();
+    assert!(text.contains("VHF tu6") && text.contains("100 km/h"), "{text}");
+
+    // Parked: the multipath stays, the fading goes.
+    let parked = parse(&format!("{}\n[simulate]\nvhf = \"ht\"\n", base()));
+    let c = parked.simulate.unwrap().channel_config().unwrap();
+    assert_eq!(c.model.paths.len(), 8, "HT has eight taps");
+    assert!(c.model.paths.iter().all(|p| p.doppler_spread_hz == 0.0));
+
+    // A VHF preset ignores `channel`, so a stale number is not an error; speed and band are
+    // checked.
+    let stale = parse(&format!(
+        "{}\n[simulate]\nchannel = 9\nvhf = \"ra\"\nspeed_kmh = 400\ncarrier_mhz = 10\n",
+        base()
+    ));
+    let p = match stale.validate() {
+        Err(e) => e.problems().to_vec(),
+        Ok(_) => panic!("expected problems"),
+    };
+    assert!(p.iter().any(|x| x.contains("speed_kmh 400")), "{p:?}");
+    assert!(p.iter().any(|x| x.contains("carrier_mhz 10")), "{p:?}");
+    assert!(!p.iter().any(|x| x.contains("channel 9")), "a VHF preset does not use channel: {p:?}");
 }

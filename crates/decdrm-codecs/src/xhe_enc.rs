@@ -264,10 +264,14 @@ pub struct XheAacConfig {
     pub sample_rate: u32,
     /// 1 (mono) or 2 (stereo, one channel pair element).
     pub channels: u16,
-    /// Length of the audio super frame in bytes: the MSC stream's bytes per 400 ms logical
+    /// Length of the audio super frame in bytes: the MSC stream's bytes per audio super
     /// frame, minus the 4 text-message bytes when the SDC text flag is set. The stream bit
-    /// rate is `20 · super_frame_bytes` bit/s.
+    /// rate is `8 · super_frame_bytes / super_frame_ms`.
     pub super_frame_bytes: usize,
+    /// Duration of the audio super frame, milliseconds: **400 in robustness modes A–D,
+    /// 200 in mode E** (§5.3.1.0). The rate control, the 15-frame rule and the 163 920
+    /// bit/s maximum all scale with it.
+    pub super_frame_ms: u32,
     /// SBR ratio.
     pub sbr: XheSbrMode,
     /// Core coding mode.
@@ -289,16 +293,29 @@ impl XheAacConfig {
         Self::with_super_frame_bytes(sample_rate, channels, (bitrate / 20) as usize)
     }
 
-    /// A configuration for audio super frames of exactly `super_frame_bytes` bytes.
+    /// A configuration for audio super frames of exactly `super_frame_bytes` bytes (400 ms
+    /// super frames, as in robustness modes A–D).
     pub fn with_super_frame_bytes(
         sample_rate: u32,
         channels: u16,
         super_frame_bytes: usize,
     ) -> Self {
+        Self::with_super_frame_ms(sample_rate, channels, super_frame_bytes, 400)
+    }
+
+    /// [`Self::with_super_frame_bytes`] for an explicit super frame duration: **200 ms in
+    /// robustness mode E** (§5.3.1.0), 400 ms otherwise.
+    pub fn with_super_frame_ms(
+        sample_rate: u32,
+        channels: u16,
+        super_frame_bytes: usize,
+        super_frame_ms: u32,
+    ) -> Self {
         Self {
             sample_rate,
             channels,
             super_frame_bytes,
+            super_frame_ms,
             sbr: XheSbrMode::Auto,
             coding_mode: XheCodingMode::FrequencyDomain,
             independent_interval: None,
@@ -307,9 +324,15 @@ impl XheAacConfig {
         }
     }
 
-    /// Stream bit rate in bit/s (`20 · super_frame_bytes`).
+    /// Stream bit rate in bit/s: `8 · super_frame_bytes / super_frame_ms`.
     pub fn bitrate(&self) -> u32 {
-        (self.super_frame_bytes as u32).saturating_mul(20)
+        let ms = self.super_frame_ms.max(1) as u64;
+        ((self.super_frame_bytes as u64 * 8_000) / ms) as u32
+    }
+
+    /// The largest super frame the 163 920 bit/s maximum allows for this duration.
+    fn max_super_frame_bytes(&self) -> usize {
+        (163_920usize * self.super_frame_ms.max(1) as usize) / 8_000
     }
 
     /// The SBR ratio used: the fixed one, or for [`XheSbrMode::Auto`] the one that gave the
@@ -404,11 +427,13 @@ impl XheAacConfig {
                 self.channels
             )));
         }
-        if self.super_frame_bytes > XHE_AAC_MAX_SUPER_FRAME_BYTES {
+        if self.super_frame_bytes > self.max_super_frame_bytes() {
             return Err(CodecError::InvalidConfig(format!(
-                "{} bytes per super frame exceed the xHE-AAC maximum of 163 920 bit/s \
-                 ({XHE_AAC_MAX_SUPER_FRAME_BYTES} bytes)",
-                self.super_frame_bytes
+                "{} bytes per {}-ms super frame exceed the xHE-AAC maximum of 163 920 bit/s \
+                 ({} bytes)",
+                self.super_frame_bytes,
+                self.super_frame_ms,
+                self.max_super_frame_bytes()
             )));
         }
         if self.independent_interval == Some(0) {
@@ -566,7 +591,8 @@ impl XheAacConfig {
     /// `None` if no size does (e.g. an SBR ratio the rate does not support).
     pub fn min_super_frame_bytes(&self) -> Option<usize> {
         let mut probe = self.clone();
-        (1..=XHE_AAC_MAX_SUPER_FRAME_BYTES).find(|&l| {
+        let max = self.max_super_frame_bytes();
+        (1..=max).find(|&l| {
             probe.super_frame_bytes = l;
             probe.rate_plan().is_ok()
         })
@@ -578,8 +604,11 @@ impl XheAacConfig {
         let frame_len = ratio.frame_len();
         let fs = i64::from(self.sample_rate);
         let l = self.super_frame_bytes as i64;
+        // Bits per byte per second of the super frame's duration: 20 for 400 ms, 40 for
+        // 200 ms (mode E).
+        let per_byte = 8_000 / i64::from(self.super_frame_ms.max(1));
         // Channel capacity per access unit, in bits·fs (see the module docs).
-        let cap_num = 20 * (l - 2) * frame_len as i64 - 32 * fs;
+        let cap_num = per_byte * (l - 2) * frame_len as i64 - 32 * fs;
         let avg_bits = cap_num as f64 / fs as f64;
         // libxaac runs a little below the channel rate: its own bit reservoir then keeps it
         // inside ours (both start full and have the same size); the difference is filled.
@@ -615,11 +644,12 @@ impl XheAacConfig {
         }
         if (au_min_bytes * 8) as f64 >= avg_bits {
             return Err(CodecError::InvalidConfig(format!(
-                "with {frame_len}-sample frames at {} Hz a 400 ms super frame holds {:.2} \
+                "with {frame_len}-sample frames at {} Hz a {}-ms super frame holds {:.2} \
                  frames; the 15-frame limit of ES 201 980 §5.3.1 leaves no room for a bit \
                  reservoir (use SBR or a lower sampling rate)",
                 self.sample_rate,
-                0.4 * fs as f64 / frame_len as f64
+                self.super_frame_ms,
+                self.super_frame_ms as f64 * fs as f64 / (1000.0 * frame_len as f64)
             )));
         }
         Ok(RatePlan {
@@ -739,7 +769,8 @@ impl XheAacEncoder {
         let core_bitrate = inp.i_bitrate.max(0) as u32;
 
         let fs_u = config.sample_rate;
-        let frames_per_sf = 2 * i64::from(fs_u) / (5 * frame_len as i64); // ⌊0.4·fs/F⌋
+        let frames_per_sf =
+            i64::from(config.super_frame_ms) * i64::from(fs_u) / (1000 * frame_len as i64);
         let independent_interval = u64::from(
             config
                 .independent_interval
@@ -849,9 +880,10 @@ impl XheAacEncoder {
         self.frame_len
     }
 
-    /// Average number of access units per 400 ms audio super frame.
+    /// Average number of access units per audio super frame (its duration is 400 ms in
+    /// robustness modes A–D, 200 ms in mode E).
     pub fn frames_per_super_frame(&self) -> f64 {
-        0.4 * f64::from(self.config.sample_rate) / self.frame_len as f64
+        (self.config.super_frame_ms as f64 / 1000.0) * f64::from(self.config.sample_rate) / self.frame_len as f64
     }
 
     /// Channel capacity for access units in bit/s: the stream rate minus super-frame
@@ -2332,5 +2364,35 @@ mod tests {
             XheAacConfig::new(48_000, 2, 16_000).min_super_frame_bytes(),
             Some(600)
         );
+    }
+
+    /// Mode E's audio super frame is 200 ms (§5.3.1.0): the same bit rate buys twice the
+    /// bytes, and the rate control, the frame count and the 163 920 bit/s ceiling all
+    /// scale with the duration.
+    #[test]
+    fn mode_e_super_frame_duration() {
+        let short = XheAacConfig::with_super_frame_ms(24_000, 1, 600, 200);
+        let long = XheAacConfig::with_super_frame_bytes(24_000, 1, 600);
+        assert_eq!((short.bitrate(), long.bitrate()), (24_000, 12_000));
+        // The same stream rate as 1200 bytes per 400 ms: the budget matches up to the
+        // two-byte super frame header, which a 200 ms super frame pays twice as often
+        // (40 bit/s at 24 kHz).
+        let same = XheAacConfig::with_super_frame_bytes(24_000, 1, 1_200);
+        let (a, b) = (short.budget().unwrap(), same.budget().unwrap());
+        assert!((a.net_bitrate - b.net_bitrate).abs() < 100.0, "{} vs {}", a.net_bitrate, b.net_bitrate);
+        assert!((f64::from(a.core_bitrate) - f64::from(b.core_bitrate)).abs() < 100.0);
+        // Half as many access units per super frame: the encoder's framing must follow.
+        let short_enc = XheAacEncoder::new(short.clone()).unwrap();
+        let long_enc = XheAacEncoder::new(same.clone()).unwrap();
+        assert!(
+            (short_enc.frames_per_super_frame() - long_enc.frames_per_super_frame() / 2.0).abs() < 1e-9,
+            "{} vs {}",
+            short_enc.frames_per_super_frame(),
+            long_enc.frames_per_super_frame()
+        );
+        // The maximum is 163 920 bit/s: 4098 bytes per 200 ms (8196 per 400 ms).
+        let over = XheAacConfig::with_super_frame_ms(48_000, 1, 4_099, 200);
+        let err = over.budget().unwrap_err().to_string();
+        assert!(err.contains("exceed the xHE-AAC maximum"), "{err}");
     }
 }

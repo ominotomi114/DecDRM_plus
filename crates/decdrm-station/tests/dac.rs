@@ -493,4 +493,99 @@ mod loopback {
         let d = decode(&dir.path().join("dac_d.wav"));
         check_service(&d, &plan, 6.0, "Robust");
     }
+
+    /// The receiver side of mode E: I/Q at 192 kHz, pinned to mode E (the acquisition path
+    /// cannot find DRM+ yet).
+    fn decode_pinned_e(path: &Path) -> Decoded {
+        use decdrm_core::params::{RobustnessMode, SpectrumOccupancy};
+        let started = Instant::now();
+        let mut reader = FileReader::open(path).unwrap();
+        let channels = reader.format().channels;
+        let mut d = Decoded {
+            session: Session::new(ReceiverConfig {
+                input: InputFormat::Iq { swap: false },
+                channels,
+                working_rate: decdrm_core::params::WorkingRate::R192,
+                pinned: Some((RobustnessMode::E, SpectrumOccupancy::SO_0)),
+                ..Default::default()
+            }),
+            audio: Vec::new(),
+            rate: 0,
+            channels: 0,
+            texts: Vec::new(),
+        };
+        while let Some(block) = reader.read(4800).unwrap() {
+            for ev in d.session.push(&block) {
+                match ev {
+                    SessionEvent::Audio(pcm) => {
+                        d.rate = pcm.sample_rate;
+                        d.channels = usize::from(pcm.channels);
+                        d.audio.extend_from_slice(&pcm.samples);
+                    }
+                    SessionEvent::Text(Some(t)) => d.texts.push(t),
+                    SessionEvent::Log(l) => println!("rx: {l}"),
+                    _ => {}
+                }
+            }
+        }
+        let st = &d.session.audio_stats;
+        println!(
+            "decoded {:.1} s in {:.2} s: \"{}\", {} super frames ok, {} concealed, {} super frame errors; texts {:?}",
+            d.session.time_s(),
+            started.elapsed().as_secs_f64(),
+            st.codec,
+            st.frames_ok,
+            st.frames_concealed,
+            st.super_frame_errors,
+            d.texts
+        );
+        d
+    }
+
+    /// Mode E, 192 kHz, 16-QAM: DAC's audio super frame is 400 ms by construction (30
+    /// frames of 320 samples at 24 kHz), so it spans **four** 100 ms logical frames; the
+    /// receiver must collect all four and decode the tone.
+    #[test]
+    fn dac_mode_e_loopback() {
+        if !weights_installed() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        write_tone(&dir.path().join("tone.wav"), 440.0, 0.25, 4.0);
+        let toml = r#"
+            [channel]
+            mode = "E"
+            occupancy = 0
+            working_sample_rate = "192"
+            [output]
+            file = "dac_e.wav"
+            format = "iq"
+            sample_format = "float32"
+            level_dbfs = -21
+            [[service]]
+            label = "DAC+"
+            id = 0xD0D0E6
+            [service.audio]
+            codec = "dac"
+            text = ["DAC over DRM+"]
+            input = { file = "tone.wav" }
+        "#;
+        let (plan, _) = transmit(dir.path(), toml, 40);
+        let a = plan.services[0].audio.as_ref().unwrap();
+        assert_eq!(a.parts_per_super_frame, 4, "DAC's 400 ms super frame over 100 ms frames");
+        assert_eq!(a.super_frame_len, 4 * (plan.streams[0].bytes() - 4));
+        let d = decode_pinned_e(&dir.path().join("dac_e.wav"));
+        let st = &d.session.audio_stats;
+        assert!(st.codec.starts_with("DAC "), "{}", st.codec);
+        assert!(st.frames_ok >= 5, "{} super frames decoded", st.frames_ok);
+        assert_eq!((st.frames_concealed, st.super_frame_errors), (0, 0), "every CRC must pass");
+        assert_eq!((d.rate, d.channels), (24_000, 1));
+        let (f, amp) = dominant_tone(&d, 100.0, 3000.0);
+        println!("tone {f} Hz, amplitude {amp:.3}");
+        assert_eq!(f, 440.0);
+        assert!((amp / 0.25 - 1.0).abs() < 0.4, "amplitude {amp}");
+        assert!(d.texts.iter().any(|t| t == "DAC over DRM+"), "{:?}", d.texts);
+        let svc = d.session.ensemble().service(0).expect("service 0");
+        assert_eq!(svc.audio.as_ref(), Some(&plan.services[0].audio.as_ref().unwrap().params));
+    }
 }

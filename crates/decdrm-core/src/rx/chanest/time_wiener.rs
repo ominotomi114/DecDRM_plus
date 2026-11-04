@@ -6,7 +6,7 @@
 
 use crate::cellmap::CellMap;
 use crate::dsp::{iir1_c, iir1_lambda, levinson, linear_regression_slope};
-use crate::params::{RobustnessMode, SAMPLE_RATE};
+use crate::params::RobustnessMode;
 use crate::{Cplx, Real};
 use std::collections::VecDeque;
 use std::f64::consts::PI;
@@ -24,6 +24,16 @@ fn params(mode: RobustnessMode) -> (usize, Real) {
         RobustnessMode::B => (7, 2.7 / 2.0),
         RobustnessMode::C => (9, 5.7 / 2.0),
         RobustnessMode::D => (9, 4.5 / 2.0),
+        // Mode E (DRM+): measured, not inherited. A car on Band III at 100 km/h sees 18.5 Hz
+        // and at 200 km/h 37 Hz of Doppler, an order of magnitude above the modes C/D weights
+        // this used to borrow (σ = 2.85 Hz). Swept against COST 207 TU6 at 200 MHz
+        // (`examples/modee_sweep.rs`, 50-frame runs at 20/10/6 dB): the 3-tap/12 Hz pair
+        // decodes every multiplex frame at 100 km/h and 200 km/h, where the placeholder got
+        // 22/36 and 0/36 at 20 dB, and it also beats it parked (48 FAC against 47), so there
+        // is no static-reception trade. The short filter is what tracks a 37 Hz fade; σ = 12
+        // is the widest the sweep tried and still improved, so a faster receiver may want
+        // more (see the sweep for the next cell).
+        RobustnessMode::E => (3, 12.0),
     }
 }
 
@@ -59,15 +69,38 @@ pub struct TimeWiener {
     ns: usize,
     /// First frame symbol with a gain reference on carrier offset 0.
     s0: usize,
+    /// FFT size at the working rate: the denominator of the timing-shift phase rotation.
+    fft_size: usize,
 }
 
 impl TimeWiener {
     pub fn new(map: &CellMap) -> Self {
+        Self::new_at(map, crate::params::WorkingRate::R48)
+    }
+
+    /// [`Self::new`] at an explicit working sample rate (mode E, DRM+, needs 120 or 192 kHz).
+    ///
+    /// The rate matters because a timing shift (`dshift`, in working-rate samples) is turned
+    /// into a per-carrier phase rotation with the **FFT size at that rate** as the
+    /// denominator: using the 48 kHz size at 192 kHz rotates every estimate 4x too far.
+    pub fn new_at(map: &CellMap, rate: crate::params::WorkingRate) -> Self {
+        Self::new_with(map, rate, super::ChanEstTuning::default())
+    }
+
+    /// [`Self::new_at`] with the filter length and Doppler σ overridden (for tuning).
+    pub fn new_with(
+        map: &CellMap,
+        rate: crate::params::WorkingRate,
+        tuning: super::ChanEstTuning,
+    ) -> Self {
         let mode = map.mode();
-        let (len, sigma_max) = params(mode);
+        let (default_len, default_sigma) = params(mode);
+        let len = tuning.time_len.unwrap_or(default_len);
+        let sigma_max = tuning.time_sigma_hz.unwrap_or(default_sigma);
         let t = map.scattered.time_int;
         let delay = ((len * t - t + 1) as Real / 2.0).ceil() as usize + t / 2 - 1;
-        let ts = mode.symbol_len() as Real / Real::from(SAMPLE_RATE);
+        let ts = mode.symbol_len_at(rate) as Real / Real::from(rate.hz());
+        let fft_size = mode.fft_size_at(rate);
         let grid_len = (map.num_carriers - 1) / map.scattered.freq_int + 1;
         let s0 = (0..map.symbols_per_frame).find(|&s| map.cell(s, 0).is_scattered()).unwrap_or(0);
         let num_pil_one_sym = grid_len.div_ceil(t);
@@ -78,6 +111,7 @@ impl TimeWiener {
             t,
             delay,
             ts,
+            fft_size,
             sigma_max,
             sigma: sigma_max,
             hist: vec![VecDeque::from(vec![init; len]); grid_len],
@@ -134,17 +168,23 @@ impl TimeWiener {
         &mut self,
         map: &CellMap,
         sym: &[Cplx],
-        s: usize,
+        sf_sym: usize,
         cum_shift: i64,
         out_cum_shift: i64,
         snr_pilots: Real,
         out: &mut [Cplx],
     ) -> Real {
         let x = map.scattered.freq_int;
-        let n = map.mode().fft_size() as Real;
-        let cells = map.symbol_cells(s);
-        let pilots = map.symbol_pilots(s);
+        // The timing shift is in working-rate samples, so the rotation denominator is the
+        // FFT size at that rate (NOT the mode's 48 kHz size).
+        let n = self.fft_size as Real;
+        let cells = map.symbol_cells(sf_sym);
+        let pilots = map.symbol_pilots(sf_sym);
         let rot = |h: Cplx, c: usize, dshift: i64| -> Cplx {
+            // Every mode rotates by the timing shift. Mode E used to skip it, because the
+            // shift the loop produced for it was not a real sub-guard drift but the residue
+            // of a timing search coarser than its guard interval (`timesync::step_for`);
+            // with that fixed the rotation is what A-D have always used it for.
             if dshift == 0 {
                 h
             } else {
@@ -152,6 +192,10 @@ impl TimeWiener {
                 h * Cplx::from_polar(1.0, 2.0 * PI * k * dshift as Real / n)
             }
         };
+        // The scattered grid repeats with period `t` **symbols within a frame**, and `s0`
+        // is a frame-relative symbol, so the filter phase must use the frame-relative
+        // symbol. `sf_sym` is a super-frame index (only the map rows need that).
+        let s = sf_sym % self.ns;
         for (p, hist) in self.hist.iter_mut().enumerate() {
             let c = p * x;
             if c >= map.num_carriers {

@@ -26,7 +26,7 @@ mod chain;
 mod mscdec;
 
 pub use chain::{CHAN_ROWS, ChainVisuals, MscConfig, MscFrame, SdcBlock};
-pub use chanest::PdsAxis;
+pub use chanest::{ChanEstTuning, PdsAxis};
 pub use diversity::{CarrierMix, DiversityReceiver, DiversityStats, MixRecord, MscCells, RECENT_MIX};
 pub use scatter::DelayDoppler;
 pub use input::{InputFormat, RealChannel};
@@ -34,7 +34,7 @@ pub use input::{InputFormat, RealChannel};
 use crate::dsp::resampler::FracResampler;
 use crate::fac::{ChannelParams, Fac};
 use crate::fec::qam::MetricKind;
-use crate::params::{RobustnessMode, SAMPLE_RATE, SpectrumOccupancy};
+use crate::params::{RobustnessMode, SpectrumOccupancy, WorkingRate};
 use crate::{Cplx, Real};
 use chain::SymbolChain;
 use freqacq::FreqAcquisition;
@@ -43,8 +43,16 @@ use std::collections::VecDeque;
 use std::f64::consts::PI;
 use timesync::{TimeSync, TimeSyncEvent};
 
-/// Symbols of time sync without a valid FAC before restarting acquisition.
+/// Symbols of time sync without a valid FAC before restarting acquisition. Sized for modes
+/// A-D, whose symbols are 20-26.7 ms: 150 of them is 3-4 s.
 const MAX_SYMBOLS_WITHOUT_FAC: usize = 150;
+/// [`MAX_SYMBOLS_WITHOUT_FAC`] in seconds, which is what mode E needs instead of a count:
+/// its symbols are 2.5 ms, so 150 of them is only 0.375 s — far too little for a mode E
+/// signal whose carrier the mixer has only roughly on frequency (§8.4.2 gives the mode no
+/// frequency reference cells, so the guard-interval tracker has to pull the carrier in and
+/// the frame alignment has to be found, which takes a second or so). Modes A-D keep the
+/// symbol count, which is what their tests were tuned against.
+const FAC_WAIT_S: Real = 4.0;
 /// A frequency acquisition that no FAC has confirmed yet is dropped at once when the
 /// input power rises this many times (10 dB) above its level during the search: the
 /// detection predates the signal. A virtual audio cable, for instance, carries the
@@ -69,6 +77,13 @@ const CP_POWER_RATIO: Real = 0.5;
 /// once instead of after `MAX_BAD_FACS_LOCKED`.
 const CP_LOSS_SYMBOLS: usize = 8;
 const CP_LOSS_BAD_FACS: usize = 2;
+/// Symbols per fine carrier estimate for mode E (see [`Receiver::track_cp_frequency`]): 16
+/// symbols are 40 ms there, and the block averages the guard correlation's phase noise
+/// (a few Hz per symbol) down to about a hertz.
+const CP_TRACK_SYMBOLS: usize = 16;
+/// Guard correlations weaker than this are not used for the carrier estimate: below it the
+/// phase is noise (a collapse at a timing jump, or a deep fade).
+const CP_TRACK_MIN_RHO: Real = 0.35;
 /// Good FACs before switching timing to impulse-response tracking.
 const DELAYED_TRACKING_FACS: usize = 2;
 /// Limit of the sample-rate offset correction, Hz.
@@ -89,6 +104,9 @@ pub struct ReceiverConfig {
     pub input: InputFormat,
     /// Channels in the interleaved input.
     pub channels: usize,
+    /// Channel-estimator overrides (normally the per-mode Wiener defaults; a sweep sets them
+    /// here — see [`ChanEstTuning`]).
+    pub chanest: ChanEstTuning,
     /// Mirror the spectrum (manual).
     pub flip: bool,
     /// Also accept spectrally inverted signals during acquisition.
@@ -103,6 +121,25 @@ pub struct ReceiverConfig {
     /// A branch of diversity reception: hand the equalised MSC cells out per multiplex
     /// frame ([`ReceiverEvent::MscCells`]) for the combiner instead of decoding them.
     pub diversity_branch: bool,
+    /// Working sample rate of the input: the rate the OFDM baseband is demodulated at, in Hz.
+    /// Modes A–D are received at 48 kHz (the default); robustness mode E (DRM+) needs
+    /// [`WorkingRate::R120`] or more, because its 213 carriers reach ±47.11 kHz.
+    pub working_rate: WorkingRate,
+    /// Decode this robustness mode instead of searching for one, at this spectrum
+    /// occupancy (see [`Receiver::set_mode`]). Pinning is no longer needed for mode E
+    /// (DRM+): the frequency scan finds its spectrum plateau, the time sync identifies the
+    /// mode, and the guard interval refines the carrier (see [`Receiver::track_cp_frequency`]),
+    /// at 120/192 kHz. It remains a shortcut when both the mode and the centre frequency are
+    /// known, and skips the second or so the search takes. A pinned receiver runs at DC with
+    /// no frequency search, so a signal pinned while off centre by more than the guard
+    /// interval's ±222 Hz decodes nothing.
+    pub pinned: Option<(RobustnessMode, SpectrumOccupancy)>,
+    /// DC carrier frequency of the input, Hz, for a **pinned** receiver: the mixer runs at
+    /// this offset instead of at 0. A pinned receiver does not search for the signal, and a
+    /// DRM+ recording whose carrier is off centre (the reference recordings carry +20 kHz)
+    /// would otherwise decode nothing. Ignored while searching — the scan finds the carrier
+    /// itself — and refined from there by the tracking loop once the FAC arrives.
+    pub dc_hz: Real,
 }
 
 /// The default MSC soft metric: the Huber shape with Dream's amplitude weighting and a
@@ -120,11 +157,15 @@ impl Default for ReceiverConfig {
         Self {
             input: InputFormat::default(),
             channels: 1,
+            chanest: ChanEstTuning::default(),
             flip: false,
             auto_flip: true,
             msc_iterations: 2,
             metric: MSC_METRIC,
             diversity_branch: false,
+            working_rate: WorkingRate::R48,
+            pinned: None,
+            dc_hz: 0.0,
         }
     }
 }
@@ -308,6 +349,8 @@ pub struct Receiver {
     timesync: TimeSync,
     chain: Option<SymbolChain>,
     mode: RobustnessMode,
+    /// A mode/occupancy the caller pinned with [`Receiver::set_mode`], instead of searching.
+    pinned: Option<(RobustnessMode, SpectrumOccupancy)>,
     state: RxState,
     symbols_without_fac: usize,
     bad_facs: usize,
@@ -317,6 +360,11 @@ pub struct Receiver {
     /// Timing health: fast/slow averages of the cyclic-prefix correlation and of the
     /// window power, reference samples, symbols with a collapsed correlation.
     cp: TimingHealth,
+    /// Mode E's fine carrier estimate: the cyclic-prefix correlations of the symbols since
+    /// the last correction, summed (their common phase is the frequency error), and how many
+    /// there are. See [`Self::track_cp_frequency`].
+    cp_sum: Cplx,
+    cp_symbols: usize,
     /// Pilot-slope SRO acquisition: estimates seen, and the previous block's.
     sro_reports: usize,
     sro_prev: Option<Real>,
@@ -334,11 +382,22 @@ pub struct Receiver {
 
 impl Receiver {
     pub fn new(cfg: ReceiverConfig) -> Self {
+        let mut rx = Self::searching(cfg.clone());
+        // A configured pinned mode needs no frequency search and no mode detection.
+        if let Some((mode, occupancy)) = cfg.pinned {
+            rx.set_mode(mode, occupancy);
+        }
+        rx
+    }
+
+    /// A receiver that searches for a signal: frequency scan and mode detection armed.
+    fn searching(cfg: ReceiverConfig) -> Self {
         let input = InputConverter::new(cfg.input, cfg.channels, cfg.flip);
         let real = input.is_real();
         let mode = RobustnessMode::B;
         Self {
-            acq: Some(FreqAcquisition::new(real, cfg.auto_flip)),
+            pinned: None,
+            acq: Some(FreqAcquisition::new_at(real, cfg.auto_flip, cfg.working_rate)),
             acq_power: None,
             loud_samples: 0,
             input,
@@ -352,7 +411,7 @@ impl Receiver {
             track_hz: 0.0,
             nco_phase: 0.0,
             mixed: Vec::new(),
-            timesync: TimeSync::new(mode),
+            timesync: TimeSync::new_at(mode, cfg.working_rate),
             chain: None,
             mode,
             state: RxState::Acquisition,
@@ -362,6 +421,8 @@ impl Receiver {
             delayed_cnt: DELAYED_TRACKING_FACS,
             delayed_done: false,
             cp: TimingHealth::default(),
+            cp_sum: Cplx::new(0.0, 0.0),
+            cp_symbols: 0,
             sro_reports: 0,
             sro_prev: None,
             msc_config: None,
@@ -410,9 +471,9 @@ impl Receiver {
             spectrum_db: self.spectrum.db(),
             waterfall_rows: self.spectrum.rows.iter().cloned().collect(),
             spectrum_seq: self.spectrum.count,
-            spectrum_row_s: InputSpectrum::LEN as Real / Real::from(SAMPLE_RATE),
+            spectrum_row_s: InputSpectrum::LEN as Real / Real::from(self.fs()),
             spectrum_centre_hz: 0.0,
-            spectrum_span_hz: Real::from(SAMPLE_RATE),
+            spectrum_span_hz: Real::from(self.fs()),
             real_input: self.input.is_real(),
             dc_hz,
             signal_band_hz,
@@ -425,22 +486,75 @@ impl Receiver {
         self.chain.as_ref().map(|c| c.msc_cells()).unwrap_or_default()
     }
 
-    /// Latest robustness-mode detection scores (A, B, C, D), for diagnostics.
-    pub fn mode_scores(&self) -> [Real; 4] {
+    /// Latest robustness-mode detection scores, one per mode (A, B, C, D, E), for
+    /// diagnostics.
+    pub fn mode_scores(&self) -> [Real; crate::params::RobustnessMode::ALL.len()] {
         self.timesync.last_mode_scores
     }
 
     /// Restart acquisition from scratch (e.g. after retuning).
+    /// Pin the robustness mode and spectrum occupancy instead of searching for them.
+    ///
+    /// Pinning is not needed for mode E (DRM+) any more — the search finds it and the guard
+    /// interval tracks its carrier — but it saves the second or so acquisition takes, and it
+    /// is what a caller who already knows the mode (a recording decoded at a known carrier)
+    /// wants. The receiver then does not try to detect the mode and does not re-derive the
+    /// occupancy from the FAC.
+    pub fn set_mode(&mut self, mode: RobustnessMode, occupancy: SpectrumOccupancy) {
+        self.pinned = Some((mode, occupancy));
+        self.mode = mode;
+        self.timesync.stop_mode_detection();
+        self.timesync.restart(mode);
+        self.chain = None;
+        // The caller has already told us what and where the signal is, so there is nothing
+        // to search for: drop the frequency acquisition and run at DC. (Its scan is built
+        // for 48 kHz geometry — a fixed 6144-point FFT over fixed pilot bins — and would
+        // not find a mode E signal at 120/192 kHz anyway.)
+        self.acq = None;
+        self.acq_power = None;
+        self.conj = false;
+        // A pinned receiver was told where the signal is, which includes how far its carrier
+        // is from DC (`ReceiverConfig::dc_hz`). The tracking loop refines it once the FAC
+        // arrives; this is what gets the first FAC.
+        self.dc_hz = self.cfg.dc_hz;
+        self.track_hz = 0.0;
+        // Stay in `Acquisition`, NOT `Tracking`: pinning says where the signal is, not where
+        // the frame boundary is. The receiver still has to find symbol 0 of the frame (FrameSync
+        // and the time-reference pilots do that), and `Acquisition` is the state that keeps
+        // trying and, after `MAX_SYMBOLS_WITHOUT_FAC`, resynchronises if it cannot. Forcing
+        // `Tracking` skipped both, so a pinned mode E file never aligned and never recovered -
+        // which is why the same signal decoded in memory and not through a file (measured: the
+        // file is the same signal, shifted by the transmit filter's group delay).
+        self.state = RxState::Acquisition;
+        self.symbols_without_fac = 0;
+    }
+
+    /// The pinned mode and occupancy, if any (see [`Self::set_mode`]).
+    pub fn pinned_mode(&self) -> Option<(RobustnessMode, SpectrumOccupancy)> {
+        self.pinned
+    }
+
     pub fn restart(&mut self) {
-        let real = self.input.is_real();
-        self.acq = Some(FreqAcquisition::new(real, self.cfg.auto_flip));
+        // A pinned receiver was told where the signal is, and the frequency scan is built
+        // for 48 kHz geometry: re-arming it would lose a mode E signal at 120/192 kHz for
+        // good. Pinned, run at DC as `set_mode` left it. Unpinned, scan afresh.
+        if self.pinned.is_none() {
+            let real = self.input.is_real();
+            self.acq = Some(FreqAcquisition::new_at(real, self.cfg.auto_flip, self.cfg.working_rate));
+            self.conj = false;
+            self.dc_hz = 0.0;
+        }
         self.acq_power = None;
         self.loud_samples = 0;
         self.pending.clear();
-        self.conj = false;
         self.track_hz = 0.0;
-        self.mode = RobustnessMode::B;
+        self.mode = self.pinned.map_or(RobustnessMode::B, |(m, _)| m);
         self.timesync.restart(self.mode);
+        // The FAC's 2-bit mode field cannot express mode E, so a pinned receiver keeps
+        // believing what it was told instead of re-deriving the mode from the FAC.
+        if self.pinned.is_some() {
+            self.timesync.stop_mode_detection();
+        }
         self.chain = None;
         self.state = RxState::Acquisition;
         self.symbols_without_fac = 0;
@@ -449,6 +563,8 @@ impl Receiver {
         self.delayed_cnt = DELAYED_TRACKING_FACS;
         self.delayed_done = false;
         self.cp = TimingHealth::default();
+        self.cp_sum = Cplx::new(0.0, 0.0);
+        self.cp_symbols = 0;
         self.fac_config = None;
         self.fac_pending = None;
         let (ok, bad, sok, sbad) = (self.status.fac_ok, self.status.fac_bad, self.status.sdc_ok, self.status.sdc_bad);
@@ -458,7 +574,7 @@ impl Receiver {
     /// Change the sample-rate correction. Frequencies at the resampler output scale
     /// with (fs - sro), so the mixer frequency is rescaled to stay on the signal.
     fn set_sro(&mut self, new_sro: Real) {
-        let fs = Real::from(SAMPLE_RATE);
+        let fs = Real::from(self.fs());
         let new_sro = new_sro.clamp(-MAX_SRO_HZ, MAX_SRO_HZ);
         let scale = (fs - new_sro) / (fs - self.sro_hz);
         self.dc_hz *= scale;
@@ -466,7 +582,24 @@ impl Receiver {
         self.sro_hz = new_sro;
     }
 
-    /// Feed interleaved samples (any number of frames) at 48 kHz and return the
+    /// The working sample rate of the input, Hz: everything that converts between samples
+    /// and seconds (frequencies, the SRO, the spectrum axis) uses this. 48 kHz for modes
+    /// A–D; mode E (DRM+) is received at 120 or 192 kHz.
+    fn fs(&self) -> u32 {
+        self.cfg.working_rate.hz()
+    }
+
+    /// Time-sync symbols without a valid FAC that acquisition tolerates (see
+    /// [`MAX_SYMBOLS_WITHOUT_FAC`] and [`FAC_WAIT_S`]).
+    fn max_symbols_without_fac(&self) -> usize {
+        if self.mode != RobustnessMode::E {
+            return MAX_SYMBOLS_WITHOUT_FAC;
+        }
+        let symbol_s = self.mode.symbol_len_at(self.cfg.working_rate) as Real / Real::from(self.fs());
+        (FAC_WAIT_S / symbol_s.max(1e-9)).ceil() as usize
+    }
+
+    /// Feed interleaved samples (any number of frames) at the working rate and return the
     /// events produced.
     pub fn push(&mut self, interleaved: &[f32]) -> Vec<ReceiverEvent> {
         let ch = self.cfg.channels.max(1);
@@ -483,7 +616,7 @@ impl Receiver {
         self.input.process(chunk, &mut self.conv);
         self.spectrum.push(&self.conv);
         self.res.clear();
-        let fs = Real::from(SAMPLE_RATE);
+        let fs = Real::from(self.fs());
         let sro = self.sro_hz.clamp(-MAX_SRO_HZ, MAX_SRO_HZ);
         let ratio = fs / (fs - sro);
         self.resampler.process(&self.conv, ratio, &mut self.res);
@@ -499,7 +632,7 @@ impl Receiver {
             self.pending.extend_from_slice(&samples);
             // Keep only what the frequency search looked at (≈0.45 s), so no
             // pre-signal data reaches time sync.
-            let max_pending = freqacq::ANALYSIS_SPAN;
+            let max_pending = freqacq::analysis_span_at(self.cfg.working_rate);
             if self.pending.len() > max_pending {
                 let d = self.pending.len() - max_pending;
                 self.pending.drain(..d);
@@ -535,7 +668,7 @@ impl Receiver {
         // Process in pieces so frequency corrections take effect quickly.
         for piece in samples.chunks(256) {
             self.mixed.clear();
-            let fs = Real::from(SAMPLE_RATE);
+            let fs = Real::from(self.fs());
             let w = 2.0 * PI * (self.dc_hz + self.track_hz) / fs;
             for &s in piece {
                 let s = if self.conj { s.conj() } else { s };
@@ -570,9 +703,60 @@ impl Receiver {
         }
     }
 
+    /// Fine carrier correction for mode E from the phase of the guard-interval correlation.
+    ///
+    /// A residual offset `df` rotates every sample by `2π·df·t`, so the correlation between
+    /// the cyclic prefix and the copy of it at the end of the symbol has the phase
+    /// `−2π·df·Tu`. Tu is the useful symbol length, 27T = 2.25 ms in mode E, so the estimate
+    /// is unambiguous within ±1/(2Tu) = ±222 Hz — wider than the spectrum search's error —
+    /// and it is independent of the channel (both samples pass through the same taps) and of
+    /// where in the guard the window sits. Averaging [`CP_TRACK_SYMBOLS`] symbols takes the
+    /// per-symbol phase noise down to about a hertz.
+    ///
+    /// This is what makes unpinned mode E decode. Nothing else refines the spectrum
+    /// search's estimate (measured: 14–62 Hz of scatter per window, and up to 220 Hz from
+    /// the receiver's own restarts), and mode E loses most of its multiplex frames beyond
+    /// about ±50 Hz while ±20 Hz decodes cleanly — measured by shifting a pinned receiver's
+    /// mixer over the reference recording.
+    fn track_cp_frequency(&mut self, win: &timesync::SymbolWindow) {
+        let (Some(rho), Some(phase)) = (win.guard_corr, win.guard_phase) else {
+            return;
+        };
+        if rho < CP_TRACK_MIN_RHO {
+            return;
+        }
+        self.cp_sum += Cplx::from_polar(rho, phase);
+        self.cp_symbols += 1;
+        if self.cp_symbols < CP_TRACK_SYMBOLS {
+            return;
+        }
+        let tu_s = self.mode.fft_size_at(self.cfg.working_rate) as Real / Real::from(self.fs());
+        let residual = -self.cp_sum.arg() / (2.0 * PI * tu_s);
+        self.cp_sum = Cplx::new(0.0, 0.0);
+        self.cp_symbols = 0;
+        // The estimate is the mixer's *current* residual, which is why it is added rather
+        // than integrated: the block after this one measures what is left.
+        self.track_hz += residual;
+    }
+
     fn process_window(&mut self, win: timesync::SymbolWindow) {
+        // Mode E cannot track its carrier from pilots — §8.4.2 gives it no frequency
+        // reference cells and it has no continuous pilots either, so `framesync` disables
+        // its frequency tracking outright. The guard interval does it instead.
+        if self.mode == RobustnessMode::E {
+            self.track_cp_frequency(&win);
+        }
         if self.chain.is_none() {
-            let so = SpectrumOccupancy::SO_3;
+            // Mode E exists at occupancy 0 only (§8.1), so an unpinned receiver that mode
+            // detection has just switched to E must not be given the DRM30 default: the
+            // cell map refuses that pair, `SymbolChain::new` returns None, and the receiver
+            // stays in acquisition with no chain at all.
+            let default_so = if self.mode == RobustnessMode::E {
+                SpectrumOccupancy::SO_0
+            } else {
+                SpectrumOccupancy::SO_3
+            };
+            let so = self.pinned.map_or(default_so, |(_, so)| so);
             self.chain = SymbolChain::new(self.mode, so, &self.cfg);
             self.sro_reports = 0;
             self.sro_prev = None;
@@ -583,6 +767,8 @@ impl Receiver {
         if let Some(rho) = win.guard_corr {
             self.cp.update(rho, win.power, self.state == RxState::Locked && self.bad_facs == 0);
         }
+        // Read the rate before `chain` takes its mutable borrow of `self`.
+        let fs = self.fs();
         let Some(chain) = self.chain.as_mut() else { return };
         let out = chain.process(&win);
         // The time-pilot monitor alone misfires on harsh channels (mode D on channels
@@ -610,7 +796,7 @@ impl Receiver {
                     && eps.abs() > SRO_ACQ_THRESHOLD
                     && (prev - eps).abs() < 0.25 * prev.abs().max(eps.abs())
                 {
-                    sro_delta += 0.5 * (prev + eps) * Real::from(SAMPLE_RATE);
+                    sro_delta += 0.5 * (prev + eps) * Real::from(fs);
                     chain.reset_sro_estimate();
                     self.sro_reports = 0;
                     self.sro_prev = None;
@@ -664,7 +850,7 @@ impl Receiver {
                 chain::ChainEvent::FrameIdentity(trusted) => self.events.push(ReceiverEvent::FrameIdentity { trusted }),
                 chain::ChainEvent::Msc(m) => self.events.push(ReceiverEvent::Msc(m)),
                 chain::ChainEvent::MscCells { cells, index, gap, carriers, kmin } => {
-                    let time_s = self.samples_in as Real / Real::from(SAMPLE_RATE);
+                    let time_s = self.samples_in as Real / Real::from(self.fs());
                     self.events.push(ReceiverEvent::MscCells(MscCells { cells, index, gap, time_s, carriers, kmin }));
                 }
             }
@@ -678,7 +864,7 @@ impl Receiver {
 
         if self.state == RxState::Acquisition {
             self.symbols_without_fac += 1;
-            if self.symbols_without_fac > MAX_SYMBOLS_WITHOUT_FAC {
+            if self.symbols_without_fac > self.max_symbols_without_fac() {
                 self.restart();
                 self.events.push(ReceiverEvent::Restarted);
             }
@@ -765,6 +951,8 @@ impl Receiver {
         self.delayed_cnt = DELAYED_TRACKING_FACS;
         self.delayed_done = false;
         self.cp = TimingHealth::default();
+        self.cp_sum = Cplx::new(0.0, 0.0);
+        self.cp_symbols = 0;
         self.status.state = RxState::Acquisition;
     }
 }

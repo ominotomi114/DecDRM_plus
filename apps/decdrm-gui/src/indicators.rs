@@ -271,6 +271,7 @@ pub fn fmt_error_rate(ok: u64, bad: u64) -> String {
 
 pub fn fmt_msc_mode(m: MscMode) -> &'static str {
     match m {
+        MscMode::Qam4 => "4-QAM",
         MscMode::Qam64Sm => "64-QAM",
         MscMode::Qam64HmSym => "64-QAM HMsym",
         MscMode::Qam64HmMix => "64-QAM HMmix",
@@ -282,6 +283,7 @@ pub fn fmt_sdc_mode(m: SdcMode) -> &'static str {
     match m {
         SdcMode::Qam16 => "16-QAM",
         SdcMode::Qam4 => "4-QAM",
+        SdcMode::Qam4Rate25 => "4-QAM r1/4",
     }
 }
 

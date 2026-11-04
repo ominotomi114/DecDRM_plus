@@ -1,14 +1,122 @@
-//! Basic DRM30 transmission parameters: robustness modes, spectrum occupancy and the
-//! OFDM numerology derived from them (ES 201 980 §8.1).
+//! DRM transmission parameters: robustness modes, spectrum occupancy and the OFDM
+//! numerology derived from them (ES 201 980 §8.1, tables 47–49).
 //!
-//! DecDRM always processes the signal at [`SAMPLE_RATE`] (48 kHz), at which every
-//! robustness mode has an integer number of samples per useful symbol part and guard
-//! interval (the same choice Dream makes).
+//! Modes A–D run at [`SAMPLE_RATE`] (48 kHz), at which every one of them has an integer
+//! number of samples per useful symbol part and guard interval (the same choice Dream makes).
+//! Robustness mode E (DRM+) has 213 carriers reaching ±47.11 kHz, so it needs the higher
+//! [`WorkingRate`] — see [`check_mode_rate`].
 
 use std::fmt;
 
 /// Working sample rate of the receiver and transmitter chains, in Hz.
+///
+/// The default ([`WorkingRate::R48`]). Modes A–D run only at this rate; robustness mode E
+/// needs [`MODE_E_MIN_RATE`] or more (see [`WorkingRate`] and [`check_mode_rate`]).
 pub const SAMPLE_RATE: u32 = 48_000;
+
+/// The elementary time period T = 83⅓ µs, as its denominator in seconds: T = 1/12000 s
+/// (ES 201 980 §8.1).
+///
+/// Every DRM transmission parameter is a whole number of these periods, and T is a whole
+/// number of samples at every [`WorkingRate`] (4, 8, 10 or 16) — which is what keeps the
+/// symbol geometry exact instead of accumulating rounding error.
+pub const ELEMENTARY_PERIOD_DEN: u32 = 12_000;
+
+/// Lowest working sample rate robustness mode E may use, in Hz.
+///
+/// Mode E carries 213 carriers (Kmin = −106 … Kmax = +106) at a 444 4/9 Hz spacing, so its
+/// highest carrier reaches +47.11 kHz: Nyquist needs more than 94.2 kHz. 100 kHz is the DRM+
+/// channel raster (§8.3, table 48) and leaves ~2.9 kHz of margin.
+pub const MODE_E_MIN_RATE: u32 = 100_000;
+
+/// The working sample rate of the chains: the rate the OFDM baseband is generated and
+/// demodulated at, in Hz.
+///
+/// Modes A–D run at 48 kHz. Mode E needs [`MODE_E_MIN_RATE`] or more, which is why this is a
+/// value the engine carries rather than a single constant.
+///
+/// Every rate here keeps T a whole number of samples, so the symbol geometry stays exact:
+///
+/// | rate | samples per T | Tu (27T) | Tg (3T) | Ts (30T) | mode E Nyquist margin |
+/// |---|---|---|---|---|---|
+/// | 48 kHz | 4 | 108 | 12 | 120 | — (mode E cannot run here) |
+/// | 96 kHz | 8 | 216 | 24 | 240 | +0.89 kHz (too tight for real filters) |
+/// | 120 kHz | 10 | 270 | 30 | 300 | +12.9 kHz |
+/// | 192 kHz | 16 | 432 | 48 | 480 | +48.9 kHz |
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct WorkingRate(u32);
+
+impl WorkingRate {
+    /// 48 kHz: the rate modes A–D run at.
+    pub const R48: Self = Self(48_000);
+    /// 96 kHz: the lowest rate that fits mode E's carriers, but with only 0.89 kHz of
+    /// Nyquist margin — prefer [`Self::R120`].
+    pub const R96: Self = Self(96_000);
+    /// 120 kHz: mode E with 12.9 kHz of margin.
+    pub const R120: Self = Self(120_000);
+    /// 192 kHz: mode E with 48.9 kHz of margin.
+    pub const R192: Self = Self(192_000);
+
+    /// The working rates DecDRM accepts, ascending.
+    pub const ALL: [Self; 4] = [Self::R48, Self::R96, Self::R120, Self::R192];
+
+    /// A rate of `hz` Hz, if DecDRM supports it.
+    pub const fn new(hz: u32) -> Option<Self> {
+        match hz {
+            48_000 => Some(Self::R48),
+            96_000 => Some(Self::R96),
+            120_000 => Some(Self::R120),
+            192_000 => Some(Self::R192),
+            _ => None,
+        }
+    }
+
+    /// The supported rate closest to `hz` Hz (a tie goes to the lower rate).
+    ///
+    /// The working rate wants to follow the input, not to be a free choice: demodulating at
+    /// another rate means resampling, and a DRM+ signal resampled down to 48 kHz is gone.
+    /// A caller that reads a file's own rate (a 44.1 kHz DRM30 recording, a 250 kHz Kiwi
+    /// capture) rounds it with this.
+    pub fn closest(hz: u32) -> Self {
+        Self::ALL
+            .into_iter()
+            .min_by_key(|r| r.0.abs_diff(hz))
+            .unwrap_or(Self::R48)
+    }
+
+    /// The rate in Hz.
+    pub const fn hz(self) -> u32 {
+        self.0
+    }
+
+    /// Samples per elementary period T (83⅓ µs).
+    pub const fn samples_per_t(self) -> usize {
+        (self.0 / ELEMENTARY_PERIOD_DEN) as usize
+    }
+
+    /// Whether `mode` may be used at this rate (see [`check_mode_rate`]).
+    pub fn allows(self, mode: RobustnessMode) -> bool {
+        check_mode_rate(mode, self).is_ok()
+    }
+}
+
+impl Default for WorkingRate {
+    fn default() -> Self {
+        Self(SAMPLE_RATE)
+    }
+}
+
+impl From<WorkingRate> for f64 {
+    fn from(r: WorkingRate) -> Self {
+        f64::from(r.0)
+    }
+}
+
+impl fmt::Display for WorkingRate {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} kHz", self.0 as f64 / 1000.0)
+    }
+}
 
 /// Transmission frames per transmission super frame (§8.1).
 pub const FRAMES_PER_SUPERFRAME: usize = 3;
@@ -22,25 +130,40 @@ pub const MAX_STREAMS: usize = 4;
 /// Maximum number of services (§6.3).
 pub const MAX_SERVICES: usize = 4;
 
-/// DRM30 robustness mode (§8.1, table 82).
+/// DRM robustness mode (§8.1, table 47; §4.4.2.2, table 1).
+///
+/// Modes A–D are the DRM30 modes used below 30 MHz. **Mode E is DRM+**: the VHF mode, in
+/// band II (the FM band) on a 100 kHz raster. It differs from the others in more than
+/// numerology — its frame is 100 ms rather than 400 ms, it leaves no carriers unused, it
+/// defines no frequency reference cells, it has AFS reference cells the others lack, its FAC
+/// carries two sets of service parameters, and it needs a working sample rate above ~94 kHz
+/// (see [`check_mode_rate`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum RobustnessMode {
     A,
     B,
     C,
     D,
+    E,
 }
 
 impl RobustnessMode {
-    /// All DRM30 modes, in order.
-    pub const ALL: [RobustnessMode; 4] = [Self::A, Self::B, Self::C, Self::D];
+    /// The DRM30 modes A–D, in order.
+    pub const DRM30: [RobustnessMode; 4] = [Self::A, Self::B, Self::C, Self::D];
 
-    /// Index 0..=3, used to address per-mode tables.
+    /// Every mode, in order.
+    pub const ALL: [RobustnessMode; 5] = [Self::A, Self::B, Self::C, Self::D, Self::E];
+
+    /// Index 0..=4, used to address per-mode tables.
     pub const fn index(self) -> usize {
         self as usize
     }
 
     /// Decode the 2-bit robustness mode field used in SDC/MDI signalling.
+    ///
+    /// The field cannot express mode E: §6.3 gives the value `1` a second meaning ("the FAC
+    /// block contains two sets of service parameters") when the SDC says so, so mode E is
+    /// recognised from the SDC rather than from these two bits alone.
     pub const fn from_index(i: usize) -> Option<Self> {
         match i {
             0 => Some(Self::A),
@@ -51,54 +174,125 @@ impl RobustnessMode {
         }
     }
 
-    /// Length of the useful symbol part Tu in samples at 48 kHz (= FFT size).
-    pub const fn fft_size(self) -> usize {
+    /// `true` for robustness mode E (DRM+).
+    pub const fn is_drm_plus(self) -> bool {
+        matches!(self, Self::E)
+    }
+
+    /// Useful symbol part Tu in units of the elementary period T
+    /// (§8.1, table 2: 288, 256, 176, 112, 27).
+    pub const fn tu_in_t(self) -> usize {
         match self {
-            Self::A => 1152,
-            Self::B => 1024,
-            Self::C => 704,
-            Self::D => 448,
+            Self::A => 288,
+            Self::B => 256,
+            Self::C => 176,
+            Self::D => 112,
+            Self::E => 27,
         }
     }
 
-    /// Ratio Tg/Tu as (numerator, denominator).
+    /// Guard interval Tg in units of the elementary period T
+    /// (§8.1, table 2: 32, 64, 64, 88, 3).
+    pub const fn tg_in_t(self) -> usize {
+        match self {
+            Self::A => 32,
+            Self::B => 64,
+            Self::C => 64,
+            Self::D => 88,
+            Self::E => 3,
+        }
+    }
+
+    /// Length of the useful symbol part Tu in samples at `rate` (= FFT size).
+    ///
+    /// Exact for every [`WorkingRate`], because T is a whole number of samples there.
+    pub const fn fft_size_at(self, rate: WorkingRate) -> usize {
+        self.tu_in_t() * rate.samples_per_t()
+    }
+
+    /// Ratio Tg/Tu as (numerator, denominator) (§8.1, table 2).
     pub const fn guard_ratio(self) -> (usize, usize) {
         match self {
             Self::A => (1, 9),
             Self::B => (1, 4),
             Self::C => (4, 11),
             Self::D => (11, 14),
+            Self::E => (1, 9),
         }
     }
 
-    /// Guard interval length Tg in samples at 48 kHz.
+    /// Guard interval length Tg in samples at `rate`.
+    pub const fn guard_len_at(self, rate: WorkingRate) -> usize {
+        self.tg_in_t() * rate.samples_per_t()
+    }
+
+    /// Total symbol length Ts = Tu + Tg in samples at `rate`.
+    pub const fn symbol_len_at(self, rate: WorkingRate) -> usize {
+        self.fft_size_at(rate) + self.guard_len_at(rate)
+    }
+
+    /// Length of the useful symbol part Tu in samples at the default 48 kHz (§8.1, table 2).
+    ///
+    /// A–D only: mode E has no geometry at this rate (see [`check_mode_rate`]).
+    pub const fn fft_size(self) -> usize {
+        self.fft_size_at(WorkingRate::R48)
+    }
+
+    /// Guard interval length Tg in samples at the default 48 kHz.
     pub const fn guard_len(self) -> usize {
-        let (num, den) = self.guard_ratio();
-        self.fft_size() * num / den
+        self.guard_len_at(WorkingRate::R48)
     }
 
-    /// Total symbol length Ts = Tu + Tg in samples at 48 kHz.
+    /// Total symbol length Ts = Tu + Tg in samples at the default 48 kHz.
     pub const fn symbol_len(self) -> usize {
-        self.fft_size() + self.guard_len()
+        self.symbol_len_at(WorkingRate::R48)
     }
 
-    /// Number of OFDM symbols per transmission frame Ns.
+    /// Number of OFDM symbols per transmission frame Ns (§8.1, table 47).
     pub const fn symbols_per_frame(self) -> usize {
         match self {
             Self::A | Self::B => 15,
             Self::C => 20,
             Self::D => 24,
+            Self::E => 40,
         }
+    }
+
+    /// Transmission frames per transmission super frame (§8.1): three for A–D, four for E.
+    pub const fn frames_per_superframe(self) -> usize {
+        match self {
+            Self::A | Self::B | Self::C | Self::D => 3,
+            // "each transmission super frame consists of four transmission frames" (§8.1).
+            Self::E => 4,
+        }
+    }
+
+    /// Duration of one transmission frame, ms: 400 for A–D, **100 for mode E** (§8.1, table 2).
+    pub const fn frame_ms(self) -> u32 {
+        match self {
+            Self::A | Self::B | Self::C | Self::D => 400,
+            Self::E => 100,
+        }
+    }
+
+    /// Samples in one transmission frame at `rate`.
+    pub const fn samples_per_frame_at(self, rate: WorkingRate) -> usize {
+        self.symbol_len_at(rate) * self.symbols_per_frame()
     }
 
     /// Number of OFDM symbols per transmission super frame.
     pub const fn symbols_per_superframe(self) -> usize {
-        self.symbols_per_frame() * FRAMES_PER_SUPERFRAME
+        self.symbols_per_frame() * self.frames_per_superframe()
     }
 
-    /// Carrier spacing 1/Tu in Hz.
+    /// Carrier spacing 1/Tu in Hz at `rate`.
+    pub fn carrier_spacing_at(self, rate: WorkingRate) -> f64 {
+        f64::from(rate.hz()) / self.fft_size_at(rate) as f64
+    }
+
+    /// Carrier spacing 1/Tu in Hz at the default 48 kHz.
     pub fn carrier_spacing(self) -> f64 {
-        f64::from(SAMPLE_RATE) / self.fft_size() as f64
+        self.carrier_spacing_at(WorkingRate::R48)
     }
 
     /// Number of OFDM symbols at the start of each super frame that carry the SDC.
@@ -106,6 +300,8 @@ impl RobustnessMode {
         match self {
             Self::A | Self::B => 2,
             Self::C | Self::D => 3,
+            // §8.5.3.1: mode E's SDC occupies symbols 0..=4 of each super frame.
+            Self::E => 5,
         }
     }
 }
@@ -117,6 +313,7 @@ impl fmt::Display for RobustnessMode {
             Self::B => 'B',
             Self::C => 'C',
             Self::D => 'D',
+            Self::E => 'E',
         };
         write!(f, "{c}")
     }
@@ -151,28 +348,41 @@ impl SpectrumOccupancy {
         self.0 as usize
     }
 
-    /// Nominal channel bandwidth in kHz.
-    pub const fn bandwidth_khz(self) -> f64 {
-        match self.0 {
-            0 => 4.5,
-            1 => 5.0,
-            2 => 9.0,
-            3 => 10.0,
-            4 => 18.0,
-            _ => 20.0,
+    /// Nominal channel bandwidth in kHz **for `mode`** (§8.3, table 48).
+    ///
+    /// The occupancy parameter is not enough on its own: §6.3.3 says its interpretation
+    /// "is dependent on the value of the RM flag". With RM = 0 (modes A–D), value `0` is
+    /// 4.5 kHz; with RM = 1 (**mode E**) it is **100 kHz**, the DRM+ raster. Mode E defines
+    /// occupancy 0 only, so any other value with mode E is undefined and reported as 100 kHz
+    /// — `carrier_range` is `None` for it, so no `ChannelLayout` can hold one.
+    pub const fn bandwidth_khz(self, mode: RobustnessMode) -> f64 {
+        match mode {
+            RobustnessMode::E => 100.0,
+            _ => match self.0 {
+                0 => 4.5,
+                1 => 5.0,
+                2 => 9.0,
+                3 => 10.0,
+                4 => 18.0,
+                _ => 20.0,
+            },
         }
     }
 }
 
 impl fmt::Display for SpectrumOccupancy {
+    /// Just the parameter: `SO0`. The bandwidth it stands for depends on the robustness
+    /// mode (§6.3.3), so it is [`SpectrumOccupancy::bandwidth_khz`]'s job, not this one's.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "SO{} ({} kHz)", self.0, self.bandwidth_khz())
+        write!(f, "SO{}", self.0)
     }
 }
 
 /// Lowest and highest carrier index (Kmin, Kmax) for a mode/occupancy pair
-/// (§8.1, table 84). Returns `None` for combinations the standard does not define
-/// (modes C and D only exist with occupancies 3 and 5).
+/// (§8.3, table 49). Returns `None` for combinations the standard does not define.
+///
+/// Modes C and D exist only at occupancies 3 and 5; **mode E at occupancy 0 only** — the
+/// 100 kHz DRM+ raster — with Kmin = −106, Kmax = +106 (213 carriers).
 pub const fn carrier_range(mode: RobustnessMode, so: SpectrumOccupancy) -> Option<(i32, i32)> {
     const KMIN: [[i32; 4]; 6] = [
         [2, 1, 0, 0],
@@ -190,9 +400,72 @@ pub const fn carrier_range(mode: RobustnessMode, so: SpectrumOccupancy) -> Optio
         [314, 279, 0, 0],
         [350, 311, 213, 135],
     ];
-    let kmin = KMIN[so.index()][mode.index()];
-    let kmax = KMAX[so.index()][mode.index()];
-    if kmin == 0 && kmax == 0 { None } else { Some((kmin, kmax)) }
+    match mode {
+        // Mode E is defined at spectrum occupancy 0 only (`E as usize` is 4, past the
+        // per-occupancy tables, which is why it is handled before indexing them).
+        RobustnessMode::E => {
+            if so.index() == 0 { Some((-106, 106)) } else { None }
+        }
+        _ => {
+            let kmin = KMIN[so.index()][mode.index()];
+            let kmax = KMAX[so.index()][mode.index()];
+            if kmin == 0 && kmax == 0 { None } else { Some((kmin, kmax)) }
+        }
+    }
+}
+
+/// Carriers around DC that are unused (§8.3.1, table 50).
+///
+/// Mode E uses **every** carrier in `Kmin..=Kmax`; A–D leave DC unused, and mode A also its
+/// two neighbours.
+pub const fn unused_carriers(mode: RobustnessMode) -> &'static [i32] {
+    match mode {
+        RobustnessMode::A => &[-1, 0, 1],
+        RobustnessMode::B | RobustnessMode::C | RobustnessMode::D => &[0],
+        RobustnessMode::E => &[],
+    }
+}
+
+/// Why a robustness mode and a working sample rate cannot be used together.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum RateError {
+    /// Robustness mode E's carriers extend past the Nyquist frequency of this rate.
+    #[error(
+        "robustness mode E (DRM+) needs a working sample rate of at least {min_khz} kHz: its \
+         carriers reach +47.1 kHz, above the {nyquist_khz} kHz Nyquist limit of {rate} \
+         (choose 120 kHz or 192 kHz)"
+    )]
+    ModeERateTooLow {
+        /// The rate that was asked for.
+        rate: WorkingRate,
+        /// Nyquist frequency of that rate, kHz, for the message.
+        nyquist_khz: u32,
+        /// The lowest rate the mode accepts, kHz.
+        min_khz: u32,
+    },
+}
+
+/// Check that `mode` can run at `rate`, or say why not.
+///
+/// Modes A–D are defined at 48 kHz; mode E needs [`MODE_E_MIN_RATE`] or more. Callers turn
+/// this into a user-facing error (transmitter config, GUI, CLI) rather than generating a
+/// signal that folds its own carriers. A user interface can use it to hide mode E from its
+/// mode selector while the chosen rate is too low.
+pub const fn check_mode_rate(mode: RobustnessMode, rate: WorkingRate) -> Result<(), RateError> {
+    match mode {
+        RobustnessMode::A | RobustnessMode::B | RobustnessMode::C | RobustnessMode::D => Ok(()),
+        RobustnessMode::E => {
+            if rate.hz() >= MODE_E_MIN_RATE {
+                Ok(())
+            } else {
+                Err(RateError::ModeERateTooLow {
+                    rate,
+                    nyquist_khz: rate.hz() / 2000,
+                    min_khz: MODE_E_MIN_RATE / 1000,
+                })
+            }
+        }
+    }
 }
 
 /// A valid (mode, occupancy) combination.
@@ -217,11 +490,19 @@ impl ChannelLayout {
         let (kmin, kmax) = self.carrier_range();
         (kmax - kmin + 1) as usize
     }
+
+    /// Nominal channel bandwidth in kHz (§8.3, table 48) — the mode-aware form of
+    /// [`SpectrumOccupancy::bandwidth_khz`], which this layout's mode and occupancy fix.
+    pub const fn bandwidth_khz(self) -> f64 {
+        self.occupancy.bandwidth_khz(self.mode)
+    }
 }
 
 impl fmt::Display for ChannelLayout {
+    /// The bandwidth needs the mode (§6.3.3), so this is the place to name both: e.g.
+    /// `mode B / SO3 (10 kHz)`, `mode E / SO0 (100 kHz)`.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "mode {} / {}", self.mode, self.occupancy)
+        write!(f, "mode {} / {} ({} kHz)", self.mode, self.occupancy, self.bandwidth_khz())
     }
 }
 
@@ -231,15 +512,150 @@ mod tests {
 
     #[test]
     fn every_mode_fills_exactly_400_ms() {
-        for m in RobustnessMode::ALL {
+        // DRM30 frames are 400 ms; mode E's is 100 ms.
+        for m in RobustnessMode::DRM30 {
             assert_eq!(m.symbol_len() * m.symbols_per_frame(), SAMPLES_PER_FRAME, "mode {m}");
         }
+        let e = RobustnessMode::E;
+        assert_eq!(e.symbol_len() * e.symbols_per_frame(), 4_800, "mode E is 100 ms @48k");
     }
 
     #[test]
     fn guard_lengths_match_spec() {
-        let g: Vec<_> = RobustnessMode::ALL.iter().map(|m| m.guard_len()).collect();
+        let g: Vec<_> = RobustnessMode::DRM30.iter().map(|m| m.guard_len()).collect();
         assert_eq!(g, [128, 256, 256, 352]);
+        // Mode E at 192 kHz: Tg = 3T = 48 samples.
+        assert_eq!(RobustnessMode::E.guard_len_at(WorkingRate::R192), 48);
+    }
+
+    #[test]
+    fn every_mode_and_rate_fills_its_frame_exactly() {
+        // No rounding anywhere: Ts·Ns must equal frame_ms × rate at every supported rate
+        // where the mode may run.
+        for m in RobustnessMode::ALL {
+            for r in WorkingRate::ALL {
+                if check_mode_rate(m, r).is_err() {
+                    continue;
+                }
+                let want = u64::from(m.frame_ms()) * u64::from(r.hz()) / 1000;
+                assert_eq!(m.samples_per_frame_at(r) as u64, want, "mode {m} at {r}");
+            }
+        }
+    }
+
+    #[test]
+    fn working_rates_keep_the_elementary_period_whole() {
+        // T = 83⅓ µs must be a whole number of samples at every rate, or the geometry drifts.
+        assert_eq!(WorkingRate::R48.samples_per_t(), 4);
+        assert_eq!(WorkingRate::R96.samples_per_t(), 8);
+        assert_eq!(WorkingRate::R120.samples_per_t(), 10);
+        assert_eq!(WorkingRate::R192.samples_per_t(), 16);
+        assert_eq!(WorkingRate::new(48_000), Some(WorkingRate::R48));
+        assert_eq!(WorkingRate::new(44_100), None);
+        assert_eq!(WorkingRate::default(), WorkingRate::R48);
+        assert_eq!(WorkingRate::R192.to_string(), "192 kHz");
+    }
+
+    #[test]
+    fn mode_e_geometry_matches_the_spec() {
+        let e = RobustnessMode::E;
+        // Table 47: Tu 2.25 ms, Tg 0.25 ms, Ts 2.5 ms, Ns 40, frame 100 ms, super 400 ms.
+        assert_eq!(e.tu_in_t(), 27);
+        assert_eq!(e.tg_in_t(), 3);
+        assert_eq!(e.guard_ratio(), (1, 9));
+        assert_eq!(e.symbols_per_frame(), 40);
+        assert_eq!(e.frame_ms(), 100);
+        assert_eq!(e.frames_per_superframe(), 4);
+        assert_eq!(e.symbols_per_superframe(), 160);
+        assert_eq!(e.sdc_symbols(), 5);
+        assert!(e.is_drm_plus());
+        // At 192 kHz: Tu = 27×16 = 432, Tg = 3×16 = 48, Ts = 480 (verified on real DRM+).
+        assert_eq!(e.fft_size_at(WorkingRate::R192), 432);
+        assert_eq!(e.guard_len_at(WorkingRate::R192), 48);
+        assert_eq!(e.symbol_len_at(WorkingRate::R192), 480);
+        assert_eq!(e.fft_size_at(WorkingRate::R120), 270);
+        assert_eq!(e.symbol_len_at(WorkingRate::R120), 300);
+        // Carrier spacing is 1/Tu = 4000/9 Hz at every rate.
+        for r in WorkingRate::ALL {
+            assert!((e.carrier_spacing_at(r) - 4000.0 / 9.0).abs() < 1e-9, "{r}");
+        }
+    }
+
+    #[test]
+    fn mode_e_has_213_carriers_and_no_unused_ones() {
+        let (kmin, kmax) = carrier_range(RobustnessMode::E, SpectrumOccupancy::SO_0).unwrap();
+        assert_eq!((kmin, kmax), (-106, 106));
+        assert_eq!(kmax - kmin + 1, 213);
+        assert_eq!(unused_carriers(RobustnessMode::E), &[] as &[i32]);
+        // Its highest carrier is what forces the higher rate: measured at +47.11 kHz, above
+        // 24 kHz, so it would fold at 48 kHz.
+        let top_hz = f64::from(106) * RobustnessMode::E.carrier_spacing_at(WorkingRate::R192);
+        assert!(top_hz > 47_000.0 && top_hz < 47_200.0, "{top_hz}");
+        assert!(top_hz > f64::from(SAMPLE_RATE) / 2.0, "would fold at 48 kHz");
+        // Mode E exists at occupancy 0 only.
+        for so in SpectrumOccupancy::ALL {
+            assert_eq!(
+                carrier_range(RobustnessMode::E, so).is_some(),
+                so.index() == 0,
+                "mode E with {so}"
+            );
+        }
+        // A-D still leave their DC carriers unused.
+        assert_eq!(unused_carriers(RobustnessMode::A), &[-1, 0, 1]);
+        assert_eq!(unused_carriers(RobustnessMode::B), &[0]);
+        assert_eq!(unused_carriers(RobustnessMode::D), &[0]);
+    }
+
+    /// §6.3.3: the occupancy parameter's meaning "is dependent on the value of the RM
+    /// flag". Value 0 is 4.5 kHz for modes A–D and 100 kHz for mode E (table 48), so a
+    /// bandwidth taken from the occupancy alone is wrong for DRM+ — which is what the
+    /// receiver used to display (4.5 kHz) and what skewed its SNR by ~21x in power.
+    #[test]
+    fn occupancy_zero_means_100_khz_for_mode_e() {
+        let so0 = SpectrumOccupancy::SO_0;
+        assert_eq!(so0.bandwidth_khz(RobustnessMode::A), 4.5);
+        assert_eq!(so0.bandwidth_khz(RobustnessMode::B), 4.5);
+        assert_eq!(so0.bandwidth_khz(RobustnessMode::D), 4.5);
+        assert_eq!(so0.bandwidth_khz(RobustnessMode::E), 100.0, "table 48, RM = 1");
+        // The mode-aware layout form agrees.
+        let e = ChannelLayout::new(RobustnessMode::E, so0).unwrap();
+        assert_eq!(e.bandwidth_khz(), 100.0);
+        assert_eq!(e.to_string(), "mode E / SO0 (100 kHz)");
+        // A–D keep their table 48 values through both forms.
+        for (so, khz) in [
+            (SpectrumOccupancy::SO_0, 4.5),
+            (SpectrumOccupancy::SO_1, 5.0),
+            (SpectrumOccupancy::SO_2, 9.0),
+            (SpectrumOccupancy::SO_3, 10.0),
+            (SpectrumOccupancy::SO_4, 18.0),
+            (SpectrumOccupancy::SO_5, 20.0),
+        ] {
+            assert_eq!(so.bandwidth_khz(RobustnessMode::B), khz, "{so}");
+            assert_eq!(ChannelLayout::new(RobustnessMode::B, so).unwrap().bandwidth_khz(), khz);
+        }
+        // Display names just the parameter; the bandwidth needs the mode.
+        assert_eq!(so0.to_string(), "SO0");
+        assert_eq!(SpectrumOccupancy::SO_3.to_string(), "SO3");
+    }
+
+    #[test]
+    fn mode_e_needs_a_high_enough_rate() {
+        for m in RobustnessMode::DRM30 {
+            assert!(check_mode_rate(m, WorkingRate::R48).is_ok(), "mode {m}");
+        }
+        assert!(check_mode_rate(RobustnessMode::E, WorkingRate::R48).is_err());
+        // 96 kHz technically fits but with only 0.89 kHz of margin: refused by policy.
+        assert!(check_mode_rate(RobustnessMode::E, WorkingRate::R96).is_err());
+        assert!(check_mode_rate(RobustnessMode::E, WorkingRate::R120).is_ok());
+        assert!(check_mode_rate(RobustnessMode::E, WorkingRate::R192).is_ok());
+        assert!(!WorkingRate::R48.allows(RobustnessMode::E));
+        assert!(!WorkingRate::R96.allows(RobustnessMode::E));
+        assert!(WorkingRate::R120.allows(RobustnessMode::E));
+        // The message names the rate tried, the limit it missed and what to choose.
+        let msg = check_mode_rate(RobustnessMode::E, WorkingRate::R48).unwrap_err().to_string();
+        assert!(msg.contains("100 kHz"), "{msg}");
+        assert!(msg.contains("47.1 kHz"), "{msg}");
+        assert!(msg.contains("48 kHz"), "{msg}");
     }
 
     #[test]
@@ -251,5 +667,31 @@ mod tests {
             assert!(ChannelLayout::new(RobustnessMode::A, so).is_some());
             assert!(ChannelLayout::new(RobustnessMode::B, so).is_some());
         }
+    }
+
+    /// A recording is demodulated at its own rate where that is possible: 44.1 kHz DRM30
+    /// stays at 48, and a 44.1/48 kHz *upsampled* capture (88.2/96) stays wide enough for
+    /// mode E, whose carriers would fold at 48.
+    #[test]
+    fn the_closest_rate_follows_the_input() {
+        let cases = [
+            (8_000, WorkingRate::R48),
+            (22_050, WorkingRate::R48),
+            (44_100, WorkingRate::R48),
+            (48_000, WorkingRate::R48),
+            (88_200, WorkingRate::R96),
+            (96_000, WorkingRate::R96),
+            (110_250, WorkingRate::R120),
+            (120_000, WorkingRate::R120),
+            (176_400, WorkingRate::R192),
+            (192_000, WorkingRate::R192),
+            (250_000, WorkingRate::R192),
+            (384_000, WorkingRate::R192),
+        ];
+        for (hz, want) in cases {
+            assert_eq!(WorkingRate::closest(hz), want, "{hz} Hz");
+        }
+        // A rate exactly between two supported ones takes the lower.
+        assert_eq!(WorkingRate::closest(108_000), WorkingRate::R96);
     }
 }

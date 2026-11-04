@@ -4,7 +4,8 @@
 
 use crate::plan::MultiplexPlan;
 use decdrm_core::fac::Fac;
-use decdrm_mdi::mdi::MdiSdc;
+use decdrm_core::params::RobustnessMode;
+use decdrm_mdi::mdi::{MdiFac, MdiSdc};
 use decdrm_mdi::{MdiFrame, Protocol, Sdci};
 
 /// The `sdci` item of a multiplex: protection levels and stream lengths (with
@@ -27,8 +28,6 @@ pub fn sdci(plan: &MultiplexPlan) -> Sdci {
 /// super frame it starts (padded to `sdc_capacity` bytes), the logical frames of the
 /// streams.
 pub fn frame(plan: &MultiplexPlan, dlfc: u32, fac: &Fac, sdc: Option<&[u8]>, sdc_capacity: usize, streams: &[Vec<u8>]) -> MdiFrame {
-    let mut fac_bytes = [0u8; 9];
-    fac_bytes.copy_from_slice(&decdrm_core::bits::pack(&fac.to_bits()));
     let sdc = sdc.map(|d| {
         let mut data = d.to_vec();
         data.resize(sdc_capacity.max(d.len()), 0);
@@ -37,8 +36,10 @@ pub fn frame(plan: &MultiplexPlan, dlfc: u32, fac: &Fac, sdc: Option<&[u8]>, sdc
     let mut out = MdiFrame {
         protocol: Some(Protocol::MDI),
         dlfc: Some(dlfc),
-        robustness: Some(plan.tx.mode.index() as u8),
-        fac: Some(fac_bytes),
+        // `robm` names A–D only: a mode E frame is marked by its 116-bit FAC instead
+        // (see `decdrm_mdi::mdi`).
+        robustness: (plan.tx.mode != RobustnessMode::E).then_some(plan.tx.mode.index() as u8),
+        fac: Some(MdiFac::from_bits(&fac.to_bits_for(plan.tx.mode))),
         sdc,
         sdci: Some(sdci(plan)),
         ..MdiFrame::default()

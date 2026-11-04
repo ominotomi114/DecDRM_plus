@@ -8,7 +8,7 @@ and the milestone plan. Keep the milestone checklist current.
 
 | Topic | Decision |
 |---|---|
-| Standard scope | DRM30 robustness modes **A, B, C, D**; all spectrum occupancies (0–5, 4.5–20 kHz); 4/16/64-QAM; SM, HMsym, HMmix; short & long interleaving; all protection levels. No DRM+ (mode E), no analog AM/SSB/FM, no AMSS. |
+| Standard scope | DRM30 robustness modes **A, B, C, D**; all spectrum occupancies (0–5, 4.5–20 kHz); 4/16/64-QAM; SM, HMsym, HMmix; short & long interleaving; all protection levels. **DRM+ (mode E)** added 2026-10-23: transmit and receive both work, including reception without pinning the mode — see the milestone at the end of this document. No analog AM/SSB/FM, no AMSS. |
 | Purpose | Personal / hobby. |
 | Relationship to Dream | Spec-first idiomatic Rust, freely translating Dream's proven algorithms (sync, Wiener channel estimation, MLC decoding). Licence therefore **GPL-2.0-or-later**. Reference: Dream `branches/dream-mjf` r1548. |
 | Receiver performance | Match or beat Dream on weak/fading signals (Wiener channel estimation, soft-decision Viterbi, iterative MLC, sample-rate-offset tracking). |
@@ -73,8 +73,10 @@ FAC/SDC updates, audio super-frames, data-stream frames, text messages). Stages 
 own buffers; timing/frequency corrections flow backwards through explicit feedback fields
 rather than shared global state (Dream's `CParameter` is split into typed per-stage state).
 
-Working sample rate is **48 kHz** (Dream's `SOUNDCRD_SAMPLE_RATE`), at which the useful
-symbol lengths are 1152/1024/704/448 samples for modes A/B/C/D.
+The working sample rate defaults to **48 kHz** (Dream's `SOUNDCRD_SAMPLE_RATE`), at which the
+useful symbol lengths are 1152/1024/704/448 samples for modes A/B/C/D. It is a setting
+(`WorkingRate`), because robustness mode E (DRM+) carries 213 carriers reaching ±47.11 kHz and
+needs 120 or 192 kHz; the input is resampled to whatever the receiver is configured with.
 
 ## Milestones
 
@@ -770,6 +772,614 @@ symbol lengths are 1152/1024/704/448 samples for modes A/B/C/D.
       loopback through the receiver; live through the virtual cable: 80 s, 0 underruns,
       titles received. Not verified: real Icecast/SHOUTCAST servers and real encoders'
       streams (no internet in development).
+
+- [ ] **DRM+ / robustness mode E** (started 2026-10-23) — mode E is the VHF DRM+ mode:
+  213 carriers at a 444 4/9 Hz spacing reaching ±47.11 kHz, on the 100 kHz raster, with
+  **100 ms** transmission frames of 40 OFDM symbols, 244 FAC cells over symbols 5..=26,
+  no unused carriers, no frequency reference cells, and a two-service 116-bit FAC at code
+  rate 0.25. It needs a **120 or 192 kHz** working sample rate, which is why `WorkingRate`
+  now exists and is carried by the transmitter and receiver.
+
+  *Transmit: works.* A station with `mode = "E"`, `occupancy = 0` and
+  `working_sample_rate = "192"` validates and transmits, and the signal it writes measures
+  as real DRM+ (Tu 432 samples, Tg 48, span ±47.29 kHz) by the same analysis used on the
+  reference recordings. Mode E at 48 or 96 kHz is refused by `check_mode_rate`.
+  `tests/mode_e_tx.rs` asserts the signal against those measurements.
+
+  *Receive: works* (2026-10-26). Every DRM+ recording in `refs/` decodes end to end —
+  FAC, SDC, multiplex frames and **xHE-AAC audio** — at both rates and down to 3 dB SNR.
+  The two mode E loopback tests in `tests/mode_e_rx.rs` that used to be ignored-passing or
+  failing now pass unignored. Two bugs had to be found
+  for that: the MSC interleaver depth is **D = 6** for mode E (§7.6), not the 5 the code
+  hardcoded, and the channel estimator's timing rotation must use the FFT size *at the
+  working rate* (it used the 48 kHz one, 4× too small at 192 kHz). A third, in the PDS
+  tracker's `ir_per_sample`, was the same class of mistake.
+
+  **The 120 kHz fault is solved by upsampling to 192 kHz** (2026-10-25). `examples/upsprobe.rs`
+  generates mode E at 120 kHz, converts it to 192 with `channel::resample::Resampler`
+  (ratio 1.6), and decodes at 192: **FAC 193, SDC 46 over 20 s**, against FAC 193, SDC 47
+  for the same signal generated and decoded natively at 192 — i.e. identical, where the
+  120 kHz receiver alone gives FAC 3, SDC 0. This is the intended design, not a workaround:
+  **JvanKatwijk's DRM+ decoder — which decodes these recordings — runs entirely at 192 kHz**
+  (`#define SAMPLE_RATE 192000`, a 192000-entry mixer table, and no input resampler at all).
+  It does not have a 120 kHz path. Mode E's 1.9 kHz carrier spacing over ±47.11 kHz is
+  comfortably inside 192 kHz's 96 kHz Nyquist, and the upsampling image of the band edge
+  (72.89 kHz) is 23 kHz clear of it, so the interpolation filter removes it.
+  **The consequence for DecDRM: convert 120 kHz input to 192 kHz and receive everything at
+  192.** A file at 120 kHz needs `rate × 1.6`; a live 120 kHz SDR needs the same. The native
+  120 kHz receive path can then be left alone — or removed — rather than debugged further.
+
+  Still failing, in decreasing order of how well it is understood:
+
+  1. **Real DRM+ recordings did not decode — fixed** (2026-10-25 and 2026-10-26). All
+     eleven 192 kHz DRM+ recordings in `refs/` now decode end to end, audio included:
+     `decdrm rx <file> --drm-plus --format iq --dc 20000` — the recordings carry their
+     carrier at +20 kHz, and `--dc` tells the pinned mixer where it is (`ReceiverConfig::
+     dc_hz`; the GUI's receiver options show the same field when a mode is pinned). Before
+     that field existed the carrier had to be mixed down by hand first (`--example mixwav`),
+     which is what `refs/m20k_20k_offset_4QAM_LPP0_192kHz.wav` is: the 4-QAM LPP0 recording
+     mixed down by +20 kHz, kept as a baseband copy for tools that cannot mix. It decodes
+     without `--dc`: FAC 310, SDC 77, MSC 302:
+
+     | recording | MSC frames (ok) | audio frames ok |
+     |---|---|---|
+     | 4-QAM LPP0, 1 service | 307 (151) | 566 |
+     | 4-QAM LPP1 | 175 (85) | 398 |
+     | 4-QAM LPP2 | 271 (133) | 623 |
+     | 4-QAM LPP3 | 499 (247) | 1157 |
+     | 4-QAM LPP0, 3 dB AWGN | 283 (139) | 521 |
+     | 4-QAM LPP0, 6 dB AWGN | 283 (139) | 521 |
+     | 16-QAM LPP0, 1 service | 511 (253) | 1185 |
+     | 16-QAM LPP1 | 331 (163) | 1528 |
+     | 16-QAM LPP2 | 343 (169) | 1584 |
+     | 16-QAM LPP3 | 307 (150) | 1414 |
+     | 16-QAM LPP3, 4 services (2 xHE + 2 HE) | 535 (265) | 994 |
+
+     (About half the multiplex frames are counted before the long interleaver has filled,
+     which is the expected `D - 1` of them; the concealment count is 0-1 per file.)
+
+     Three further faults had to be found for the **audio** to come out, each invisible in
+     a DecDRM-to-DecDRM loopback because both ends made the same mistake:
+
+     - **The guard-correlation step was coarser than mode E's guard interval.** `timesync`
+       searches for the symbol boundary every `STEP` = 4 *decimated* samples; at 192 kHz
+       the decimation is 16, so that is 64 real samples, while mode E's guard is only **48**
+       (3 decimated). The correlation peak fell between grid points and the loop parked the
+       FFT window ~280 samples out — outside the guard, where the cyclic prefix no longer
+       covers the window and every data cell is wrong. Only the heavily protected FAC
+       survived, which is why this read as a signal-quality problem for so long, and why
+       whether it decoded at all depended on the transmit filter's group delay.
+       `timesync::step_for` now takes the fine step whenever `STEP` is wider than the mode's
+       decimated guard. *Measured: removing the transmit band-limiting filter had moved the
+       counts before (FAC 3 to 66); with this fix they rise at both rates without it
+       (FAC 77 of 77, SDC 19, MSC 75, bit-exact on a synthetic signal).*
+     - **The receiver's MSC decoder hardcoded mode B's protection tables.** `MlcParams::msc`
+       is fixed to `RobustnessMode::B`, and `rx/mscdec.rs` (and `tx/mod.rs`) called it, so
+       mode E's 16-QAM used table 30 instead of table 31 and its 4-QAM had no rates at all.
+       The rates differ at every level **except the last**, where both tables say 0.62 —
+       which is why 16-QAM LPP3 decoded while LPP0/1/2 came out as noise, and why the fault
+       looked like an equaliser problem. Both sides now call `MlcParams::msc_for(mode, ...)`.
+     - **The audio super frame spans two logical frames in mode E.** §5.3.1.0 and clause 6:
+       "For robustness mode E, the audio super frame is mapped onto two logical frames,
+       since the audio super frame is of twice the duration of the logical frame" — 200 ms
+       of xHE-AAC over two 100 ms multiplex frames. `AudioDeframer` was fed one logical frame
+       per multiplex frame as for A-D, so every xHE-AAC super frame was parsed from half its
+       bytes and failed. The two halves are not aligned to anything in the bits, so
+       `AudioDeframer::new_at(params, stream, mode)` now collects `super_frames_per_logical`
+       parts and finds the boundary by the super frame's own check — the fixed-header CRC-8
+       plus every directory element repeating the border count (§5.3.1.1-2), the same way the
+       rest of the stream is found.
+
+     The four coding faults fixed on 2026-10-25 were responsible for the FAC/SDC half, all in
+     the same place: **every field that the FAC's RM flag re-interprets was being read with
+     the RM-flag-0 table.** §6.3.3 says "the interpretation of [the interleaver depth, MSC
+     mode, SDC mode and toggle] is dependent on the value of the RM flag"; DecDRM read one
+     table for both modes. Each fault below was confirmed by reverting just that change and
+     watching the count collapse:
+
+     - **The occupancy field was read 4 bits wide.** §6.3.3's channel parameters are 20 bits
+       in *every* mode — occupancy is **3** bits — but the code read 4, swallowing the RM
+       flag as the value's top bit. Mode E's `1 000` became 8, not a valid occupancy, so
+       every real mode E frame was rejected (`FAC 0`). DecDRM's own transmitter wrote the
+       same wrong width, so only a loopback ever passed. *Reverting to the 4-bit read leaves
+       FAC at 1269 but MSC at 0.*
+     - **The MSC-mode field used the A–D table.** RM flag = 0 codes `00` 64-QAM / `11`
+       16-QAM; **RM flag = 1 codes `00` 16-QAM / `11` 4-QAM**. Reading the A–D table reports
+       each mode E signal one step high — a real 4-QAM file as 16-QAM, a real 16-QAM one as
+       64-QAM — and there was no 4-QAM MSC variant at all. `MscMode::from_bits` now takes the
+       flag and can return `None` for the reserved mode E codes.
+     - **The SDC-mode bit was treated as a constellation only.** In modes A–D it picks 16-QAM
+       or 4-QAM; in **mode E it is the SDC protection level** — `0` is 4-QAM at rate 1/2, `1`
+       at rate **1/4** (table 38). `MlcParams::sdc_for` was called with a hardcoded level 0 in
+       both places that build an SDC decoder, so a mode E SDC sent at rate 1/4 was decoded
+       with the wrong code rate and the CRC never passed. *Reverting this drops SDC to 0 and
+       MSC to 0.* `SdcMode::Qam4Rate25` carries the level, and `SdcMode::protection()` feeds
+       it through.
+     - **The Identity field was read as the frame index.** It encodes *position in the FAC
+       cycle*: `00`/`11` first, `01` intermediate, `10` last. Modes A–D have three frames and
+       one intermediate block, so identity == frame index works; **mode E has four frames and
+       two intermediate blocks, both `01`, told apart by the toggle flag** (§6.3.3: "zero for
+       the first and third FAC block and to one for the second and fourth"). The real signal
+       sends `{0|3} 01 01 10` with toggle `0 1 0 1`. Mapping identity straight through
+       mis-numbered frames 2 and 3 as 1 and 2, so the super frame restarted constantly and
+       the multiplex frame was never assembled. *Reverting this leaves FAC 1269 and SDC 316
+       but MSC 0* — the SDC gate is not the only consumer, the MSC assembler needs the count
+       to reach 3. `frame_index_of` now takes the toggle and the frame count, and
+       `identity_and_toggle` is its inverse for the transmitter.
+
+     `examples/modee_real.rs`'s earlier "FAC 0/681" reading was a symptom of the occupancy
+     width, not a demodulation fault: that tool has **no equaliser**, so its failure was never
+     evidence about the receiver's decoding.
+  2. **A pinned mode did not establish its own frame alignment — fixed.** The file round trip
+     looked like a signal problem (band limiting on gave FAC 0, off gave FAC 2-3) but is a
+     timing one. Measured on the written files: the two are the **same signal shifted by ~415
+     samples** (the transmit filter's ~697-tap group delay), agreeing to **0.36 % of peak**
+     once aligned, so nothing is corrupted. The cause was one line: `Receiver::set_mode` forced
+     `state = Tracking`, which skips the frame-sync attempts *and* the no-FAC resync, so a
+     pinned signal only decoded if it was already aligned — true of a signal generated in the
+     same process, false of any file. Staying in `Acquisition` took a written-then-read mode E
+     file from **FAC 3 to FAC 63** (7.5 s, 192 kHz), so a mode E file now decodes in practice.
+     Pinning says where the signal is, not where the frame boundary is.
+     *Band limiting, now fully explained:* the filtered file carries **412 leading zero samples**
+     (the FIR's group delay, written as silence) that the unfiltered one does not, so the
+     receiver counts frames from before the signal starts. Stripping those 412 samples gives
+     **FAC 72, FAC bad 0** - every frame decodes - which confirms the waveform was never the
+     problem and the whole difference is that lead-in. The **real remaining bug** is therefore
+     the receiver's tolerance for a fractional-symbol lead-in: it should resolve a sub-symbol
+     offset at the start of a signal, and does not. (Or `OutputStage` should not emit the
+     filter's warm-up: it reports `delay()` but nothing consumes it.)
+     Where the lead-in should be fixed, and a constraint on doing it: `OutputStage::process`
+     deliberately returns input + 2·`latency()` samples and the tail is drained at the end by
+     `OutputStage::flush` - so the filter's **warm-up at the start** is handled symmetrically
+     nowhere, and the station writes it into the file as silence. Two of `output.rs`'s own tests
+     pin that length (they skip `2 * latency()` by hand), so dropping the lead-in inside
+     `process` would break a deliberate invariant. The fix belongs either in the station (drop
+     the first `latency()` samples of the first frame it emits) or in the receiver (tolerate a
+     sub-symbol lead-in) - the first is smaller and symmetric with the existing tail handling.
+     *The lead-in bug is fixed* (2026-10-25). The cause was in `Receiver::restart`: it re-armed
+     the 48 kHz frequency scan unconditionally, even for a receiver whose mode was pinned. A
+     pinned receiver runs at DC with no scan; after its first restart it began hunting for a
+     DRM30 signal it could never find and never came back to the signal at DC. `restart` now
+     leaves a pinned receiver at DC (and keeps mode detection off, since the FAC cannot
+     express mode E). Every lead-in value the test sweeps now decodes, where before only 0 and
+     5000 did. `mode_e_rx.rs`'s lead test asserts the fix instead of pinning the failure.
+     *Still open:* the receiver resolves a sub-symbol lead-in the slow way (one restart, then
+     re-acquire) rather than aligning first time; not emitting the transmit filter's warm-up
+     would avoid the restart, but the receiver now survives it.
+
+  3. **120 kHz reception — fixed** (2026-10-26), by the same guard-step fix as item 1: at
+     120 kHz the decimation is 10, so mode E's guard is 5 decimated samples against a
+     `STEP` of 4. `tests/mode_e_rx.rs::mode_e_loopback_at_120k` (which used to carry a long
+     list of measurements ruling out the equaliser) now passes unignored. The upsampling
+     note above is therefore no longer needed as a workaround, though it remains a valid
+     design choice — JvanKatwijk's decoder runs at 192 kHz only.
+  4. **`freqacq.rs` finds mode E, and the guard interval tracks its carrier** (2026-10-26,
+     completed 2026-11-03), so a DRM+ signal need not be pinned. The pilot detector cannot
+     find it — it hunts for the three DRM30 frequency reference pilots at 750/2250/3000 Hz,
+     and mode E defines none (§8.4.2) — so `FreqAcquisition::detect_plateau` searches for
+     the signal's **spectrum plateau** instead: the window of the band's own width (213
+     carriers, ±47.11 kHz) whose mean power most exceeds the mean outside it. That is a
+     matched filter, so it needs only that the band be *relatively* stronger than its
+     surroundings — no absolute threshold, which an edge test cannot avoid and which made
+     the noisiest recordings unfindable. It runs only above 48 kHz, where a 95 kHz DRM30
+     signal cannot exist, and the FFT length, hop and analysis span scale with the working
+     rate, keeping the 7.8 Hz bin the threshold was set for.
+
+     Two things the unpinned path needed besides the detector: an unpinned receiver that
+     mode detection has switched to E must build its chain at **occupancy 0** (mode E has
+     no other, §8.1 — the DRM30 default leaves `SymbolChain::new` returning `None` and the
+     receiver stuck in acquisition with no chain), and `mode_e_rx.rs` guards the whole
+     thing (`mode_e_is_acquired_without_pinning`, with the signal put off centre on
+     purpose).
+
+     **The carrier is what was missing** (2026-11-03), and it is found in two stages. The
+     ratio's peak is flat — the window is as wide as the band — so the crest centroid that
+     first located it wandered: measured over ten 0.47 s windows of each reference
+     recording, 14–62 Hz of standard deviation, and up to 220 Hz between the receiver's own
+     re-acquisitions. A band **edge** is far better conditioned, so the centre now comes
+     from an antisymmetric kernel (the derivative of a Gaussian) on the spectrum smoothed
+     by one carrier spacing: each edge becomes an extremum, a parabola puts it at a fraction
+     of a bin, and the two are averaged — which also cancels a symmetric transmit-filter
+     rolloff. Measured the same way: **4.5–14 Hz, bias under 5 Hz**. Then
+     `Receiver::track_cp_frequency` refines it in the time domain: mode E has no pilots, but
+     the guard interval is a copy of the symbol's tail, and the phase of its correlation is
+     `−2π·Δf·Tu` — unambiguous within ±222 Hz (Tu = 2.25 ms), independent of the channel
+     (both samples pass through the same taps), and averaged over 16 symbols (40 ms) down to
+     about a hertz.
+
+     **Measured.** Shifting a pinned receiver's mixer over a reference recording: the FAC
+     and MSC decode fully within **±20 Hz** of the carrier, partially at ±50 Hz (30–54 FAC
+     of 311), and not at all at ±100 Hz. With both stages **all fourteen recordings decode
+     unpinned**, within two multiplex frames of their pinned counts and without
+     re-acquiring; before, two did, and the receiver restarted every four seconds with a
+     fresh (bad) estimate. The pinned path gets the same refinement, so `--dc` only has to
+     be within a few tens of Hz.
+
+     *Reachable from the GUI and CLI now* (2026-10-25): `ReceiverConfig::pinned` carries a
+     mode/occupancy to decode instead of searching, so `Receiver::new` pins it without a
+     caller having to reach in with `set_mode`. The GUI's source bar has a **mode picker**
+     (Auto / Mode E (DRM+), which also raises a working rate that cannot carry the mode);
+     the CLI has `--sample-rate` for the rate and `--drm-plus` to pin the mode. Mode E's
+     occupancy is always 0 (§8.1), so the picker derives that rather than offering a choice.
+     **Auto works now too** (see item 4): the mode picker is a shortcut, not a requirement,
+     and a DRM+ signal no longer has to be tuned to the receiver's centre frequency.
+
+     **The working rate follows the input** (2026-11-03). It is a property of the recording,
+     not a choice: demodulating at another rate means resampling, and a 192 kHz DRM+ file
+     resampled to 48 kHz is gone. Opening a recording in the GUI now sets the rate picker to
+     the file's own rate, and `decdrm rx` does the same when `--sample-rate` is left out, both
+     through `WorkingRate::closest` (nearest supported rate, 48/96/120/192; 44.1 kHz DRM30
+     stays at 48). A sound card or a KiwiSDR has no file to ask, so those keep 48 kHz unless
+     the caller says otherwise.
+
+  The `TimeWiener` `params(E)` filter length/Doppler pair and `freq_wiener_len(E)` were
+  **placeholders** copied from mode C/D. They are tuned now (2026-11-02): **mode E is
+  (3 pilots, σ = 12 Hz)** and the frequency length stays 13, which a 7–15 tap sweep could not
+  distinguish. The measurement is in the VHF milestone at the end of this document: the
+  placeholder decoded no multiplex frames at 200 km/h, the tuned weights decode 66 of 80.
+  `ChanEstTuning` (a `ReceiverConfig` field) now carries overrides so a sweep can repeat this
+  without recompiling; `examples/modee_sweep.rs` is that sweep.
+
+  *Fixed in the form since the list above was written:* the sample-rate value was written to
+  the TOML as a number where `RateSetting` needs a string (the saved file could not be read
+  back, so the choice silently did not apply); the multiplex bar computed kbit/s with a
+  hardcoded 400 ms frame, so mode E showed 4× too low; mode E showed a one-item bandwidth
+  selector instead of the fixed 100 kHz it is defined at. The channel rows now also follow the
+  mode's own rules — MSC 16-QAM or 4-QAM, SDC 4-QAM, long interleaving, no hierarchical
+  layer — greying out what the mode removes and repairing a document that holds one, since
+  the station's own validation accepts those. See "What robustness mode E changes in the rest
+  of the form" in `tx_form.rs`.
+
+  *Fixed in the receiver's displays* (2026-10-26): the three readouts that come from the
+  channel parameters were all wrong for mode E, and all three for the same reason — each
+  read a mode E value with a DRM30 table, exactly as the FAC parser had. §6.3.3 says the
+  spectrum-occupancy parameter's interpretation "is dependent on the value of the RM flag",
+  and table 48 gives value `0` two meanings: 4.5 kHz for modes A–D and **100 kHz** for mode E.
+  `SpectrumOccupancy::bandwidth_khz` had no mode argument, so it always answered 4.5. Each
+  fault is measured against the pre-fix binary on the same 4-QAM LPP0 recording pinned with
+  `--drm-plus --format iq --dc 20000`, whose decoding is identical before and after (FAC 309,
+  SDC 77, MSC 307, 566 audio frames, 0 concealed):
+
+  - **The bandwidth read 4.5 kHz.** The CLI's status line and the GUI's "BW" field printed
+    `SO0 (4.5 kHz)`; they now print `SO0 (100 kHz)`. The mode now reaches the bandwidth
+    through `bandwidth_khz(mode)` and `ChannelLayout::bandwidth_khz()`, and
+    `SpectrumOccupancy`'s own `Display` names only the parameter (`SO0`) since it cannot know
+    the mode. Callers updated: the CLI status line, the GUI status strip, the CSV logger's
+    `bandwidth_khz` column, and the station's plan/modulator summaries.
+  - **The SNR read 13.5 dB too high** — 54.4 dB instead of 40.9 dB on that recording. The
+    channel estimator refers its SNR from the system bandwidth to the nominal one
+    (`sys_to_nom_bw`); with the DRM30 reading the ratio is 94 667/4 500 ≈ 21× (+13.2 dB)
+    where it should be 94 667/100 000 ≈ 0.95 (−0.24 dB), so the printed figure was inflated
+    by 10·log10(100 000/4 500) = **13.47 dB**. Measured on the same signal: 53.7/54.4/54.4 dB
+    before, 40.3/40.8/40.9 dB after — the same 13.5 dB drop at every status line, while MER,
+    WMER, Doppler and the FAC/SDC/MSC counts are unchanged. That field feeds only
+    `stats.snr_db` and the per-carrier SNR plot, never the equaliser or any decision, so this
+    is a display correction and cannot move a decode.
+  - **The bit rate read 4× too low.** `stream_bitrate` divided by a hardcoded 400 ms, but
+    §8.1 gives mode E **100 ms** logical frames ("the logical frames are each 100 ms long";
+    its 200 ms audio super frame spans two of them). The duration now comes from
+    `RobustnessMode::frame_ms()`, so DRM+ streams report 4× the old figure. The transmit
+    side's multiplex bar already had this fix; this is the receive side's `stream_bitrate`,
+    which feeds `ServiceView::audio_bitrate` and each application's `stream_bitrate` — the
+    service bars in the GUI. *Verified end to end:* the recording delivers 307 multiplex
+    frames in 31.2 s, i.e. 101.6 ms per frame, confirming the 100 ms geometry.
+
+  The receive-side and transmit-side fixes are the same three misreadings, so a DRM+ station
+  now agrees with the receiver that decodes it. Not changed: `Source::position_s` keeps its
+  400 ms for MDI input — MDI's `robm` field is 2 bits (§ "robm", 0–3 = A–D) and cannot carry
+  mode E, so a 400 ms frame there is correct.
+
+  *Both of mode E's constellations now encode, at all four of its levels each* (2026-10-26).
+  The transmitter capped 16-QAM at level 1 in every mode (the DRM30 table 30 cap), and the
+  form hid 4-QAM for mode E on the grounds that its rates were not encodable. §7.5.1 gives
+  mode E four levels of each — table 31 for 16-QAM (0.33, 0.41, 0.5, 0.62) and table 29 for
+  4-QAM (0.25, 0.33, 0.4, 0.5) — and mode E's tables are in `tables`, so both sides only had
+  to stop assuming DRM30's. The cap is now the mode's: 0–1 for 16-QAM in A–D, 0–3 in E, and a
+  DRM30 station still refuses level 2 (asserted in `tests/mode_e_tx.rs`). The eight
+  constellation/level pairs are each checked against annex J table J.5's MSC input bits per
+  frame — 3 727 to 18 635.
+
+  Still open: the transmit side underruns badly at 192 kHz (4× the samples of 48 kHz).
+
+  **The receive side has a rate selector now** (2026-10-24). `ReceiverConfig::working_rate`
+  reaches the source: `Source::open_at(spec, rate_hz)` resamples the input to the receiver's
+  rate instead of a fixed 48 kHz (`decdrm_io::ToRate`, with `To48k` kept as its 48 kHz case),
+  and the GUI's source bar and the CLI's `--sample-rate` set it. The engine's monitor audio and
+  `Session`'s time/sample arithmetic follow the same rate. The spectrum plots no longer assume
+  48 kHz either: `Visuals::spectrum_span_hz` and the transmitter's `TxSnapshot::output_rate_hz`
+  carry the real span, and `Waterfall` derives its frequency axis from it — the bins of a
+  192 kHz DRM+ receiver are now drawn where they belong rather than on a 48 kHz axis. A rate
+  change restarts the waterfall's history (the axis and bin width change with it).
+
+- [ ] **VHF multipath simulation** (started 2026-11-01) — the channel simulator ran the
+  HF models of ES 201 980 annex B at a fixed 48 kHz. DRM+ runs at 120/192 kHz on VHF
+  (Band I/II/III), where the impairments are different in kind: its guard interval is
+  **250 µs** (`Tg = 3T = 250 µs`), so COST 207's rural and urban profiles sit *deep*
+  inside it and the interesting echoes are the long ones (an SFN, a mountain), and a car
+  sees Doppler shifts an order of magnitude above annex B's — 9.3 Hz at 100 km/h on
+  100 MHz, 18.5 Hz at 200 MHz.
+
+  *Rate-aware, with true sub-sample delays.* `ChannelSimulator::new_at(layout, rate, cfg)`
+  converts the paths, the Doppler steps and the noise reference at the working rate;
+  `new` stays the 48 kHz case for A–D. The SNR definition is unchanged (in the nominal
+  channel bandwidth, which for mode E is the 100 kHz of table 48), so at 192 kHz the noise
+  power is `P·192 000/(SNR·100 000)` and the system bandwidth is 213·192 000/432 =
+  94.67 kHz. Delays are **not** rounded to whole samples: at 192 kHz COST 207's taps are
+  sub-sample (0.2 µs = 0.038 samples), so each path adds a 16-tap Hamming-windowed sinc
+  interpolation and the model carries a fixed 7-sample latency, keeping relative delays
+  exact. Rounding would merge TU6's six taps into a single one-sample echo and move every
+  null — `path_delays_exact` measures the real thing: 0, 0.0384, 0.096, 0.3072, 0.4416,
+  0.96 samples.
+
+  *VHF models beside annex B's.* `channel::vhf` adds COST 207 **RA** (rural, 4 taps to
+  0.6 µs), **TU6** (typical urban, 6 taps to 5 µs) and **HT** (hilly terrain, 8 taps in two
+  clusters out to 17.2 µs), each tap fading with a *classical (Jakes)* Doppler spectrum at
+  `f_d = v·f_c/c`; `speed_kmh = 0` gives the static case (multipath, no fading). Jakes
+  fading is a 32-sinusoid random-angle sum — a fixed angle grid repeats `cos θ`, whose
+  equal-frequency sinusoids beat instead of averaging and biased the tap power by 17 %
+  until the angles were drawn at random. `sfn_echo(delay, level)` models the case COST 207
+  does not: one echo, possibly beyond the guard. BU (bad urban, twelve taps) is left out
+  until its table is checked against the source. Even HT's 17.2 µs is 7 % of the guard, so
+  every COST 207 profile is flat as far as mode E's ISI is concerned — what they cost is
+  channel-estimation accuracy, not inter-symbol interference.
+
+  Verified by 24 unit tests in `channel::`: Jakes unit power and `J₀(2π f_d τ)`
+  autocorrelation, mode E noise and system bandwidth at 192 kHz, delay scaling at 120 and
+  192 kHz, a sub-sample delay passing a 3 kHz tone to 2·10⁻², HT's second cluster keeping
+  its 2.88–3.30-sample delays, TU6 fading in motion and not when parked, and the frequency
+  response of a static two-path channel at 192 kHz.
+
+  *End to end: mode E decodes through a moving VHF channel* (2026-11-01, retuned 2026-11-02).
+  `mode_e_rx.rs`'s `mode_e_decodes_through_a_moving_vhf_channel` and
+  `mode_e_survives_200_kmh` send 8 s of mode E (80 frames) at 192 kHz through TU6 at 200 MHz
+  and decode it. Measured with the tuned estimator, FAC / SDC / MSC frames of 80:
+
+  | channel | FAC | SDC | MSC |
+  |---|---|---|---|
+  | TU6, parked, 20 dB | 78 | 18 | 66 |
+  | TU6, 100 km/h (18.5 Hz), 20 dB | 78 | 18 | 66 |
+  | TU6, 200 km/h (37 Hz), 20 dB | 78 | 16 | 66 |
+  | TU6, 100 km/h, 10 dB | 77 | 17 | 66 |
+
+  ***The tuning pass*** (2026-11-02). With the C/D placeholders (9 pilots, σ = 2.85 Hz) the
+  same runs gave **38/6/48** at 100 km/h and **12/2/6** at 200 km/h: the limit was the
+  estimator, not the noise, because doubling the speed collapsed the counts while dropping
+  10 dB barely moved them. The truth is that 37 Hz is simply outside what a filter sized for
+  a few hertz can follow. `examples/modee_sweep.rs` sweeps the TimeWiener's length (3–9
+  pilots) and maximum Doppler (4–12 Hz) over TU6 at 100 and 200 km/h, then checks the winner
+  parked and at 10 dB (where a wide Doppler setting could cost instead of gain).
+
+  **Result: mode E is 3 pilots, σ = 12 Hz** (`params(E)`), and the frequency length stays 13 —
+  a 7–15 tap sweep could not distinguish it, matching the earlier "not the blocker" note. The
+  short filter is what tracks a 37 Hz fade; 12 Hz is the widest the sweep tried and still
+  improved, so a faster receiver or a harsher profile should extend the grid rather than
+  assume this is the optimum. Parked reception is not a trade: 78 FAC against the
+  placeholder's 77.
+
+  `ChanEstTuning` (a `ReceiverConfig` field) carries the overrides the sweep needs, so this
+  can be repeated without recompiling the receiver.
+
+  *Reachable from the station* (2026-11-01). The simulator already lived in `[simulate]`,
+  with annex B's HF presets; it takes a VHF preset too now — `vhf = "ra" | "tu6" | "ht"` with
+  `speed_kmh` and `carrier_mhz` — so a DRM+ station can transmit through a car or a hilly
+  profile. Two bugs had to go with it:
+
+  - The station built the simulator with `ChannelSimulator::new`, the 48 kHz entry point. A
+    mode E station runs at 192 kHz, so delays, Doppler steps and the noise power were all
+    scaled for the wrong rate; it now uses `new_at` with the plan's working rate.
+  - `StationStatus::seconds` and the SDC clock counted 400 ms per frame whatever the mode, so
+    a DRM+ transmission reported four times its length — 2 s of signal printed as 8 s.
+    `MultiplexPlan::frame_seconds()` now takes the duration from the mode.
+
+  Measured: `drm_plus_transmits_through_a_vhf_channel` sends 2 s of mode E at 192 kHz through
+  TU6 at 100 km/h on 200 MHz at 20 dB, and the file and status carry the right rate and time.
+  128 of ~1.5 M output samples clipped, though: the real-IF output at 192 kHz peaks just over
+  full scale (the same station without a simulator clips too), which wants a level check.
+
+  *The form offers them* (2026-11-01). The `[simulate]` card's picker now lists the six annex B
+  models and the three VHF presets; choosing a VHF one swaps `channel` for `vhf` plus Speed and
+  Band rows (0 km/h = parked, 200 MHz = Band III by default), and choosing an HF model removes
+  those keys again — `[simulate]` is `deny_unknown_fields`, so a leftover key would either fail
+  to load or describe a model that is not in use. `the_vhf_presets_replace_the_hf_channel_number`
+  checks the swap, the round trip through the station's parser, and that the speed and band
+  survive switching between VHF profiles.
+
+  *DRM+ over MDI, receive side* (2026-11-03). MDI could not express mode E at all: `robm` is
+  two bits and TS 102 820 names only A–D, and `fac_` was parsed as a fixed 9 bytes, so a DRM+
+  content server's frames were rejected. The FAC is its own marker — §6.3 gives mode E two
+  service parameter sets, so its block is 116 bits where A–D's is 72:
+
+  - `decdrm_mdi::mdi::MdiFac` keeps the block's exact width (72 or 116 bits);
+    `MdiFrame::is_mode_e()` and `fac_bits()` follow it. A mode E frame carries **no** `robm`.
+  - `Session::push_mdi` takes the mode from that width (else `robm`, else the last status) and
+    advances time by `mode.frame_ms()` — 100 ms per mode E frame instead of the hardcoded
+    400 ms. `Source::position_s` had the same 0.4 s-per-frame assumption for MDI input; it now
+    sums the frames' real durations.
+  - The station's `capture_mdi` writes `fac.to_bits_for(mode)` (116 bits for DRM+) and omits
+    `robm`; its modulator takes the mode from the FAC's width and rejects a mode E stream when
+    the station's working rate cannot carry it.
+
+  Measured with `drm_plus_over_mdi` (60 frames of a mode E station at 192 kHz through a `.rsM`
+  recording and the engine): mode E in the status, the service from the SDC, **FAC 60/60**,
+  SDC 15, and 6.0 s of input — where the old code would have called it 24 s.
+
+  *Mode E audio, end to end* (2026-11-03). Real DRM+ recordings decoded all along: the
+  `refs/` recordings are xHE-AAC, and the receiver's deframer finds the 200 ms super frame
+  from the xHE-AAC header (the 26 Oct build decodes 459 audio frames of a 20 s reference with
+  none concealed; this code state 454, none concealed). What never worked was DecDRM's
+  **station** on mode E — it encoded one 400 ms super frame per 100 ms logical frame — and the
+  **AAC** branch of the deframer, which had no way to find the phase (the xHE-AAC check never
+  passes on an AAC super frame): the old build locks onto this station's mode E AAC signal
+  (FAC/SDC fine) and decodes **0** audio frames, where this one decodes 10 of 1.5 s. Now:
+
+  - `AudioPlan` carries `parts_per_super_frame` (1 in A–D, 2 in mode E) and the logical frame
+    duration; `AudioChain::next_logical_frame` encodes one super frame (200 ms of PCM in mode E)
+    and returns its halves, one per call, holding the second in `pending`.
+  - The AAC frame count follows §5.4.1's mode E rates: 5 frames at a 24 kHz core, 10 at 48 kHz
+    (where A–D have 12/24 kHz) — `AudioParams::aac_frames_per_super_frame` now takes the mode,
+    and Opus gets 10 packets per 200 ms super frame instead of 20.
+  - The receiver's `AudioDeframer` takes the phase from the FAC's frame identities when it has
+    them (MDI, whose frames carry their own FAC: frames 0 and 2 start a super frame), and
+    otherwise finds it from the audio frame borders (AAC/Opus `parse`) or the xHE-AAC header CRC.
+
+  Three more station bugs stood in the way, all found by making a receiver decode the signal:
+
+  - **SDC mode.** Mode E has no 16-QAM SDC; its SDC-mode bit is a protection level (§6.3.3), so
+    the station's default `sdc_mode = Qam16` made the encoder send 16-QAM cells while the FAC
+    announced 4-QAM. No receiver could decode the SDC (it carries the audio and data
+    parameters), which is why the mode E loopback tests never got an audio pipeline at all. A
+    16-QAM setting now means the mode's 4-QAM rate 1/2.
+  - **MSC mode.** The default `msc_mode = Qam64Sm` cannot be signalled in mode E either: the FAC
+    field fell back to 4-QAM while the cells carried 64-QAM. A 64-QAM/hierarchical setting is
+    now mapped to 16-QAM for mode E, and 16-QAM's four protection levels (table 31) are accepted
+    there where modes A–D have two.
+  - **Allocation tables.** `allocate` sized the streams with `MlcParams::msc`, which is
+    hardcoded to mode B: mode E streams were computed from A–D's code rates and came out ~5×
+    too long (the debug check against the transmitter caught it once the MSC mode agreed). It
+    now uses `msc_for(mode, …)`.
+
+  Measured: `drm_plus_audio_decodes_through_the_receiver` (4 s of mode E HE-AAC at 192 kHz,
+  I/Q, receiver pinned to mode E) decodes **75 audio frames** with no concealment and the 800 Hz
+  tone is the strongest component of the last second; `drm_plus_over_mdi` decodes **150 frames**
+  of its 6 s (40 ms AAC frames at the 24 kHz core) with no errors. xHE-AAC and DAC in mode E
+  are rejected with a message (their super frames still need the two-frame split).
+
+  *Mode E durations, and simulated stations' headroom* (2026-11-03). Two small fixes from the
+  same review:
+
+  - **Bit rates and durations.** The station still divided by 400 ms everywhere: the plan's
+    stream bit rates, `MSC … kbit/s`, the data-request sizes and the modulator's service
+    rates read a mode E stream 4× low (a 1530-byte frame is 122.4 kbit/s, not 30.6). Mode E
+    frames are 100 ms (§8.1), so `StreamPlan` carries its `frame_seconds`, `describe` uses
+    `MultiplexPlan::frame_seconds()`, and the `--duration` frame count in the CLI and the GUI
+    (`tx_config::frames_for`) take the mode's frame duration — a 60 s run was 15 s long in
+    mode E before this.
+  - **Output headroom with a simulator.** A `[simulate]` channel adds fading gain on top of
+    the signal's own peaks: at the default −15 dBFS a mode E real-IF station clipped ~2000
+    samples in 30 s through TU6, where the same station without a simulator clipped none in
+    30 s (peaks −2.2 dBFS). `plan.describe` now warns when a simulator leaves less than 6 dB
+    of headroom and no limiter is set (it suggests about −20 dBFS or `papr_db`), `Station`
+    logs one line when the output first clips, and the example/config docs say so. With a
+    6 dB limiter at −15 dBFS, 30 s through TU6 clipped nothing. The VHF loopback test runs at
+    −21 dBFS with `papr_db = 6` and asserts no clipped samples: 0 in 30 s measured, where the
+    old default clipped 1973.
+
+  *Mode E audio: xHE-AAC, DAC and Opus* (2026-11-03). The two codecs that were rejected in
+  mode E now work, and a third one turned out broken:
+
+  - **xHE-AAC**: its super frame in mode E is 200 ms (§5.3.1.0), and the encoder's rate
+    control assumed 400 ms everywhere (`bitrate = 20·bytes`, the 15-frame rule, the
+    163 920 bit/s ceiling, `frames_per_super_frame`). `XheAacConfig::super_frame_ms` now
+    carries the duration and everything scales with it (`with_super_frame_ms`); the station
+    plans a 200 ms super frame of two logical frames' bytes and the receiver already found
+    the pair from the super frame's header CRC (the DRM+ reference recordings decode that
+    way). Measured: 4 s of mode E xHE-AAC at 192 kHz decodes **70 frames**, none concealed.
+  - **DAC**: its super frame is 400 ms by construction (30 frames of 320 samples at 24 kHz),
+    so mode E cannot hold it in two 100 ms logical frames: it spans **four**. The station
+    splits the encoded 400 ms super frame into four parts and the receiver collects four
+    (`super_frames_for(Dac, E) = 4`). The FAC frame identity cannot give the phase over RF
+    (the interleaver's delay flips the parity), so `AudioDeframer::set_whole_check` lets the
+    engine hand the deframer the DAC framing's CRC check: a candidate that fails slides one
+    logical frame and tries again. Measured: 4 s of mode E DAC (24 kbit/s, 192 kHz) decodes
+    **7 super frames, 0 concealed**, the 440 Hz tone at 0.254 against 0.25.
+  - **Opus**: the station built the 400 ms format's twenty borders for mode E's 200 ms
+    super frame and so failed to encode it at all (`AacSuperFrameFormat::opus_for` with the
+    plan's packet count fixes it). Measured: 150 packets of 4 s, none concealed.
+
+  The transmitter form's audio card no longer greys out xHE-AAC or DAC in mode E; it still
+  offers mode E's AAC core rates (24 kHz, and 48 kHz without SBR — §5.4.1) and repairs a rate
+  the document holds from the other mode. The receiver's Diversity tab used a hardcoded
+  400 ms per record for its time axis; `DiversityView::frame_seconds` now carries the mode's
+  (0.1 s in mode E).
+
+  *Portable executables* (2026-11-03). `scripts/build-portable.ps1` gained `-NoWeights` (build
+  without the DAC codec for a much smaller executable, or when the weights are not at hand)
+  and two wrappers, `scripts/build-portable.bat` (with the weights) and
+  `scripts/build-portable-noweights.bat` (without); the script checks for the weights up
+  front, so a missing download is one clear line rather than a build-script panic. The build now sets
+  `CARGO_PROFILE_RELEASE_DEBUG=0`: with the profile's line tables MSVC embeds the compile
+  command line in every object (`/Z7`), and the codec crates' long include list plus this
+  workspace's path make `cl` fail with D8050 ("cannot execute c1xx.dll ... debug record").
+  The portable binaries do not need debug info.
+
+  Not yet done: the GUI's diversity history still assumes 400 ms frames (receiver-side mode E
+  diversity is untested); mode E has no MDI output role (not asked for).
+
+  Next: nothing on the DRM+ list — the acquisition path is the last item (item 4 above), and
+  the `params(E)` tuning was done before it. What remains untested is listed on the line
+  above.
+
+  *PAPR reduction, measured* (2026-11-03). There was none: the output stage clipped at ±1 and
+  that was the whole story, so a mode B signal (10.7 dB crest; 12.8 dB for the real part at the
+  IF) either clipped or had to run at about −15 dBFS RMS. `[output] papr_db` (GUI: Output →
+  PAPR → *limit peaks*) now enables a limiter on the baseband, **before** the channel filter,
+  with two laws — a radial `tanh` (`PeakLaw::Tanh`) and a hard `clip` (`PeakLaw::Clip`, the
+  default) — with `σ` the RMS, phase unchanged, and the power lost to the limiting restored by
+  the Gaussian model (a Rayleigh amplitude, which a few hundred carriers approximate: measured
+  within 0.02 dB), so `level_dbfs` still means the RMS. `examples/papr` and `tests/papr.rs`
+  measure it on real frames, mode B 64-QAM and mode E 16-QAM (mode E within 0.2 dB of the
+  mode B figures):
+
+  | knee (dB above RMS) | tanh peak | tanh MER | clip peak | clip MER | samples above the knee |
+  |---|---|---|---|---|---|
+  | none | 10.7 | — | 10.7 | — | — |
+  | 12 | 9.2 | 33.7 dB | 10.7 | 143.7 dB | 0.000 % |
+  | 9 | 8.1 | 28.4 dB | 9.0 | 54.1 dB | 0.016 % |
+  | 7.5 | 7.4 | 25.9 dB | 7.5 | 41.5 dB | 0.27 % |
+  | 6 | 6.6 | 23.6 dB | 6.1 | 31.6 dB | 1.7 % |
+  | 4.5 | 5.8 | 21.4 dB | 4.7 | 24.7 dB | 5.8 % |
+
+  (The 12 dB clip row touches a couple of samples in 4.8 s, so its MER is meaninglessly large —
+  it is there to show that at that knee the clip does essentially nothing.)
+
+  The trade is real and not flattering to `tanh`: at the same 6 dB knee the clip keeps 8 dB more
+  MER (11 dB if the comparison is at tanh's slightly higher peak) — a memoryless clip is
+  transparent below the ceiling and only touches the top 1.7 % of samples, whereas `tanh` starts
+  compressing at half the knee (its gain is already −0.7 dB at `r = γσ/2`) and distorts the
+  whole distribution. What the smooth law buys is the *spectrum* of the distortion: its products
+  decay much faster than a clip's, which matters when the limiter is the last stage. In this
+  chain the transmit filter follows it (the limiter plus filter *is* one iteration of
+  clip-and-filter), so that advantage is largely spent — the honest summary is that the limiter
+  is a **peak-safety knob**, not a quality improvement, and it is off by default. With a 6 dB
+  knee the clip's asymptote is the knee itself (the tanh's is 7.2 dB) and the real part adds
+  3 dB, so −10 dBFS (−11 with tanh) keeps the real output clear of ±1; the 128 samples that
+  clipped in the 192 kHz VHF loopback above would be covered by that.
+
+  Further iterations of clip-and-filter would push the out-of-band distortion below the filter's
+  −70 dB floor, which is already where it is; what ICF would buy here is a *final* clip after the
+  filter, which is only useful if the level is set so that the filter's re-growth matters. The
+  `±1` clip at the end of the chain already bounds the output; a level at −10 dBFS leaves it
+  ~4 dB of margin.
+
+  *The external xHE-AAC encoder* (2026-11-04). libxaac is the weak point of a DRM+ transmission:
+  its USAC encoder is the one part of a reference decoder that was never meant to be competitive,
+  and at DRM+ bit rates its quality is well below Fraunhofer's. The DLL shipped with the Spark
+  Modulator DRM+ transmitter *is* the genuine Fraunhofer encoder plus their DRM+ superframe
+  assembler — but it is 32-bit and JNI-only, and DecDRM's executables are 64-bit.
+
+  So it is a side tool, not part of the program. `tools/xhe-host` (a ~330-line C shim) loads the
+  DLL in a 32-bit process and speaks a line protocol over stdio — `OK`, `NEED <samples>`,
+  `FRAME <bytes>` — calling the DLL's DRM+ entry points directly, so no JVM is involved.
+  `scripts\build-xhe-host.bat` builds
+  it into `exe\xhe\` beside the portable executables, copying `fhgio.dll` in when it is in
+  `refs\dll`. DecDRM looks for `xhe\decdrm-xhe-host.exe` beside itself: without the folder — or
+  without the tool in it — the external encoder is simply absent, and nothing else changes.
+
+  With the helper present the station offers `codec = "xhe-aac-external"` (GUI: *xHE-AAC (external
+  encoder)*). The DLL returns whole DRM audio super frames (200 ms in DRM+, 400 ms in DRM30) at
+  exactly the stream's bit rate, plus the SDC **type-9 body** — two header bytes (coding 3, mode,
+  rate code) and the xHE-AAC static config. The plan therefore takes the sampling rate and the SDC
+  from the encoder instead of computing them, and the chain has no framer, lead accounting or rate
+  control to run. Two services each get their own helper process (the DLL allows one encoder
+  instance per process), and the helper's own 640 ms start-up delay pads with silence. The DLL's
+  HE-AAC entry never initialised in any probe (its licence profile reports no instances for it),
+  so only xHE-AAC is offered; future encoder options will be named `xhe_ext_*`.
+
+  Measured (mode E, 192 kHz, 16-QAM protection 1): one stereo service at 122.4 kbit/s decodes
+  **141 audio frames of 4 s, none concealed**, the 800 Hz tone intact; two services at 61.2 kbit/s
+  each decode 70 frames each with none concealed — and the reference DRM+ recordings (from the
+  same Spark tool chain) already decode with the built-in path, so the receiver needed nothing
+  new.
 
 ## Conventions
 

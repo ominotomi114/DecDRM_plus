@@ -6,7 +6,14 @@
 
 use super::BitMetric;
 use super::conv::mother_output;
-use crate::tables::{CONSTRAINT_LENGTH, NUM_STATES, PunctureMask};
+use crate::tables::{CONSTRAINT_LENGTH, NUM_MOTHER_OUTPUTS, NUM_STATES, PunctureMask};
+#[cfg(test)]
+use crate::fec::puncture::coded_len;
+#[cfg(test)]
+use crate::tables::{CODE_RATES, GENERATORS, RATE_1_6};
+
+/// Number of distinct mother-code output words: one bit per mother output.
+const NUM_WORDS: usize = 1 << NUM_MOTHER_OUTPUTS;
 
 /// Reusable decoder; keeps its decision memory between calls to avoid reallocating.
 #[derive(Debug, Default)]
@@ -16,7 +23,7 @@ pub struct ViterbiDecoder {
 }
 
 /// For new state `s` and predecessor choice `c` (0 ⇒ `s>>1`, 1 ⇒ `(s>>1)|32`), the
-/// four mother-code output bits packed as `b0 | b1<<1 | b2<<2 | b3<<3`.
+/// mother-code output bits packed as `b0 | b1<<1 | ... | b5<<5`.
 fn output_table() -> [[u8; 2]; NUM_STATES] {
     let mut t = [[0u8; 2]; NUM_STATES];
     for (s, entry) in t.iter_mut().enumerate() {
@@ -24,7 +31,7 @@ fn output_table() -> [[u8; 2]; NUM_STATES] {
             let pred = (s >> 1) | (c << 5);
             let reg = (((pred << 1) | (s & 1)) & 0x7F) as u8;
             let mut w = 0u8;
-            for j in 0..4 {
+            for j in 0..NUM_MOTHER_OUTPUTS {
                 w |= mother_output(reg, j) << j;
             }
             entry[c] = w;
@@ -33,16 +40,16 @@ fn output_table() -> [[u8; 2]; NUM_STATES] {
     t
 }
 
+/// Decode. `metrics` holds one entry per *transmitted* coded bit, in encoder
+/// output order; `masks` is the puncturing table (one per input bit incl. tail).
+/// Returns the decoded information bits (tail removed) in `out` and the final
+/// path metric normalised by the number of coded bits (a reliability measure —
+/// lower is better).
 impl ViterbiDecoder {
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Decode. `metrics` holds one entry per *transmitted* coded bit, in encoder
-    /// output order; `masks` is the puncturing table (one per input bit incl. tail).
-    /// Returns the decoded information bits (tail removed) in `out` and the final
-    /// path metric normalised by the number of coded bits (a reliability measure —
-    /// lower is better).
     pub fn decode(&mut self, metrics: &[BitMetric], masks: &[PunctureMask], out: &mut Vec<u8>) -> f64 {
         let steps = masks.len();
         let num_bits = steps.saturating_sub(CONSTRAINT_LENGTH - 1);
@@ -56,12 +63,12 @@ impl ViterbiDecoder {
         old[0] = 0.0;
         let mut new = [0.0f64; NUM_STATES];
         let mut pos = 0usize;
-        // Branch metric of each of the 16 possible output words for this step.
-        let mut word_metric = [0.0f64; 16];
+        // Branch metric of each of the 2^6 possible output words for this step.
+        let mut word_metric = [0.0f64; NUM_WORDS];
 
         for (step, &mask) in masks.iter().enumerate() {
             // Gather the soft values of the outputs actually transmitted.
-            let mut m = [BitMetric::ERASURE; 4];
+            let mut m = [BitMetric::ERASURE; NUM_MOTHER_OUTPUTS];
             for (j, mj) in m.iter_mut().enumerate() {
                 if mask & (1 << j) != 0 {
                     *mj = metrics.get(pos).copied().unwrap_or(BitMetric::ERASURE);
@@ -136,7 +143,9 @@ mod tests {
 
     #[test]
     fn decodes_every_code_rate_error_free() {
-        for rate in 0..13 {
+        // All 15 rates, including mode E's 1/6 and 2/5. 1/6 is the unpunctured mother
+        // code, so it is the one rate that exercises mother outputs b₄ and b₅.
+        for rate in 0..CODE_RATES.len() {
             let s = spec(96, 500, rate, rate);
             let masks = mask_table(&s);
             let bits: Vec<u8> = (0..596u32).map(|i| (i.wrapping_mul(2654435761) >> 7) as u8 & 1).collect();
@@ -147,6 +156,29 @@ mod tests {
             dec.decode(&hard_metrics(&coded), &masks, &mut out);
             assert_eq!(out, bits, "rate index {rate}");
         }
+    }
+
+    /// The six-output mother code, checked against the standard's own generator
+    /// polynomials rather than against the encoder that uses it: b₀..b₂ repeat as
+    /// b₃..b₅, and b₄/b₅ are the only outputs the 1/6 rate adds (§7.3.2).
+    #[test]
+    fn the_mother_code_is_rate_one_sixth() {
+        assert_eq!(GENERATORS, [0o155, 0o117, 0o123, 0o155, 0o117, 0o123]);
+        assert_eq!(NUM_MOTHER_OUTPUTS, 6);
+        for reg in 0..128u8 {
+            for j in 0..3 {
+                assert_eq!(mother_output(reg, j), mother_output(reg, j + 3), "reg {reg}, output {j}");
+            }
+        }
+        // 1/6 keeps every output for the information bits. The six tail bits are
+        // punctured by table 28, so the total is 6·(bits + 6) minus what the tail
+        // pattern drops.
+        let bits = 100usize;
+        let s = spec(0, bits, RATE_1_6, RATE_1_6);
+        let masks = mask_table(&s);
+        let info_ones: usize = masks[..bits].iter().map(|m| m.count_ones() as usize).sum();
+        assert_eq!(info_ones, 6 * bits, "the 1/6 rate must keep all six outputs");
+        assert!(coded_len(&masks) <= 6 * masks.len());
     }
 
     #[test]

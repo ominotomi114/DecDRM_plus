@@ -3,7 +3,7 @@
 
 use crate::cellmap::CellMap;
 use crate::dsp::{iir1_c, iir1_lambda, sinc};
-use crate::params::{RobustnessMode, SAMPLE_RATE};
+use crate::params::RobustnessMode;
 use crate::{Cplx, Real};
 use std::collections::VecDeque;
 use std::f64::consts::PI;
@@ -71,6 +71,8 @@ pub struct FrameSync {
     // Frequency tracking.
     pub track_freq: bool,
     freq_pil: [usize; 3],
+    /// Whether this mode defines frequency reference cells at all (mode E defines none).
+    have_freq_pil: bool,
     old_pil: [Cplx; 3],
     have_old: bool,
     freq_vec: Cplx,
@@ -81,12 +83,19 @@ pub struct FrameSync {
     pil_ph_diff: [Cplx; 3],
     sro_lambda: Real,
     sro_count: usize,
+    /// Working sample rate of the input, for the offsets expressed in Hz.
+    rate: crate::params::WorkingRate,
 }
 
 impl FrameSync {
     pub fn new(map: &CellMap) -> Self {
+        Self::new_at(map, crate::params::WorkingRate::R48)
+    }
+
+    /// [`Self::new`] at an explicit working sample rate (mode E, DRM+, needs 120 or 192 kHz).
+    pub fn new_at(map: &CellMap, rate: crate::params::WorkingRate) -> Self {
         let ns = map.symbols_per_frame;
-        let n = map.mode().fft_size();
+        let n = map.mode().fft_size_at(rate);
         let row = map.symbol_cells(0);
         let pil = map.symbol_pilots(0);
         let mut pairs = Vec::new();
@@ -108,7 +117,9 @@ impl FrameSync {
                 cnt += 1;
             }
         }
-        let ts = map.mode().symbol_len() as Real;
+        // Mode E has no frequency reference cells at all (8.4.2), so `cnt` stays 0.
+        let have_freq_pil = cnt == 3;
+        let ts = map.mode().symbol_len_at(rate) as Real;
         Self {
             ns,
             n,
@@ -127,14 +138,16 @@ impl FrameSync {
             state: FrameSyncState::Searching,
             track_freq: false,
             freq_pil,
+            have_freq_pil,
             old_pil: [Cplx::new(0.0, 0.0); 3],
             have_old: false,
             freq_vec: Cplx::new(0.0, 0.0),
-            lambda: iir1_lambda(TICONST_FREQ_OFF_EST, Real::from(SAMPLE_RATE) / ts),
+            lambda: iir1_lambda(TICONST_FREQ_OFF_EST, Real::from(rate.hz()) / ts),
             norm_const: 1.0 / (2.0 * PI * ts),
             pil_ph_diff: [Cplx::new(0.0, 0.0); 3],
-            sro_lambda: iir1_lambda(TICONST_SRO_EST, Real::from(SAMPLE_RATE) / ts),
+            sro_lambda: iir1_lambda(TICONST_SRO_EST, Real::from(rate.hz()) / ts),
             sro_count: 0,
+            rate,
         }
     }
 
@@ -208,10 +221,12 @@ impl FrameSync {
         let symbol = self.sym_counter;
         self.sym_counter = (self.sym_counter + 1) % self.ns;
 
-        // Frequency tracking from the continuous pilots.
+        // Frequency tracking from the continuous pilots. Robustness mode E defines no
+        // frequency reference cells (8.4.2), so there is nothing to track from: skip it
+        // entirely rather than reading carrier 0 three times as if it were a pilot.
         let mut freq_delta_hz = 0.0;
         let mut sro_estimate = None;
-        if self.track_freq {
+        if self.track_freq && self.have_freq_pil {
             let mut est = Cplx::new(0.0, 0.0);
             let mut prods = [Cplx::new(0.0, 0.0); 3];
             for i in 0..3 {
@@ -231,7 +246,7 @@ impl FrameSync {
                 iir1_c(&mut self.freq_vec, est, self.lambda);
                 let e = self.freq_vec.arg();
                 self.freq_vec *= Cplx::from_polar(1.0, -e);
-                freq_delta_hz = e * self.norm_const * Real::from(SAMPLE_RATE);
+                freq_delta_hz = e * self.norm_const * Real::from(self.rate.hz());
 
                 // SRO: the per-symbol phase advance grows linearly with the carrier
                 // index with slope 2*pi*eps*Ts/N. The common part (frequency offset)
@@ -281,6 +296,6 @@ impl FrameSync {
     /// Faster frequency averaging during acquisition.
     pub fn set_freq_time_constant(&mut self, tau: Real) {
         let ts = self.norm_const.recip() / (2.0 * PI);
-        self.lambda = iir1_lambda(tau, Real::from(SAMPLE_RATE) / ts);
+        self.lambda = iir1_lambda(tau, Real::from(self.rate.hz()) / ts);
     }
 }

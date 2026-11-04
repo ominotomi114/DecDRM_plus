@@ -455,9 +455,14 @@ fn check_clean(sc: &Scenario, o: &Outcome) -> Vec<String> {
     p
 }
 
+/// Every layout the 48 kHz chain can run, i.e. the DRM30 modes A-D (robustness mode E,
+/// DRM+, needs a higher working rate — see `check_mode_rate`).
 fn all_layouts() -> Vec<ChannelLayout> {
     let mut v = Vec::new();
     for mode in RobustnessMode::ALL {
+        if mode.is_drm_plus() {
+            continue;
+        }
         for so in SpectrumOccupancy::ALL {
             if let Some(l) = ChannelLayout::new(mode, so) {
                 v.push(l);

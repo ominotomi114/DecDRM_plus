@@ -843,6 +843,7 @@ name = "decdrm-core"
 version = "0.7.0"
 dependencies = [
  "claxon",
+ "hound",
  "num-complex",
  "rustfft",
  "thiserror 2.0.21",
@@ -905,6 +906,7 @@ dependencies = [
  "ab_glyph",
  "anyhow",
  "clap",
+ "decdrm-codecs",
  "decdrm-core",
  "decdrm-dac",
  "decdrm-data",

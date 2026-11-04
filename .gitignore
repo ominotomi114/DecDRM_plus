@@ -1,15 +1,33 @@
 # Build output
 /target/
-# Portable executables (scripts/build-portable.ps1)
+# Portable executables (scripts/build-portable.ps1) and the optional xHE-AAC host
 /exe/
 **/*.rs.bk
 
 # Local-only material (large or third-party docs, not redistributed)
 /samples/
 /reference/
+/refs/
 /out/
 # Neural codec weights (DAC), fetched with `decdrm models download dac`
 /models/
+
+# Third-party binaries never belong in the repository. `fhgio.dll` is Fraunhofer IIS's
+# commercial DRM xHE-AAC encoder (tools/xhe-host explains it): DecDRM only ever loads it
+# from beside its own executable, and it must not be redistributed.
+*.dll
+*.lib
+*.obj
+*.pdb
+*.so
+*.dylib
+
+# Recordings and captures stay out too (the tests generate what they need)
+*.wav
+*.flac
+*.iq
+*.pcap
+*.pcapng
 
 # Editor/OS noise
 .vscode/

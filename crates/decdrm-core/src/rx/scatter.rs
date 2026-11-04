@@ -18,7 +18,7 @@
 
 use crate::cellmap::CellMap;
 use crate::dsp::fft::Fft;
-use crate::params::{RobustnessMode, SAMPLE_RATE};
+use crate::params::RobustnessMode;
 use crate::{Cplx, Real};
 use std::collections::VecDeque;
 use std::f64::consts::PI;
@@ -82,29 +82,41 @@ pub(crate) struct ChannelHistory {
     symbol_s: Real,
     guard_ms: Real,
     doppler_max_hz: Real,
+    /// Working sample rate (the delay–Doppler bin spacing is `rate / fft_size`).
+    rate: crate::params::WorkingRate,
     map: Option<DelayDoppler>,
 }
 
 impl ChannelHistory {
+    /// The 48 kHz default (modes A–D).
+    #[allow(dead_code)] // convenience wrapper; the receiver now always passes its rate
     pub fn new(map: &CellMap) -> Self {
+        Self::new_at(map, crate::params::WorkingRate::R48)
+    }
+
+    /// [`Self::new`] at an explicit working sample rate (mode E needs 120 or 192 kHz).
+    pub fn new_at(map: &CellMap, rate: crate::params::WorkingRate) -> Self {
         let mode = map.mode();
-        let fs = Real::from(SAMPLE_RATE);
-        let symbol_s = mode.symbol_len() as Real / fs;
+        let fs = Real::from(rate.hz());
+        let symbol_s = mode.symbol_len_at(rate) as Real / fs;
         let doppler_max_hz: Real = match mode {
             RobustnessMode::A | RobustnessMode::B => 5.0,
             RobustnessMode::C => 8.0,
             RobustnessMode::D => 10.0,
+            // Mode E (DRM+) reception is not implemented yet; widest DRM30 value.
+            RobustnessMode::E => 10.0,
         };
         Self {
             rows: VecDeque::new(),
             max_rows: (WINDOW_S / symbol_s).round() as usize,
             stale: false,
             kmin: map.kmin,
-            fft_size: mode.fft_size(),
+            fft_size: mode.fft_size_at(rate),
             symbol_s,
-            guard_ms: mode.guard_len() as Real / fs * 1e3,
+            guard_ms: mode.guard_len_at(rate) as Real / fs * 1e3,
             doppler_max_hz: doppler_max_hz.min(0.45 / symbol_s),
             map: None,
+            rate,
         }
     }
 
@@ -143,6 +155,7 @@ impl ChannelHistory {
                 self.symbol_s,
                 range,
                 self.doppler_max_hz,
+                self.rate,
             )
             .map(|m| DelayDoppler { guard_ms: self.guard_ms, ..m });
         }
@@ -169,6 +182,7 @@ pub fn delay_doppler(
     symbol_s: Real,
     delay_range_ms: (Real, Real),
     doppler_max_hz: Real,
+    rate: crate::params::WorkingRate,
 ) -> Option<DelayDoppler> {
     let t_len = rows.len();
     let n_car = rows.first()?.0.len();
@@ -176,7 +190,7 @@ pub fn delay_doppler(
         return None;
     }
     let newest = rows[t_len - 1].1;
-    let spacing_hz = Real::from(SAMPLE_RATE) / fft_size as Real;
+    let spacing_hz = Real::from(rate.hz()) / fft_size as Real;
 
     // Delay transform: twice the carriers (zero-padded), a power of two.
     let nd = (2 * n_car).next_power_of_two();
@@ -294,7 +308,7 @@ mod tests {
     #[test]
     fn paths_appear_at_their_delay_and_doppler() {
         let rows = rows(&[(0.5, 1.0, 1.0), (2.0, 0.5, -0.5)], 225, usize::MAX, 0);
-        let m = delay_doppler(&rows, KMIN, FFT, TS, (-1.33, 6.67), 5.0).unwrap();
+        let m = delay_doppler(&rows, KMIN, FFT, TS, (-1.33, 6.67), 5.0, crate::params::WorkingRate::R48).unwrap();
         let (tau, nu) = peak(&m);
         assert!((tau - 0.5).abs() < 0.06 && (nu - 1.0).abs() < 0.05, "strongest at {tau} ms, {nu} Hz");
         // The second path: about 6 dB down, at 2 ms and −0.5 Hz.
@@ -317,7 +331,7 @@ mod tests {
         // The window moves 10 samples (0.21 ms) later half-way: the path's delay in the
         // newest timing is 1.0 ms − 0.21 ms, and the spot stays sharp.
         let rows = rows(&[(1.0, 1.0, 0.3)], 225, 112, 10);
-        let m = delay_doppler(&rows, KMIN, FFT, TS, (-1.33, 6.67), 5.0).unwrap();
+        let m = delay_doppler(&rows, KMIN, FFT, TS, (-1.33, 6.67), 5.0, crate::params::WorkingRate::R48).unwrap();
         let (tau, nu) = peak(&m);
         let expected = 1.0 - 10.0 / 48.0;
         assert!((tau - expected).abs() < 0.06 && (nu - 0.3).abs() < 0.05, "at {tau} ms, {nu} Hz");
@@ -357,10 +371,10 @@ mod tests {
 
     #[test]
     fn too_little_to_go_on() {
-        assert!(delay_doppler(&[], KMIN, FFT, TS, (0.0, 5.0), 5.0).is_none());
+        assert!(delay_doppler(&[], KMIN, FFT, TS, (0.0, 5.0), 5.0, crate::params::WorkingRate::R48).is_none());
         let few = rows(&[(0.0, 1.0, 0.0)], 4, usize::MAX, 0);
-        assert!(delay_doppler(&few, KMIN, FFT, TS, (0.0, 5.0), 5.0).is_none());
+        assert!(delay_doppler(&few, KMIN, FFT, TS, (0.0, 5.0), 5.0, crate::params::WorkingRate::R48).is_none());
         let zeros = vec![(vec![Cplx::new(0.0, 0.0); N_CAR], 0); 50];
-        assert!(delay_doppler(&zeros, KMIN, FFT, TS, (0.0, 5.0), 5.0).is_none());
+        assert!(delay_doppler(&zeros, KMIN, FFT, TS, (0.0, 5.0), 5.0, crate::params::WorkingRate::R48).is_none());
     }
 }

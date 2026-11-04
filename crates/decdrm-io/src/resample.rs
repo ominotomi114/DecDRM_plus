@@ -408,42 +408,49 @@ impl std::fmt::Debug for Resampler {
     }
 }
 
-/// Brings any input rate to the 48 kHz [`WORKING_RATE`] the receiver runs at.
+/// Brings any input rate to the working rate the receiver runs at.
 ///
 /// A thin wrapper around an optional [`Resampler`] ([`High`](ResamplerQuality::High) quality)
-/// that is a zero-cost pass-through when the input already runs at 48 kHz.
+/// that is a zero-cost pass-through when the input already runs at the target rate.
+///
+/// The target is a parameter rather than the [`WORKING_RATE`] constant: robustness modes A–D
+/// are demodulated at 48 kHz, but mode E (DRM+) carries 213 carriers reaching ±47.11 kHz and
+/// needs 96/120/192 kHz, so the receiver's rate is a setting ([`To48k`] is the 48 kHz case).
 ///
 /// ```no_run
-/// use decdrm_io::{FileReader, To48k};
+/// use decdrm_io::{FileReader, ToRate};
 /// # fn main() -> decdrm_io::Result<()> {
 /// let mut reader = FileReader::open("samples/FMGold_xHE_ModeB_9khz.flac")?; // 44.1 kHz
 /// let fmt = reader.format();
-/// let mut conv = To48k::new(fmt.sample_rate, fmt.channels)?;
+/// let mut conv = ToRate::new(fmt.sample_rate, 48_000, fmt.channels)?;
 /// while let Some(block) = reader.read(4410)? {
-///     let at_48k = conv.process(&block);
-///     // feed `at_48k` to the receiver ...
-/// #   let _ = at_48k;
+///     let converted = conv.process(&block);
+///     // feed `converted` to the receiver ...
+/// #   let _ = converted;
 /// }
 /// let tail = conv.flush();
 /// # let _ = tail;
 /// # Ok(()) }
 /// ```
 #[derive(Debug)]
-pub struct To48k {
+pub struct ToRate {
     inner: Option<Resampler>,
     channels: usize,
+    out_rate: u32,
 }
 
-impl To48k {
-    /// Creates a converter for `channels`-channel input at `in_rate` Hz.
-    pub fn new(in_rate: u32, channels: usize) -> Result<Self> {
+impl ToRate {
+    /// Creates a converter from `in_rate` to `out_rate` Hz for `channels` interleaved
+    /// channels. Nothing is resampled when the two rates are equal.
+    pub fn new(in_rate: u32, out_rate: u32, channels: usize) -> Result<Self> {
         AudioFormat::new(in_rate, channels).validate()?;
-        let inner = if in_rate == WORKING_RATE {
+        AudioFormat::new(out_rate, channels).validate()?;
+        let inner = if in_rate == out_rate {
             None
         } else {
-            Some(Resampler::to_48k(in_rate, channels)?)
+            Some(Resampler::new(in_rate, out_rate, channels, ResamplerQuality::High)?)
         };
-        Ok(To48k { inner, channels })
+        Ok(ToRate { inner, channels, out_rate })
     }
 
     /// Converts a block (see [`Resampler::process`]); a copy of the input when passing through.
@@ -462,7 +469,7 @@ impl To48k {
         }
     }
 
-    /// `true` if the input is already at 48 kHz and no resampling happens.
+    /// `true` if the input is already at the target rate and no resampling happens.
     pub fn is_passthrough(&self) -> bool {
         self.inner.is_none()
     }
@@ -472,10 +479,54 @@ impl To48k {
         self.channels
     }
 
+    /// The rate this converter produces, Hz.
+    pub fn out_rate(&self) -> u32 {
+        self.out_rate
+    }
+
     /// The underlying resampler, e.g. to apply a sample-rate-offset correction with
     /// [`Resampler::set_ratio_adjust`]. `None` in pass-through mode.
     pub fn resampler_mut(&mut self) -> Option<&mut Resampler> {
         self.inner.as_mut()
+    }
+}
+
+/// [`ToRate`] to the 48 kHz [`WORKING_RATE`] the receiver runs at by default.
+#[derive(Debug)]
+pub struct To48k {
+    inner: ToRate,
+}
+
+impl To48k {
+    /// Creates a converter for `channels`-channel input at `in_rate` Hz.
+    pub fn new(in_rate: u32, channels: usize) -> Result<Self> {
+        Ok(To48k { inner: ToRate::new(in_rate, WORKING_RATE, channels)? })
+    }
+
+    /// Converts a block (see [`Resampler::process`]); a copy of the input when passing through.
+    pub fn process(&mut self, input: &[f32]) -> Vec<f32> {
+        self.inner.process(input)
+    }
+
+    /// Returns the tail at the end of the stream (see [`Resampler::flush`]).
+    pub fn flush(&mut self) -> Vec<f32> {
+        self.inner.flush()
+    }
+
+    /// `true` if the input is already at 48 kHz and no resampling happens.
+    pub fn is_passthrough(&self) -> bool {
+        self.inner.is_passthrough()
+    }
+
+    /// Number of interleaved channels.
+    pub fn channels(&self) -> usize {
+        self.inner.channels()
+    }
+
+    /// The underlying resampler, e.g. to apply a sample-rate-offset correction with
+    /// [`Resampler::set_ratio_adjust`]. `None` in pass-through mode.
+    pub fn resampler_mut(&mut self) -> Option<&mut Resampler> {
+        self.inner.resampler_mut()
     }
 }
 

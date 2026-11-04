@@ -1,10 +1,11 @@
 //! Signal sources: recordings, sound cards and KiwiSDRs, delivered as interleaved
-//! `f32` frames at the 48 kHz working rate; for diversity reception two of them side
-//! by side. MDI/RSCI input delivers multiplex frames instead ([`Input::Mdi`]).
+//! `f32` frames at the receiver's working rate — 48 kHz for robustness modes A–D, or
+//! 96/120/192 kHz for mode E (DRM+); for diversity reception two of them side by side.
+//! MDI/RSCI input delivers multiplex frames instead ([`Input::Mdi`]).
 
 use crate::snapshot::MdiStatus;
 use anyhow::{Context, Result};
-use decdrm_io::{FileReader, InputOptions, InputStream, To48k};
+use decdrm_io::{FileReader, InputOptions, InputStream, ToRate, WORKING_RATE};
 use decdrm_kiwi::{KiwiConfig, KiwiStatus, KiwiStream};
 use decdrm_mdi::net::UdpDestination;
 use decdrm_mdi::rci::{RciCommand, RciSender};
@@ -97,6 +98,9 @@ struct MdiSource {
     /// Sends RCI to the RSCI receiver.
     rci: Option<RciSender>,
     frames: u64,
+    /// Seconds of signal the frames account for: 400 ms per logical frame in modes A–D,
+    /// **100 ms in mode E** (a DRM+ frame's FAC is 116 bits, see `decdrm_mdi::mdi`).
+    seconds: f64,
     /// Protocol of the first frame ("MDI" / "RSCI" and revision).
     protocol: Option<String>,
     /// The latest RSCI receiver status.
@@ -118,11 +122,13 @@ pub struct SourceInfo {
     pub is_file: bool,
 }
 
-/// An opened source producing 48 kHz frames.
+/// An opened source producing frames at the receiver's working rate.
 pub struct Source {
     kind: Kind,
-    /// Conversion to 48 kHz; for a KiwiSDR made once it has reported its rate.
-    to48: Option<To48k>,
+    /// Conversion to the working rate; for a KiwiSDR made once it has reported its rate.
+    conv: Option<ToRate>,
+    /// The working rate the frames come out at, Hz ([`Self::open_at`]).
+    out_rate: u32,
     info: SourceInfo,
     /// Frames delivered so far (at the source rate).
     pub frames_read: u64,
@@ -139,7 +145,19 @@ enum Kind {
 }
 
 impl Source {
+    /// Opens `spec`, converting its samples to the default 48 kHz working rate
+    /// ([`WORKING_RATE`]); see [`Self::open_at`] for a receiver running at another rate.
     pub fn open(spec: &InputSpec) -> Result<Self> {
+        Self::open_at(spec, WORKING_RATE)
+    }
+
+    /// Opens `spec`, converting its samples to the working rate `rate_hz`. The rate must be
+    /// the one the receiver is configured with ([`ReceiverConfig::working_rate`]): it is what
+    /// the OFDM demodulation runs at, so a mode E (DRM+) receiver needs 96/120/192 kHz and
+    /// resampling to 48 kHz would fold its carriers away.
+    ///
+    /// [`ReceiverConfig::working_rate`]: decdrm_core::rx::ReceiverConfig::working_rate
+    pub fn open_at(spec: &InputSpec, rate_hz: u32) -> Result<Self> {
         let (kind, info) = match spec {
             InputSpec::File { path, .. } => {
                 let r = FileReader::open(path).with_context(|| format!("opening {}", path.display()))?;
@@ -156,7 +174,9 @@ impl Source {
             InputSpec::Device { name, channels } => {
                 let opts = InputOptions {
                     device: name.clone(),
-                    sample_rate: Some(48_000),
+                    // Ask the card for the working rate; if it cannot, `InputStream`
+                    // opens it at a rate it can and the resampler below converts.
+                    sample_rate: Some(rate_hz),
                     channels: *channels,
                     buffer: Duration::from_secs(3),
                 };
@@ -172,10 +192,10 @@ impl Source {
                 (Kind::Device(s), info)
             }
             InputSpec::Diversity(specs) => {
-                let a = Source::open(&specs[0]).context("opening the first input")?;
-                let b = Source::open(&specs[1]).context("opening the second input")?;
+                let a = Source::open_at(&specs[0], rate_hz).context("opening the first input")?;
+                let b = Source::open_at(&specs[1], rate_hz).context("opening the second input")?;
                 let info = SourceInfo { name: format!("{} + {}", a.info.name, b.info.name), ..a.info.clone() };
-                return Ok(Self { kind: Kind::Pair(Box::new([a, b]), [None, None]), to48: None, info, frames_read: 0 });
+                return Ok(Self { kind: Kind::Pair(Box::new([a, b]), [None, None]), conv: None, out_rate: rate_hz, info, frames_read: 0 });
             }
             InputSpec::Mdi(spec) => {
                 let input = MdiInput::open(spec.origin.clone(), spec.realtime)
@@ -198,8 +218,8 @@ impl Source {
                 if let Some(r) = &rci {
                     log.push(format!("MDI/RSCI: RCI commands go to {}", r.destination()));
                 }
-                let kind = Kind::Mdi(Box::new(MdiSource { input, rci, frames: 0, protocol: None, rsci: RsciStatus::default(), log }));
-                return Ok(Self { kind, to48: None, info, frames_read: 0 });
+                let kind = Kind::Mdi(Box::new(MdiSource { input, rci, frames: 0, seconds: 0.0, protocol: None, rsci: RsciStatus::default(), log }));
+                return Ok(Self { kind, conv: None, out_rate: rate_hz, info, frames_read: 0 });
             }
             InputSpec::Kiwi(cfg) => {
                 // Connects in the background: `read` waits for the samples, so a stop
@@ -213,11 +233,11 @@ impl Source {
                     is_file: false,
                 };
                 let kind = Kind::Kiwi(KiwiStream::start(cfg.clone()), cfg.address.to_string());
-                return Ok(Self { kind, to48: None, info, frames_read: 0 });
+                return Ok(Self { kind, conv: None, out_rate: rate_hz, info, frames_read: 0 });
             }
         };
-        let to48 = To48k::new(info.sample_rate, info.channels).context("creating resampler")?;
-        Ok(Self { kind, to48: Some(to48), info, frames_read: 0 })
+        let conv = ToRate::new(info.sample_rate, rate_hz, info.channels).context("creating resampler")?;
+        Ok(Self { kind, conv: Some(conv), out_rate: rate_hz, info, frames_read: 0 })
     }
 
     pub fn info(&self) -> &SourceInfo {
@@ -232,12 +252,12 @@ impl Source {
         }
     }
 
-    /// Seconds of input consumed so far (diversity reception: of the first branch;
-    /// MDI: 400 ms per frame).
+    /// Seconds of input consumed so far (diversity reception: of the first branch; MDI:
+    /// one logical frame per frame — 400 ms in modes A–D, 100 ms in mode E).
     pub fn position_s(&self) -> f64 {
         match &self.kind {
             Kind::Pair(s, _) => s[0].position_s(),
-            Kind::Mdi(m) => m.frames as f64 * 0.4,
+            Kind::Mdi(m) => m.seconds,
             _ => self.frames_read as f64 / f64::from(self.info.sample_rate.max(1)),
         }
     }
@@ -320,7 +340,7 @@ impl Source {
                 s.tune(freq_khz);
                 self.info.name = format!("KiwiSDR {address} at {freq_khz:.3} kHz");
                 // A fresh resampler: its history belongs to the old frequency.
-                self.to48 = None;
+                self.conv = None;
                 true
             }
             _ => false,
@@ -343,6 +363,8 @@ impl Source {
         Ok(match m.input.read(wait)? {
             MdiRead::Frame(f) => {
                 m.frames += 1;
+                // A DRM+ frame is 100 ms: its FAC is 116 bits where A–D's is 72.
+                m.seconds += if f.is_mode_e() { 0.1 } else { 0.4 };
                 if m.protocol.is_none() {
                     let p = f.protocol.map_or_else(
                         || "MDI (no *ptr)".to_string(),
@@ -384,10 +406,11 @@ impl Source {
         }
     }
 
-    /// Read up to `max_frames` source frames and return them converted to 48 kHz.
-    /// `Ok(None)` means end of file. For live inputs this waits briefly for data; a
-    /// KiwiSDR connection that has ended for good is an error (its reason). A diversity
-    /// input gives its first branch here; see [`Self::read_branches`].
+    /// Read up to `max_frames` source frames and return them converted to the working
+    /// rate ([`Self::open_at`]). `Ok(None)` means end of file. For live inputs this waits
+    /// briefly for data; a KiwiSDR connection that has ended for good is an error (its
+    /// reason). A diversity input gives its first branch here; see
+    /// [`Self::read_branches`].
     pub fn read(&mut self, max_frames: usize) -> Result<Option<Vec<f32>>> {
         self.read_waiting(max_frames, Duration::from_millis(500))
     }
@@ -398,7 +421,7 @@ impl Source {
             Kind::File(r) => match r.read(max_frames)? {
                 Some(v) => v,
                 None => {
-                    let tail = self.to48.as_mut().map(To48k::flush).unwrap_or_default();
+                    let tail = self.conv.as_mut().map(ToRate::flush).unwrap_or_default();
                     return Ok(if tail.is_empty() { None } else { Some(tail) });
                 }
             },
@@ -418,8 +441,8 @@ impl Source {
                 // receiver tracks the rest), also after a redirection to another Kiwi.
                 if let Some(rate) = s.sample_rate() {
                     let rate = rate.round() as u32;
-                    if self.to48.is_none() || rate != self.info.sample_rate {
-                        self.to48 = Some(To48k::new(rate, 2).context("creating resampler")?);
+                    if self.conv.is_none() || rate != self.info.sample_rate {
+                        self.conv = Some(ToRate::new(rate, self.out_rate, 2).context("creating resampler")?);
                         self.info.sample_rate = rate;
                     }
                 }
@@ -427,7 +450,7 @@ impl Source {
             }
         };
         self.frames_read += (raw.len() / self.info.channels.max(1)) as u64;
-        Ok(Some(match &mut self.to48 {
+        Ok(Some(match &mut self.conv {
             Some(c) => c.process(&raw),
             None => Vec::new(),
         }))

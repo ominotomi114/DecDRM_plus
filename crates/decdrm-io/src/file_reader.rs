@@ -417,6 +417,16 @@ impl std::fmt::Debug for FileReader {
     }
 }
 
+/// The sample rate of a recording, Hz, without decoding any of it.
+///
+/// A caller uses this to demodulate a file at the rate it was recorded at: a DRM+ (mode E)
+/// recording at 192 kHz decoded at 48 kHz would be resampled into a band far too narrow for
+/// its carriers. `None` for a file this reader does not understand — an MDI/pcap recording,
+/// or a raw sound-card capture — in which case the caller keeps its own default.
+pub fn probe_sample_rate(path: impl AsRef<Path>) -> Option<u32> {
+    FileReader::open(path).ok().map(|r| r.format().sample_rate)
+}
+
 /// If `path` is a FLAC stream whose STREAMINFO declares zero samples, returns its format and
 /// bit depth. Layout: `fLaC`, a 4-byte metadata block header (type 0 = STREAMINFO, length 34),
 /// then STREAMINFO, whose bytes 10..18 pack sample rate (20 bits), channels − 1 (3),
@@ -434,4 +444,32 @@ fn empty_flac_format(path: &Path) -> Option<(AudioFormat, u32)> {
     let bits = ((packed >> 36) & 0x1f) as u32 + 1;
     let total = packed & ((1 << 36) - 1);
     (total == 0 && rate > 0).then_some((AudioFormat::new(rate, channels), bits))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_sample_rate_is_read_without_decoding() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wide.wav");
+        let spec = hound::WavSpec {
+            channels: 2,
+            sample_rate: 192_000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut w = hound::WavWriter::create(&path, spec).unwrap();
+        for i in 0..480 {
+            w.write_sample((i % 100) as i16).unwrap();
+        }
+        w.finalize().unwrap();
+        assert_eq!(probe_sample_rate(&path), Some(192_000));
+        // A file this reader does not understand (an MDI recording, a missing path) leaves
+        // the caller's own default in place.
+        assert_eq!(probe_sample_rate(dir.path().join("absent.wav")), None);
+        std::fs::write(dir.path().join("not-audio.bin"), b"not a container").unwrap();
+        assert_eq!(probe_sample_rate(dir.path().join("not-audio.bin")), None);
+    }
 }

@@ -243,7 +243,7 @@ pub fn constellation_points(cells: &[Cplx]) -> Points {
 /// tables the demapper uses).
 pub fn sdc_levels(mode: SdcMode) -> &'static [f64] {
     match mode {
-        SdcMode::Qam4 => &tables::QAM4,
+        SdcMode::Qam4 | SdcMode::Qam4Rate25 => &tables::QAM4,
         SdcMode::Qam16 => &tables::QAM16,
     }
 }
@@ -252,6 +252,7 @@ pub fn sdc_levels(mode: SdcMode) -> &'static [f64] {
 /// variants only map bits differently: their points are those of standard 64-QAM.
 pub fn msc_levels(mode: MscMode) -> &'static [f64] {
     match mode {
+        MscMode::Qam4 => &tables::QAM4,
         MscMode::Qam16Sm => &tables::QAM16,
         MscMode::Qam64Sm | MscMode::Qam64HmSym | MscMode::Qam64HmMix => &tables::QAM64_SM,
     }

@@ -37,8 +37,12 @@ pub struct TxSnapshot {
     pub seq: u64,
     /// The station's own status (frames, levels, SDC, services).
     pub status: StationStatus,
-    /// Averaged spectrum of the output in dB, bins from −24 to +24 kHz.
+    /// Averaged spectrum of the output in dB, bins from −fs/2 to +fs/2.
     pub spectrum_db: Vec<f64>,
+    /// Working sample rate of the output, Hz: the span the bins above cover. It is
+    /// 48 kHz for modes A–D and 96/120/192 kHz for DRM+, so the plot's frequency axis
+    /// must come from the station rather than a constant.
+    pub output_rate_hz: f64,
     /// One output channel (real IF); else I/Q.
     pub real_output: bool,
     /// DC carrier and occupied band in that spectrum, Hz.
@@ -183,6 +187,7 @@ fn run(
     let plan = station.plan();
     let (dc, band) = signal_band(plan.layout, plan.output.format);
     let channels = station.output_channels();
+    snap.output_rate_hz = plan.output.working_rate.hz() as f64;
     snap.real_output = channels == 1;
     snap.dc_hz = Some(dc);
     snap.band_hz = Some(band);
@@ -376,7 +381,7 @@ impl TxSession {
                 self.spectrum = SpectrumPlot::new(
                     &snap.spectrum_db,
                     0.0,
-                    48_000.0,
+                    snap.output_rate_hz,
                     snap.real_output,
                     snap.dc_hz,
                     snap.band_hz,
@@ -448,7 +453,7 @@ mod tests {
         };
         let (cfg, plan) = check(EXAMPLE_STATION, &dir, &ov).unwrap();
         let mut tx = TxSession::default();
-        tx.start(cfg, plan, frames_for(2.0), "test".into());
+        tx.start(cfg, plan, frames_for(2.0, 0.4), "test".into());
         assert!(tx.is_running());
         wait_until_stopped(&mut tx);
         assert_eq!(tx.error, None, "{:?}", tx.messages);
@@ -476,7 +481,7 @@ mod tests {
         };
         let (cfg, plan) = check(EXAMPLE_STATION, &dir, &ov).unwrap();
         let mut tx = TxSession::default();
-        let limit = frames_for(3600.0);
+        let limit = frames_for(3600.0, 0.4);
         tx.start(cfg, plan, limit, "long".into());
         tx.stop();
         assert!(tx.is_stopping());
@@ -508,7 +513,7 @@ mod tests {
         };
         let (cfg, plan) = check(EXAMPLE_STATION, &dir, &ov).unwrap();
         let mut tx = TxSession::default();
-        tx.start(cfg, plan, frames_for(3600.0), "journaline".into());
+        tx.start(cfg, plan, frames_for(3600.0, 0.4), "journaline".into());
         // Edited once the station has loaded the page file.
         let t0 = Instant::now();
         while !tx.snap.started && t0.elapsed() < Duration::from_secs(60) {
@@ -565,7 +570,7 @@ mod tests {
         cfg.output.file = Some(dir.join("never.wav"));
         std::fs::remove_file(dir.join("journaline.toml")).unwrap();
         let mut tx = TxSession::default();
-        tx.start(cfg, plan, frames_for(1.0), "broken".into());
+        tx.start(cfg, plan, frames_for(1.0, 0.4), "broken".into());
         wait_until_stopped(&mut tx);
         let e = tx.error.clone().unwrap_or_default();
         assert!(e.contains("journaline"), "{e}");

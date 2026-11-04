@@ -5,7 +5,7 @@
 //! |---|---|
 //! | `*ptr` | protocol "DMDI" (MDI) or "RSCI", major and minor revision (16 bits each) |
 //! | `dlfc` | logical frame count, +1 per frame (32 bits) |
-//! | `fac_` | the FAC block: 72 bits, CRC included; empty when the FAC failed |
+//! | `fac_` | the FAC block: 72 bits (modes A–D) or **116 bits (mode E)**, CRC included; empty when the FAC failed |
 //! | `sdc_` | 4 bits Rfu, then the SDC block: AFS index (4), data field, CRC (16); in the first frame of a super frame, else empty |
 //! | `sdci` | 4 bits Rfu, protection levels of parts A and B (2 + 2), then per stream the lengths of parts A and B in bytes (12 + 12; with hierarchical modulation stream 0 is the hierarchical stream: protection 2, Rfu 10, length 12) |
 //! | `robm` | robustness mode, 0–3 = A–D (8 bits) |
@@ -14,6 +14,12 @@
 //!
 //! Unknown items are kept ([`MdiFrame::other`]); the receiver status items of RSCI go
 //! to [`MdiFrame::rsci`].
+//!
+//! **Mode E (DRM+) has no `robm` code** — the item is two bits and TS 102 820 names only
+//! A–D. A DRM+ frame is marked by its FAC instead: §6.3 gives mode E two service
+//! parameter sets, so its FAC block is 116 bits where A–D's is 72, and
+//! [`MdiFac::is_mode_e`] reads that width. This is what lets an MDI input carry DRM+ at
+//! all, and it is why the FAC item is not a fixed 9 bytes here.
 
 use crate::af::{AfPacket, PROTOCOL_TAG};
 use crate::rsci::RsciStatus;
@@ -137,16 +143,60 @@ impl MdiSdc {
     }
 }
 
+/// The `fac_` item: one FAC block, 72 bits in modes A–D or 116 bits in mode E (§6.3: mode
+/// E carries two service parameter sets). The width is also the only way an MDI frame can
+/// say "DRM+": `robm` is two bits and names A–D only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MdiFac {
+    /// The block as carried, packed eight bits to a byte (the last byte padded).
+    pub data: Vec<u8>,
+    /// The block's length in bits: 72 (A–D) or 116 (E).
+    pub bits: u32,
+}
+
+impl MdiFac {
+    /// A block from its bits, one per byte (`Fac::to_bits_for`).
+    pub fn from_bits(bits: &[u8]) -> Self {
+        Self { data: decdrm_core::bits::pack(bits), bits: bits.len() as u32 }
+    }
+
+    /// The block as bits, one per byte (for `Fac::parse`).
+    pub fn to_bits(&self) -> Vec<u8> {
+        let mut bits = decdrm_core::bits::unpack(&self.data);
+        bits.truncate(self.bits as usize);
+        bits
+    }
+
+    /// A mode E block: 116 bits (§6.3), where modes A–D have 72.
+    pub fn is_mode_e(&self) -> bool {
+        self.bits >= 116
+    }
+
+    fn to_item(&self) -> TagItem {
+        TagItem::with_bits(b"fac_", self.bits, self.data.clone())
+    }
+
+    fn parse(item: &TagItem) -> Option<Self> {
+        if item.bits != 72 && item.bits != 116 {
+            return None;
+        }
+        let len = (item.bits as usize).div_ceil(8);
+        (item.value.len() >= len).then(|| Self { data: item.value[..len].to_vec(), bits: item.bits })
+    }
+}
+
 /// One logical frame of MDI (or the multiplex part of an RSCI packet).
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct MdiFrame {
     pub protocol: Option<Protocol>,
     /// Logical frame count.
     pub dlfc: Option<u32>,
-    /// Robustness mode 0–3 = A–D.
+    /// Robustness mode 0–3 = A–D (mode E is marked by a 116-bit [`MdiFac`], see the
+    /// module docs).
     pub robustness: Option<u8>,
-    /// The FAC block, 72 bits (9 bytes) with its CRC; `None` if absent or empty.
-    pub fac: Option<[u8; 9]>,
+    /// The FAC block, 72 bits (A–D) or 116 (mode E) with its CRC; `None` if absent or
+    /// empty.
+    pub fac: Option<MdiFac>,
     /// The SDC block (first frame of a super frame).
     pub sdc: Option<MdiSdc>,
     pub sdci: Option<Sdci>,
@@ -175,12 +225,7 @@ impl MdiFrame {
                 }
                 b"dlfc" if v.len() >= 4 => f.dlfc = Some(u32::from_be_bytes([v[0], v[1], v[2], v[3]])),
                 b"robm" if !v.is_empty() => f.robustness = (v[0] <= 3).then_some(v[0]),
-                b"fac_" if item.bits == 72 && v.len() >= 9 => {
-                    let mut fac = [0u8; 9];
-                    fac.copy_from_slice(&v[..9]);
-                    f.fac = Some(fac);
-                }
-                b"fac_" => {}
+                b"fac_" => f.fac = MdiFac::parse(item),
                 b"sdc_" => f.sdc = MdiSdc::parse(item),
                 b"sdci" => f.sdci = Sdci::parse(item),
                 b"str0" | b"str1" | b"str2" | b"str3" => {
@@ -219,7 +264,7 @@ impl MdiFrame {
         if let Some(n) = self.dlfc {
             items.push(TagItem::new(b"dlfc", n.to_be_bytes().to_vec()));
         }
-        items.push(TagItem::new(b"fac_", self.fac.map_or_else(Vec::new, |f| f.to_vec())));
+        items.push(self.fac.as_ref().map_or_else(|| TagItem::new(b"fac_", Vec::new()), MdiFac::to_item));
         items.push(self.sdc.as_ref().map_or_else(|| TagItem::new(b"sdc_", Vec::new()), MdiSdc::to_item));
         if let Some(s) = &self.sdci {
             items.push(s.to_item());
@@ -245,9 +290,15 @@ impl MdiFrame {
         AfPacket::new(seq, build_tag_packet(&self.to_items()))
     }
 
-    /// The FAC block as 72 bits, one per byte (for `decdrm_core::fac::Fac::parse`).
+    /// The FAC block as bits, one per byte — 72 for modes A–D, 116 for mode E (for
+    /// `decdrm_core::fac::Fac::parse`, which takes the width from the slice).
     pub fn fac_bits(&self) -> Option<Vec<u8>> {
-        self.fac.map(|f| decdrm_core::bits::unpack(&f))
+        self.fac.as_ref().map(MdiFac::to_bits)
+    }
+
+    /// A mode E (DRM+) frame: its FAC block is 116 bits (see [`MdiFac`]).
+    pub fn is_mode_e(&self) -> bool {
+        self.fac.as_ref().is_some_and(MdiFac::is_mode_e)
     }
 
     /// The packet came from an RSCI receiver (protocol "RSCI").
@@ -265,7 +316,7 @@ mod tests {
             protocol: Some(Protocol::MDI),
             dlfc: Some(41),
             robustness: Some(1),
-            fac: Some([1, 2, 3, 4, 5, 6, 7, 8, 9]),
+            fac: Some(MdiFac::from_bits(&(0..72).map(|i| (i % 2) as u8).collect::<Vec<_>>())),
             sdc: Some(MdiSdc::new(5, vec![0x10, 0x20, 0x30])),
             sdci: Some(Sdci { protection_a: 0, protection_b: 1, streams: vec![(0, 724), (12, 96)] }),
             streams: [Some(vec![7; 724]), Some(vec![8; 108]), None, None],
@@ -282,7 +333,25 @@ mod tests {
         assert_eq!(back, f);
         assert!(!back.is_rsci());
         assert_eq!(back.fac_bits().unwrap().len(), 72);
+        assert!(!back.is_mode_e());
         assert_eq!(back.sdci.as_ref().unwrap().streams[1], (12, 96));
+    }
+
+    /// A mode E frame: its FAC is 116 bits, which is the only marker a DRM+ frame has.
+    #[test]
+    fn mode_e_frame_is_marked_by_the_fac_width() {
+        let f = MdiFrame {
+            fac: Some(MdiFac::from_bits(&(0..116).map(|i| (i % 3 == 0) as u8).collect::<Vec<_>>())),
+            robustness: None,
+            ..frame()
+        };
+        let back = MdiFrame::from_af(&AfPacket::parse(&f.to_af(1).to_bytes()).unwrap()).unwrap();
+        assert_eq!(back, f);
+        assert!(back.is_mode_e());
+        assert_eq!(back.fac_bits().unwrap().len(), 116, "116 bits reach Fac::parse");
+        // The item carries its exact length, not the padded byte count.
+        let item = back.to_items().into_iter().find(|i| &i.name == b"fac_").unwrap();
+        assert_eq!((item.bits, item.value.len()), (116, 15));
     }
 
     /// sdc_ keeps the CRC; a damaged block is flagged. Empty fac_/sdc_ mean "none".

@@ -204,11 +204,13 @@ impl AudioOut {
         Ok(())
     }
 
-    /// The RF monitor's sound: the receiver's input frames as they come in (48 kHz,
-    /// interleaved; 2 channels for I/Q or a stereo input), played while the monitor is
-    /// on.
-    pub fn push_monitor(&mut self, frames: &[f32], channels: usize) -> Result<()> {
-        if self.monitor { self.play(frames, decdrm_core::params::SAMPLE_RATE, channels) } else { Ok(()) }
+    /// The RF monitor's sound: the receiver's input frames as they come in (interleaved;
+    /// 2 channels for I/Q or a stereo input), played while the monitor is on. `sample_rate`
+    /// is the receiver's working rate, not the 48 kHz constant: a mode E (DRM+) receiver
+    /// feeds 96/120/192 kHz frames, and playing them as if they were 48 kHz would sound
+    /// slow and low by the same factor.
+    pub fn push_monitor(&mut self, frames: &[f32], sample_rate: u32, channels: usize) -> Result<()> {
+        if self.monitor { self.play(frames, sample_rate, channels) } else { Ok(()) }
     }
 
     /// Queue decoded audio (interleaved, `channels` = 1 or 2); while the RF monitor is
@@ -447,7 +449,7 @@ mod tests {
         out.set_monitor(true);
         assert!(out.monitoring());
         // 100 ms of I/Q input: played (with a sound card), not recorded.
-        out.push_monitor(&tone(10, 0.5, 4800, 2), 2).unwrap();
+        out.push_monitor(&tone(10, 0.5, 4800, 2), 48_000, 2).unwrap();
         out.push(&tone(10, 0.5, 2400, 1), 24_000, 1).unwrap();
         out.set_monitor(false);
         out.push(&tone(10, 0.5, 2400, 1), 24_000, 1).unwrap();

@@ -1,7 +1,7 @@
 //! `decdrm tx` — run the DRM transmitter described by a station configuration file.
 
 use anyhow::{Context, Result, bail};
-use decdrm_station::{Station, StationConfig, StationStatus, StopHandle};
+use decdrm_station::{Mode, RateSetting, Station, StationConfig, StationStatus, StopHandle, WorkingRate};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -32,10 +32,36 @@ pub struct TxArgs {
     /// channel model 1 (AWGN) unless one is set.
     #[arg(long, value_name = "DB", allow_negative_numbers = true)]
     snr: Option<f64>,
+    /// Working sample rate of the transmit chain, kHz: 48 (default), 96, 120 or 192,
+    /// overriding the file's `[channel] working_sample_rate`. Robustness mode E (DRM+)
+    /// needs 120 or 192, because its carriers reach ±47.11 kHz.
+    #[arg(long, value_name = "KHZ")]
+    sample_rate: Option<u32>,
+    /// Robustness mode (A-E), overriding the file's `[channel] mode`. Mode E is DRM+ and
+    /// is refused below 100 kHz.
+    #[arg(long, value_name = "MODE")]
+    mode: Option<String>,
 }
 
 pub fn run(a: TxArgs) -> Result<()> {
     let mut cfg = StationConfig::load(&a.config)?;
+    if let Some(khz) = a.sample_rate {
+        let hz = khz.checked_mul(1000).filter(|hz| WorkingRate::new(*hz).is_some());
+        let Some(rate) = hz.and_then(WorkingRate::new) else {
+            bail!("--sample-rate must be 48, 96, 120 or 192 (kHz)");
+        };
+        cfg.channel.working_sample_rate = RateSetting(rate);
+    }
+    if let Some(m) = &a.mode {
+        let mode: Mode = m
+            .parse()
+            .map_err(|e: String| anyhow::anyhow!("--mode: {e}"))?;
+        cfg.channel.mode = mode;
+        // Mode E is defined at occupancy 0 (the 100 kHz DRM+ raster) only.
+        if mode.0.is_drm_plus() {
+            cfg.channel.occupancy = 0;
+        }
+    }
     if let Some(out) = &a.output {
         // Relative to the current directory, not to the configuration file.
         cfg.output.file = Some(std::path::absolute(out).with_context(|| format!("output path {}", out.display()))?);
@@ -60,7 +86,8 @@ pub fn run(a: TxArgs) -> Result<()> {
     {
         bail!("--duration must be a positive number of seconds");
     }
-    let frames = a.duration.map(|d| (d / 0.4).ceil() as u64);
+    // One frame per logical frame of the mode: 400 ms in modes A–D, 100 ms in mode E.
+    let frames = a.duration.map(|d| (d / plan.frame_seconds()).ceil() as u64);
 
     // Checked before the station creates its output file.
     if frames.is_none() && cfg.output.device.is_none() && !cfg.inputs_finite() {
@@ -122,8 +149,12 @@ pub fn run(a: TxArgs) -> Result<()> {
 }
 
 fn print_status(s: &StationStatus) {
+    let limited = match (s.papr_db, s.papr_law) {
+        (Some(db), Some(law)) => format!(", {} peaks over {db:.0} dB ({law})", s.limited_samples),
+        _ => String::new(),
+    };
     println!(
-        "[{:6.1}s] output {:5.1} dBFS rms, {:5.1} dBFS peak, {} clipped; SDC {}/{} bytes{}{}",
+        "[{:6.1}s] output {:5.1} dBFS rms, {:5.1} dBFS peak, {} clipped{limited}; SDC {}/{} bytes{}{}",
         s.seconds,
         s.output_rms_dbfs,
         s.output_peak_dbfs,

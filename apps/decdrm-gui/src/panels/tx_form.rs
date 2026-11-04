@@ -9,7 +9,9 @@ use super::meter::{MeterKind, meter_with_text};
 use super::source::DeviceLists;
 use decdrm_core::fac::{LANGUAGES, PROGRAMME_TYPES};
 use decdrm_core::params::{ChannelLayout, RobustnessMode, SpectrumOccupancy};
-use decdrm_core::tx::output::{OutputFormat, recommended_if_range_hz, suggested_if_hz};
+use decdrm_core::tx::output::{
+    MAX_PEAK_LIMIT_DB, MIN_PEAK_LIMIT_DB, OutputFormat, recommended_if_range_hz, suggested_if_hz,
+};
 use eframe::egui::{self, Color32, RichText, Ui};
 use std::path::Path;
 use toml_edit::{ArrayOfTables, DocumentMut, InlineTable, Item, Table, TableLike, Value};
@@ -28,8 +30,12 @@ pub struct FormCtx<'a> {
 /// The multiplex as a bar: MSC capacity and the streams that fill it.
 #[derive(Debug, Clone, Default)]
 pub struct PlanBar {
-    /// MSC bytes per 400 ms frame.
+    /// MSC bytes per transmission frame.
     pub capacity: usize,
+    /// Duration of one transmission frame, ms: 400 for modes A-D, **100 for mode E**. The
+    /// bit rate is `capacity * 8 / frame_ms`, so using a constant 400 for mode E reports a
+    /// quarter of the real rate.
+    pub frame_ms: u32,
     pub segments: Vec<Segment>,
 }
 
@@ -48,6 +54,7 @@ pub struct Segment {
 impl PlanBar {
     /// The bar of a checked configuration.
     pub fn of(cfg: &decdrm_station::StationConfig, plan: &decdrm_station::MultiplexPlan) -> Self {
+        let frame_ms = cfg.channel.mode.0.frame_ms();
         let c = &plan.capacity;
         let capacity = (c.vspp_bits + c.hpp_bits + c.lpp_bits) / 8;
         let label_of = |service: usize| cfg.services.get(service).map_or_else(|| format!("service {service}"), |s| s.label.clone());
@@ -72,13 +79,15 @@ impl PlanBar {
                 }
             })
             .collect();
-        Self { capacity, segments }
+        Self { capacity, frame_ms, segments }
     }
 
     /// Bit rate of the audio stream of service `service` (position), kbit/s.
     pub fn audio_kbps(&self, service: usize) -> Option<f64> {
-        // Bytes per 400 ms frame: × 8 bits / 400 ms.
-        self.segments.iter().find(|s| s.service == Some(service)).map(|s| s.bytes as f64 * 8.0 / 400.0)
+        // Bytes per transmission frame: * 8 bits / frame duration (400 ms for modes A-D,
+        // 100 ms for mode E).
+        let ms = f64::from(self.frame_ms.max(1));
+        self.segments.iter().find(|s| s.service == Some(service)).map(|s| s.bytes as f64 * 8.0 / ms)
     }
 }
 
@@ -186,6 +195,26 @@ fn get_int(t: &dyn TableLike, k: &str) -> Option<i64> {
     t.get(k)?.as_integer()
 }
 
+/// The working sample rate in kHz from the channel section, defaulting to 48.
+///
+/// The field is a **string** ("192kHz"), because `decdrm_station`'s `RateSetting` parses and
+/// writes it in its own spelling; an integer in the file is rejected by the station parser. This
+/// accepts both spellings so a hand-written `120` still reads, and both a string and an integer
+/// so a file written by the older form does not panic.
+fn sample_rate_khz(ch: &dyn TableLike) -> i64 {
+    let Some(item) = ch.get("working_sample_rate") else {
+        return 48;
+    };
+    if let Some(s) = item.as_str() {
+        let digits: String = s.chars().take_while(char::is_ascii_digit).collect();
+        // "192kHz" and "192" are kHz; a bare "192000" is Hz.
+        let n: i64 = digits.parse().unwrap_or(48);
+        return if n >= 1000 { n / 1000 } else { n };
+    }
+    // An integer written by an older build of this form is in kHz.
+    item.as_integer().unwrap_or(48)
+}
+
 fn get_num(t: &dyn TableLike, k: &str) -> Option<f64> {
     let item = t.get(k)?;
     item.as_float().or_else(|| item.as_integer().map(|i| i as f64))
@@ -238,11 +267,22 @@ fn section<'a>(doc: &'a mut DocumentMut, k: &str) -> &'a mut dyn TableLike {
 // Sections
 // ---------------------------------------------------------------------------------
 
+/// Robustness modes. Mode E (DRM+) is listed last: it needs a working sample rate above
+/// ~94 kHz, so it is offered only when the chosen rate allows it (`RATES` below).
 const MODES: &[(&str, &str)] = &[
     ("A", "A — ground wave, few echoes"),
     ("B", "B — sky wave (the usual choice)"),
     ("C", "C — long distance, strong echoes"),
     ("D", "D — severe Doppler and delay"),
+    ("E", "E — DRM+ (VHF, 100 kHz: needs 120 or 192 kHz)"),
+];
+/// Working sample rates of the transmit chain. Modes A–D run at 48 kHz; mode E (DRM+) needs
+/// a rate above ~94 kHz, because its 213 carriers reach ±47.11 kHz.
+const RATES: &[(&str, &str)] = &[
+    ("48", "48 kHz — modes A–D"),
+    ("96", "96 kHz — mode E, but only 0.9 kHz of margin: prefer 120"),
+    ("120", "120 kHz — mode E (12.9 kHz of margin)"),
+    ("192", "192 kHz — mode E (48.9 kHz of margin)"),
 ];
 const OCCUPANCIES: &[(&str, &str)] =
     &[("0", "4.5 kHz"), ("1", "5 kHz"), ("2", "9 kHz"), ("3", "10 kHz"), ("4", "18 kHz"), ("5", "20 kHz")];
@@ -257,38 +297,237 @@ const INTERLEAVING: &[(&str, &str)] = &[("long", "Long (2 s) — rides out fadin
 const PROTECTION_16: &[(&str, &str)] = &[("0", "0 — code rate 0.5 (most robust)"), ("1", "1 — code rate 0.62")];
 const PROTECTION_64: &[(&str, &str)] =
     &[("0", "0 — code rate 0.5 (most robust)"), ("1", "1 — code rate 0.6"), ("2", "2 — code rate 0.71"), ("3", "3 — code rate 0.78")];
+/// Mode E's own four levels, whose code rates are not the DRM30 ones: 16-QAM is table 31
+/// (0.33, 0.41, 0.5, 0.62) and 4-QAM table 29 (0.25, 0.33, 0.4, 0.5).
+const PROTECTION_E_16: &[(&str, &str)] =
+    &[("0", "0 — code rate 0.33 (most robust)"), ("1", "1 — code rate 0.41"), ("2", "2 — code rate 0.5"), ("3", "3 — code rate 0.62")];
+const PROTECTION_E_4: &[(&str, &str)] =
+    &[("0", "0 — code rate 0.25 (most robust)"), ("1", "1 — code rate 0.33"), ("2", "2 — code rate 0.4"), ("3", "3 — code rate 0.5")];
+
+// ---------------------------------------------------------------------------------
+// What robustness mode E changes in the rest of the form
+// ---------------------------------------------------------------------------------
+//
+// Mode E (DRM+) is not a fifth member of the DRM30 family: §7.5.1 gives it its own MSC
+// constellations — "16-QAM or 4-QAM mapping in robustness mode E", where modes A–D use
+// "64-QAM or 16-QAM" — and §6.3.3 gives its MSC mode field different meanings. The
+// selector must therefore change what it offers when the mode changes, and a document
+// that came from elsewhere (the TOML view, a hand-edited file, a mode E station saved
+// before this existed) can hold a combination the mode cannot express. Both cases go
+// through the functions below, so the form and its tests agree on the rules.
+
+/// The MSC constellations `mode` defines, in the order its selector lists them.
+///
+/// ES 201 980 §7.5.1: "The MSC may use either 64-QAM or 16-QAM mapping in robustness modes
+/// A, B, C and D and 16-QAM or 4-QAM mapping in robustness mode E." A choice the mode does
+/// not define is **left out of the selector** rather than shown greyed: it is not a choice,
+/// and the list the user sees should be the list of real options.
+///
+/// Mode E lists its two constellations — 16-QAM and 4-QAM — in the order §7.5.1 names them.
+/// DecDRM encodes both: mode E's own code-rate tables (29 and 31) are in `tables`, and
+/// `MlcParams::msc_for` takes the mode.
+pub fn msc_modes_for(mode: &str) -> &'static [(&'static str, &'static str)] {
+    if mode == "E" {
+        &[("16-QAM", "16-QAM — the DRM+ workhorse"), ("4-QAM", "4-QAM — the robust DRM+ option")]
+    } else {
+        MSC_MODES
+    }
+}
+
+/// Whether `msc` names a constellation `mode` defines (and the form can encode).
+pub fn msc_mode_allowed(mode: &str, msc: &str) -> bool {
+    msc_modes_for(mode).iter().any(|(v, _)| canon(v) == canon(msc))
+}
+
+/// The constellation to use for `mode`: `msc` when the mode defines it, else the mode's
+/// default — 16-QAM for mode E (what DRM+ transmissions use, §7.5.1), 64-QAM for modes A–D
+/// (the station default).
+pub fn msc_mode_for(mode: &str, msc: &str) -> &'static str {
+    match msc_modes_for(mode).iter().find(|(v, _)| canon(v) == canon(msc)) {
+        Some((v, _)) => v,
+        None if mode == "E" => "16-QAM",
+        None => "64-QAM",
+    }
+}
+
+/// The SDC constellations `mode` defines. §7.5.2: 16-QAM or 4-QAM at code rate 0.5 for modes
+/// A–D, but **4-QAM only** for mode E (at 0.5 or 0.25; DecDRM fixes 0.5, `tables::SDC4_RATE`).
+/// Mode E therefore has no choice to offer, and its row is a label rather than a selector.
+pub fn sdc_modes_for(mode: &str) -> &'static [(&'static str, &'static str)] {
+    if mode == "E" {
+        &[("4-QAM", "4-QAM — the only SDC mapping DRM+ has")]
+    } else {
+        SDC_MODES
+    }
+}
+
+/// Whether `sdc` names an SDC constellation `mode` defines.
+pub fn sdc_mode_allowed(mode: &str, sdc: &str) -> bool {
+    sdc_modes_for(mode).iter().any(|(v, _)| canon(v) == canon(sdc))
+}
+
+/// The SDC constellation to use for `mode`: `sdc` when the mode defines it, else 4-QAM for
+/// mode E (its only mapping) and 16-QAM for modes A–D.
+pub fn sdc_mode_for(mode: &str, sdc: &str) -> &'static str {
+    match sdc_modes_for(mode).iter().find(|(v, _)| canon(v) == canon(sdc)) {
+        Some((v, _)) => v,
+        None if mode == "E" => "4-QAM",
+        None => "16-QAM",
+    }
+}
+
+/// The interleaving to use for `mode`: long for mode E (§7.6 — "For robustness mode E only
+/// one interleaver depth is available which corresponds to the algorithm for high interleaver
+/// depth", its flag fixed at 0, 600 ms), else `il`.
+pub fn interleaving_for(mode: &str, il: &str) -> &'static str {
+    if mode == "E" {
+        "long"
+    } else if canon(il) == "short" {
+        "short"
+    } else {
+        "long"
+    }
+}
+
+/// Protection levels the form offers for a constellation in a mode.
+///
+/// §7.5.1: 16-QAM has levels 0–1 in modes A–D (table 30) and **0–3 in mode E** (table 31);
+/// 4-QAM is mode E only and has 0–3 (table 29); 64-QAM has 0–3 (table 32). `MlcParams::msc_for`
+/// uses the mode's own tables, so all four levels of both mode E constellations are real
+/// choices, not just the two the DRM30 16-QAM table happens to carry.
+pub fn protection_levels(mode: &str, msc: &str) -> &'static [(&'static str, &'static str)] {
+    if mode == "E" {
+        if canon(msc) == "4qam" { PROTECTION_E_4 } else { PROTECTION_E_16 }
+    } else if canon(msc) == "16qam" {
+        PROTECTION_16
+    } else {
+        PROTECTION_64
+    }
+}
 
 fn channel(ui: &mut Ui, doc: &mut DocumentMut) -> bool {
+    // The grid repairs the fields it draws as it draws them. What it cannot reach while its
+    // own borrow of `doc` is live — the hierarchical marks on the services — is repaired
+    // here, once the borrow is released. The repair is idempotent: a document already in
+    // order comes back unchanged, so this costs a comparison per frame and never rewrites a
+    // valid document. Running it unconditionally also covers a document *loaded* in a state
+    // its mode cannot express (the station's own validation does not reject those), so the
+    // form cannot save one either.
+    let changed = channel_grid(ui, doc);
+    changed | repair_channel_for_mode(doc)
+}
+
+/// The Channel card's grid.
+fn channel_grid(ui: &mut Ui, doc: &mut DocumentMut) -> bool {
     let mut changed = false;
     let uep = uses_part_a(doc);
     let ch = section(doc, "channel");
-    let mode = get_str(ch, "mode").unwrap_or_else(|| "B".into());
-    let msc = get_str(ch, "msc_mode").unwrap_or_else(|| "64-QAM".into());
-    let sixteen = canon(&msc) == "16qam";
-    let hierarchical = canon(&msc).starts_with("hm");
+    // `mode` is re-read after the selectors that can change it (sample rate and mode), so the
+    // rows below draw the mode the document now has rather than the one it had when the frame
+    // started. Without that a switch to E drew one frame of DRM30 bandwidth on a DRM+ signal.
+    let mut mode = get_str(ch, "mode").unwrap_or_else(|| "B".into());
+    let mut msc = get_str(ch, "msc_mode").unwrap_or_else(|| "64-QAM".into());
+    let mut hierarchical = canon(&msc).starts_with("hm");
     grid(ui, "tx_form_channel", |ui| {
-        row_label(ui, "Robustness mode");
-        if let Some(v) = combo(ui, "tx_mode", &mode, MODES, 280.0) {
-            set(ch, "mode", v);
-            // Modes C and D only have 10 and 20 kHz.
-            if matches!(v, "C" | "D") && !matches!(get_int(ch, "occupancy"), Some(3 | 5)) {
-                set(ch, "occupancy", 3i64);
+        row_label(ui, "Sample rate");
+        // The value is a **string** in the file ("192kHz"), because `RateSetting` parses it
+        // through its own spelling rules ("120", "120kHz" and "192000" all work). Reading it as
+        // an integer and writing one back - which this did - produced a file the station parser
+        // then rejected.
+        let rate = sample_rate_khz(ch).to_string();
+        if let Some(v) = combo(ui, "tx_rate", &rate, RATES, 280.0) {
+            set(ch, "working_sample_rate", format!("{v}kHz"));
+            // Dropping below 100 kHz makes mode E impossible, so fall back to B for the user
+            // rather than leave a configuration that cannot validate.
+            let hz = v.parse::<i64>().unwrap_or(48) * 1000;
+            if hz < 100_000 && mode == "E" {
+                set(ch, "mode", "B");
+                // Back to DRM30: the mode E choices (16-QAM MSC, 4-QAM SDC, long
+                // interleaving) are all valid there, so nothing else needs changing.
             }
+            // The rows below must draw the rate just picked, not the previous one.
+            mode = get_str(ch, "mode").unwrap_or_else(|| "B".into());
             changed = true;
+        }
+        ui.end_row();
+        row_label(ui, "Robustness mode");
+        // Mode E is offered only when the working rate can carry it.
+        let rate_hz = sample_rate_khz(ch) * 1000;
+        let modes: Vec<(&str, &str)> = MODES
+            .iter()
+            .copied()
+            .filter(|(v, _)| *v != "E" || rate_hz >= 100_000)
+            .collect();
+        if let Some(v) = combo(ui, "tx_mode", &mode, &modes, 280.0) {
+            set(ch, "mode", v);
+            mode = v.to_string();
+            // Modes C and D only have 10 and 20 kHz; mode E only has occupancy 0 (100 kHz).
+            match v {
+                "C" | "D" => {
+                    if !matches!(get_int(ch, "occupancy"), Some(3 | 5)) {
+                        set(ch, "occupancy", 3i64);
+                    }
+                }
+                "E" => set(ch, "occupancy", 0i64),
+                _ => {}
+            }
+            // Mode E changes what the rest of the document may hold (§7.5.1-7.6): its MSC
+            // is 16-QAM only in DecDRM, its SDC 4-QAM only, its interleaving long only, and
+            // it has no hierarchical layer. Reaching the new mode with the old choices would
+            // leave a document the station refuses — the rows below repair the channel and
+            // `channel` clears the hierarchical marks. Nothing has to be set here: each row
+            // compares the document against the mode's rule and writes only what differs.
+            changed = true;
+        }
+        if mode == "E" {
+            ui.label(RichText::new(format!("{:.0} kHz carriers", 2.0 * 47.11)).weak())
+                .on_hover_text("Mode E occupies ±47.11 kHz, which is why it needs 120 or 192 kHz");
         }
         ui.end_row();
         row_label(ui, "Bandwidth");
-        let occ = get_int(ch, "occupancy").unwrap_or(3).to_string();
-        let allowed: Vec<(&str, &str)> =
-            OCCUPANCIES.iter().copied().filter(|(v, _)| !matches!(mode.as_str(), "C" | "D") || matches!(*v, "3" | "5")).collect();
-        if let Some(v) = combo(ui, "tx_occupancy", &occ, &allowed, 280.0) {
-            set(ch, "occupancy", v.parse::<i64>().unwrap_or(3));
+        // Mode E exists at occupancy 0 only (100 kHz, the DRM+ raster), so a selector holding one
+        // entry would be noise: show the fixed value instead.
+        if mode == "E" {
+            set(ch, "occupancy", 0i64);
+            ui.label(RichText::new("100 kHz (fixed for DRM+)").weak()).on_hover_text(
+                "Robustness mode E is defined at spectrum occupancy 0 only",
+            );
+            ui.end_row();
+        } else {
+            let occ = get_int(ch, "occupancy").unwrap_or(3).to_string();
+            let allowed: Vec<(&str, &str)> = OCCUPANCIES
+                .iter()
+                .copied()
+                .filter(|(v, _)| !matches!(mode.as_str(), "C" | "D") || matches!(*v, "3" | "5"))
+                .collect();
+            if let Some(v) = combo(ui, "tx_occupancy", &occ, &allowed, 280.0) {
+                set(ch, "occupancy", v.parse::<i64>().unwrap_or(3));
+                changed = true;
+            }
+            ui.end_row();
+        }
+        row_label(ui, "MSC modulation");
+        // The selector lists only what the mode defines (§7.5.1) — a choice that is not an
+        // option is not shown — and a document holding one the mode cannot express is
+        // repaired to the mode's default as the row is drawn.
+        let msc_now = msc_mode_for(&mode, &msc).to_string();
+        if get_str(ch, "msc_mode").as_deref() != Some(msc_now.as_str()) {
+            set(ch, "msc_mode", msc_now.as_str());
+            msc.clone_from(&msc_now);
+            // The hierarchical-protection row below reads this, so keep it in step with the
+            // constellation actually written.
+            hierarchical = canon(&msc).starts_with("hm");
             changed = true;
         }
-        ui.end_row();
-        row_label(ui, "MSC modulation");
-        if let Some(v) = combo(ui, "tx_msc", &msc, MSC_MODES, 280.0) {
+        let msc_options = msc_modes_for(&mode);
+        if msc_options.len() == 1 {
+            // One constellation: a selector holding a single entry is noise, so the row shows
+            // the value — the same treatment the bandwidth row gets for mode E.
+            ui.label(RichText::new(msc_options[0].0).weak())
+                .on_hover_text("ES 201 980 §7.5.1 gives robustness mode E 16-QAM or 4-QAM; DecDRM encodes 16-QAM for DRM+");
+        } else if let Some(v) = combo(ui, "tx_msc", &msc, msc_options, 280.0) {
             set(ch, "msc_mode", v);
+            msc = v.to_string();
             // 16-QAM has protection levels 0-1 only.
             if canon(v) == "16qam" {
                 for key in ["protection_b", "protection_a"] {
@@ -300,24 +539,47 @@ fn channel(ui: &mut Ui, doc: &mut DocumentMut) -> bool {
             if uep {
                 keep_part_a_stronger(ch);
             }
+            // Picking a plain constellation drops any hierarchical layer the document still
+            // marks; `channel` clears the marks after the grid.
+            hierarchical = canon(v).starts_with("hm");
             changed = true;
         }
         ui.end_row();
         row_label(ui, "SDC modulation");
-        let sdc = get_str(ch, "sdc_mode").unwrap_or_else(|| "16-QAM".into());
-        if let Some(v) = combo(ui, "tx_sdc", &sdc, SDC_MODES, 280.0) {
+        // §7.5.2: modes A-D have 16-QAM or 4-QAM; mode E has 4-QAM only, at one code rate in
+        // DecDRM, so its row is the value rather than a selector holding one entry.
+        let sdc = sdc_mode_for(&mode, &get_str(ch, "sdc_mode").unwrap_or_else(|| "16-QAM".into())).to_string();
+        if get_str(ch, "sdc_mode").as_deref() != Some(sdc.as_str()) {
+            set(ch, "sdc_mode", sdc.as_str());
+            changed = true;
+        }
+        let sdc_options = sdc_modes_for(&mode);
+        if sdc_options.len() == 1 {
+            ui.label(RichText::new(sdc_options[0].0).weak())
+                .on_hover_text("Robustness mode E defines 4-QAM for the SDC only; 16-QAM is DRM30-only");
+        } else if let Some(v) = combo(ui, "tx_sdc", &sdc, sdc_options, 280.0) {
             set(ch, "sdc_mode", v);
             changed = true;
         }
         ui.end_row();
         row_label(ui, "Interleaving");
-        let il = get_str(ch, "interleaving").unwrap_or_else(|| "long".into());
-        if let Some(v) = combo(ui, "tx_interleaving", &il, INTERLEAVING, 280.0) {
+        // §7.6: "For robustness mode E only one interleaver depth is available which
+        // corresponds to the algorithm for high interleaver depth" — so mode E's row is the
+        // value too, and a document holding short interleaving is repaired to long.
+        let il = interleaving_for(&mode, &get_str(ch, "interleaving").unwrap_or_else(|| "long".into())).to_string();
+        if get_str(ch, "interleaving").as_deref() != Some(il.as_str()) {
+            set(ch, "interleaving", il.as_str());
+            changed = true;
+        }
+        if mode == "E" {
+            ui.label(RichText::new("Long").weak())
+                .on_hover_text("Robustness mode E has a single interleaver depth, the long algorithm's (600 ms)");
+        } else if let Some(v) = combo(ui, "tx_interleaving", &il, INTERLEAVING, 280.0) {
             set(ch, "interleaving", v);
             changed = true;
         }
         ui.end_row();
-        let levels = if sixteen { PROTECTION_16 } else { PROTECTION_64 };
+        let levels = protection_levels(&mode, &msc);
         row_label(ui, "Protection").on_hover_text("Error protection of the multiplex: a lower code rate survives a weaker signal, a higher one carries more");
         let pb = get_int(ch, "protection_b").unwrap_or(1).to_string();
         if let Some(v) = combo(ui, "tx_prot_b", &pb, levels, 280.0) {
@@ -463,6 +725,10 @@ fn apply_shares(list: &mut ArrayOfTables, weights: &[Option<f64>]) {
 fn services(ui: &mut Ui, doc: &mut DocumentMut, ctx: &mut FormCtx) -> bool {
     let mut changed = false;
     let protection_b = doc.get("channel").and_then(Item::as_table_like).and_then(|ch| get_int(ch, "protection_b")).unwrap_or(1);
+    // The audio settings depend on the mode (AAC core rates), and the channel card ran
+    // before this, so the document has the mode the rows below draw.
+    let mode =
+        doc.get("channel").and_then(Item::as_table_like).and_then(|ch| get_str(ch, "mode")).unwrap_or_else(|| "B".into());
     let mut parts = Parts { protection_b, shared: Vec::new(), turned_on: false };
     if !doc.as_table().get("service").is_some_and(Item::is_array_of_tables) {
         doc.as_table_mut().insert("service", Item::ArrayOfTables(ArrayOfTables::new()));
@@ -486,7 +752,7 @@ fn services(ui: &mut Ui, doc: &mut DocumentMut, ctx: &mut FormCtx) -> bool {
                 });
             });
             ui.add_space(4.0);
-            changed |= service(ui, svc, i, ctx, &mut parts, &mut shares);
+            changed |= service(ui, svc, i, ctx, &mut parts, &mut shares, &mode);
         });
         ui.add_space(8.0);
     }
@@ -560,7 +826,7 @@ fn new_service(n: usize, audio: bool) -> Table {
     t
 }
 
-fn service(ui: &mut Ui, svc: &mut Table, i: usize, ctx: &mut FormCtx, parts: &mut Parts, shares: &mut Shares) -> bool {
+fn service(ui: &mut Ui, svc: &mut Table, i: usize, ctx: &mut FormCtx, parts: &mut Parts, shares: &mut Shares, mode: &str) -> bool {
     let mut changed = false;
     let is_audio = svc.get("audio").is_some_and(Item::is_table_like);
     grid(ui, ("tx_form_service", i), |ui| {
@@ -646,7 +912,7 @@ fn service(ui: &mut Ui, svc: &mut Table, i: usize, ctx: &mut FormCtx, parts: &mu
     ui.add_space(6.0);
     if is_audio {
         let audio = child(svc, "audio");
-        changed |= audio_settings(ui, audio, i, ctx, parts, shares);
+        changed |= audio_settings(ui, audio, i, ctx, parts, shares, mode);
     } else if svc.get("data").is_some_and(Item::is_table_like) {
         ui.label(RichText::new("Main application").strong());
         let data = child(svc, "data");
@@ -661,10 +927,39 @@ const CODECS: &[(&str, &str)] = &[
     ("he-aac", "HE-AAC (AAC + SBR)"),
     ("he-aac-v2", "HE-AAC v2 (SBR + parametric stereo)"),
     ("xhe-aac", "xHE-AAC (USAC)"),
+    ("xhe-aac-external", "xHE-AAC (external encoder)"),
     ("opus", "Opus"),
     ("dac", "DAC (neural codec)"),
 ];
+
+/// The codecs the picker offers: DAC when it is built in, and the external xHE-AAC encoder
+/// when its helper is beside the executable — the one codec that depends on an optional
+/// folder. Either stays listed when the document already names it, so a service does not
+/// silently lose its codec and the plan can say what is missing.
+fn codec_choices(current: &str, dac_built: bool, external: bool) -> Vec<(&'static str, &'static str)> {
+    let c = canon(current);
+    CODECS
+        .iter()
+        .copied()
+        .filter(|(v, _)| *v != "dac" || dac_built || canon(v) == c)
+        .filter(|(v, _)| *v != "xhe-aac-external" || external || canon(v) == c)
+        .collect()
+}
 const CORE_RATES: &[(&str, &str)] = &[("12000", "12 kHz core (5 frames per 400 ms)"), ("24000", "24 kHz core (10 frames)")];
+/// Mode E's AAC super frame is 200 ms, so its core rates are 24 and 48 kHz (§5.4.1); 48 kHz
+/// is only allowed without SBR, so a codec that always uses SBR has one option.
+const CORE_RATES_E: &[(&str, &str)] = &[("24000", "24 kHz core (5 frames per 200 ms)"), ("48000", "48 kHz core (10 frames, no SBR)")];
+const CORE_RATES_E_SBR: &[(&str, &str)] = &[("24000", "24 kHz core (5 frames per 200 ms)")];
+
+/// AAC core rates the mode and codec allow.
+fn core_rates(mode_e: bool, sbr: bool) -> &'static [(&'static str, &'static str)] {
+    match (mode_e, sbr) {
+        (false, _) => CORE_RATES,
+        (true, true) => CORE_RATES_E_SBR,
+        (true, false) => CORE_RATES_E,
+    }
+}
+
 const XHE_RATES: &[(&str, &str)] = &[
     ("auto", "Automatic (from the bit rate)"),
     ("9600", "9.6 kHz"),
@@ -723,12 +1018,16 @@ fn audio_settings(
     ctx: &mut FormCtx,
     parts: &mut Parts,
     shares: &mut Shares,
+    mode: &str,
 ) -> bool {
     let mut changed = false;
+    let mode_e = canon(mode) == "e";
     let codec = get_str(audio, "codec").unwrap_or_else(|| "he-aac".into());
     let c = canon(&codec);
-    let codecs: Vec<(&str, &str)> =
-        CODECS.iter().copied().filter(|(v, _)| *v != "dac" || cfg!(feature = "dac") || canon(v) == c).collect();
+    // The external xHE-AAC encoder exists only when its helper (the `xhe` folder beside
+    // the executable) is there; the entry then appears, and vanishes with it.
+    let external = decdrm_codecs::xhe_external::available();
+    let codecs = codec_choices(&codec, cfg!(feature = "dac"), external);
     grid(ui, ("tx_form_audio", i), |ui| {
         row_label(ui, "Codec");
         if let Some(v) = combo(ui, ("tx_codec", i), &codec, &codecs, 280.0) {
@@ -738,7 +1037,7 @@ fn audio_settings(
             if !aac {
                 remove(audio, "core_rate");
             } else if !audio.contains_key("core_rate") {
-                set(audio, "core_rate", 12_000i64);
+                set(audio, "core_rate", if mode_e { 24_000i64 } else { 12_000i64 });
             }
             if canon(v) != "xheaac" {
                 remove(audio, "sample_rate");
@@ -754,9 +1053,19 @@ fn audio_settings(
         match c.as_str() {
             "aac" | "heaac" | "heaacv2" => {
                 row_label(ui, "Core rate");
-                let rate = get_int(audio, "core_rate").unwrap_or(12_000).to_string();
-                if let Some(v) = combo(ui, ("tx_core", i), &rate, CORE_RATES, 280.0) {
-                    set(audio, "core_rate", v.parse::<i64>().unwrap_or(12_000));
+                let sbr = matches!(c.as_str(), "heaac" | "heaacv2");
+                let options = core_rates(mode_e, sbr);
+                let default = if mode_e { 24_000 } else { 12_000 };
+                let mut rate = get_int(audio, "core_rate").unwrap_or(default);
+                // The mode can be switched after the audio settings were written: repair a
+                // rate the mode does not define, as the channel rows do for their fields.
+                if !options.iter().any(|(v, _)| v.parse::<i64>() == Ok(rate)) {
+                    rate = default;
+                    set(audio, "core_rate", rate);
+                    changed = true;
+                }
+                if let Some(v) = combo(ui, ("tx_core", i), &rate.to_string(), options, 280.0) {
+                    set(audio, "core_rate", v.parse::<i64>().unwrap_or(default));
                     changed = true;
                 }
                 ui.end_row();
@@ -947,9 +1256,9 @@ fn input_settings(ui: &mut Ui, input: &mut dyn TableLike, i: usize, ctx: &mut Fo
                         set(input, "device", "default");
                         changed = true;
                     }
-                    for name in ctx.devices.inputs().to_vec() {
-                        if ui.selectable_label(current == name, &name).clicked() {
-                            set(input, "device", name.as_str());
+                    for d in ctx.devices.inputs().to_vec() {
+                        if ui.selectable_label(current == d.name, d.label()).clicked() {
+                            set(input, "device", d.name.as_str());
                             changed = true;
                         }
                     }
@@ -1257,6 +1566,112 @@ fn keep_part_a_stronger(ch: &mut dyn TableLike) {
     }
 }
 
+/// Bring the rest of the document into what its robustness mode allows, after the mode
+/// changed (or when the document arrived with a combination the mode cannot express).
+///
+/// The three fields with per-mode rules are the MSC constellation (§7.5.1: mode E has
+/// 16-QAM and 4-QAM; A–D have 16-QAM and 64-QAM), the SDC constellation (§7.5.2: mode E
+/// has 4-QAM only) and the interleaving depth (§7.6: mode E has the long depth only).
+/// Protection levels are clamped to what the chosen constellation defines.
+///
+/// Hierarchical modulation only exists in 64-QAM (§7.5.1: "a hierarchical mapping scheme can
+/// only be used in a 64-QAM signal constellation"), so a mode E document cannot carry a
+/// stream marked `hierarchical = true`: the mark is dropped, and the station would otherwise
+/// refuse the configuration.
+///
+/// Returns whether anything changed.
+fn repair_channel_for_mode(doc: &mut DocumentMut) -> bool {
+    let mut changed = false;
+    // Read what the clamping below needs from the whole document first: `ch` borrows `doc`
+    // mutably, and `uses_part_a` needs to read the services.
+    let part_a = uses_part_a(doc);
+    let ch = section(doc, "channel");
+    let mode = get_str(ch, "mode").unwrap_or_else(|| "B".into());
+    // The comparisons are against the *effective* value (the key, or the default when it is
+    // absent) and are canonical, so a document that leaves a key out at its default, or spells
+    // it its own way, is not rewritten just for being opened.
+    changed |= repair_str(ch, "msc_mode", "64-QAM", |v| msc_mode_for(&mode, v).to_string());
+    changed |= repair_str(ch, "sdc_mode", "16-QAM", |v| sdc_mode_for(&mode, v).to_string());
+    changed |= repair_str(ch, "interleaving", "long", |v| interleaving_for(&mode, v).to_string());
+    // Occupancy: mode E exists at 0 only; C and D only at 3 or 5.
+    let occ = get_int(ch, "occupancy").unwrap_or(3);
+    let occ_ok = match mode.as_str() {
+        "E" => occ == 0,
+        "C" | "D" => matches!(occ, 3 | 5),
+        _ => true,
+    };
+    if !occ_ok {
+        set(ch, "occupancy", if mode == "E" { 0i64 } else { 3 });
+        changed = true;
+    }
+    // Protection levels above what the constellation defines (§7.5.1 tables 29-32). Only the
+    // levels the station actually uses are clamped, as its own validation does: `protection_b`
+    // always, `protection_a` only when a stream is in part A, `protection_hierarchical` only
+    // when the constellation has a hierarchical layer. A stale value in an unused field is
+    // harmless, and rewriting it would change a document the station accepts.
+    let msc = get_str(ch, "msc_mode").unwrap_or_else(|| "64-QAM".into());
+    let max = protection_levels(&mode, &msc).len() as i64 - 1;
+    let mut used = vec![("protection_b", true)];
+    used.push(("protection_a", part_a));
+    used.push(("protection_hierarchical", canon(&msc).starts_with("hm")));
+    for (key, used) in used {
+        if used && get_int(ch, key).unwrap_or(0) > max {
+            set(ch, key, max);
+            changed = true;
+        }
+    }
+    // No hierarchical layer without a 64-QAM constellation.
+    if !canon(&msc).starts_with("hm") {
+        changed |= clear_hierarchical_marks(doc);
+    }
+    changed
+}
+
+/// Set `key` to `rule(effective)` when that differs from the value the document already has
+/// (`default` when the key is absent). Comparison is canonical, so an equivalent spelling is
+/// left as written; a key that is absent and whose default already satisfies the rule is not
+/// added. Returns whether the document changed.
+fn repair_str(ch: &mut dyn TableLike, key: &str, default: &str, rule: impl Fn(&str) -> String) -> bool {
+    let effective = get_str(ch, key).unwrap_or_else(|| default.to_string());
+    let corrected = rule(&effective);
+    if canon(&corrected) == canon(&effective) {
+        return false;
+    }
+    set(ch, key, corrected);
+    true
+}
+
+/// Drop `hierarchical = true` from every stream (audio services and data applications).
+/// A mark that cannot be honoured would make the station refuse the configuration.
+/// Returns whether any stream was marked.
+fn clear_hierarchical_marks(doc: &mut DocumentMut) -> bool {
+    let mut changed = false;
+    if let Some(services) = doc.get_mut("service").and_then(Item::as_array_of_tables_mut) {
+        for svc in services.iter_mut() {
+            for key in ["audio", "data"] {
+                if let Some(t) = svc.get_mut(key).and_then(Item::as_table_like_mut) {
+                    changed |= take_true(t, "hierarchical");
+                }
+            }
+            if let Some(apps) = svc.get_mut("app").and_then(Item::as_array_of_tables_mut) {
+                for app in apps.iter_mut() {
+                    changed |= take_true(app, "hierarchical");
+                }
+            }
+        }
+    }
+    changed
+}
+
+/// Remove `key` when it is set to `true`; returns whether it was.
+fn take_true(t: &mut dyn TableLike, key: &str) -> bool {
+    if !get_bool(t, key).unwrap_or(false) {
+        return false;
+    }
+    remove(t, key);
+    true
+}
+
 /// The service's extra data applications (`[[service.app]]`).
 fn extra_apps(ui: &mut Ui, svc: &mut Table, i: usize, ctx: &mut FormCtx, parts: &mut Parts) -> bool {
     let mut changed = false;
@@ -1299,6 +1714,8 @@ fn extra_apps(ui: &mut Ui, svc: &mut Table, i: usize, ctx: &mut FormCtx, parts: 
 
 const FORMATS: &[(&str, &str)] = &[("real", "Real IF (1 channel)"), ("iq", "I/Q (2 channels)")];
 const SAMPLE_FORMATS: &[(&str, &str)] = &[("int16", "16-bit"), ("int24", "24-bit"), ("float32", "32-bit float")];
+/// PAPR limiter laws, in order: a hard clip is the better in-band trade (see `[output]`).
+const PAPR_LAWS: &[(&str, &str)] = &[("clip", "hard clip"), ("tanh", "tanh")];
 
 /// The channel layout (robustness mode and bandwidth) of the document, if valid.
 fn channel_layout(doc: &DocumentMut) -> Option<ChannelLayout> {
@@ -1308,6 +1725,7 @@ fn channel_layout(doc: &DocumentMut) -> Option<ChannelLayout> {
         "b" => RobustnessMode::B,
         "c" => RobustnessMode::C,
         "d" => RobustnessMode::D,
+        "e" | "drm+" => RobustnessMode::E,
         _ => return None,
     };
     let occupancy = u8::try_from(ch.and_then(|ch| get_int(ch, "occupancy")).unwrap_or(3)).ok()?;
@@ -1384,6 +1802,42 @@ fn output(ui: &mut Ui, doc: &mut DocumentMut, ctx: &mut FormCtx) -> bool {
             ui.label(RichText::new("OFDM peaks are ~10 dB higher").weak());
         });
         ui.end_row();
+        row_label(ui, "PAPR");
+        ui.horizontal(|ui| {
+            let mut on = out.contains_key("papr_db");
+            let mut db = get_num(out, "papr_db").unwrap_or(6.0);
+            let hint = "Limit the peaks before the channel filter (so the out-of-band part of the \
+                distortion is filtered with the side lobes). A hard clip is transparent below its \
+                knee and costs ~32 dB MER at 6 dB; tanh is smoother but compresses below the knee \
+                too and costs ~24 dB.";
+            if ui.checkbox(&mut on, "limit peaks").on_hover_text(hint).changed() {
+                if on {
+                    set(out, "papr_db", db);
+                    set(out, "papr_law", "clip");
+                } else {
+                    remove(out, "papr_db");
+                    remove(out, "papr_law");
+                }
+                changed = true;
+            }
+            if on {
+                let law = get_str(out, "papr_law").unwrap_or_else(|| "clip".into());
+                if let Some(v) = combo(ui, "tx_papr_law", &law, PAPR_LAWS, 90.0) {
+                    set(out, "papr_law", v);
+                    changed = true;
+                }
+                let edit = egui::DragValue::new(&mut db)
+                    .range(MIN_PEAK_LIMIT_DB..=MAX_PEAK_LIMIT_DB)
+                    .speed(0.25)
+                    .suffix(" dB above RMS");
+                if ui.add(edit).changed() {
+                    set(out, "papr_db", db);
+                    changed = true;
+                }
+            }
+            ui.label(RichText::new("peaks are ~10 dB above the RMS otherwise").weak());
+        });
+        ui.end_row();
         row_label(ui, "Filter");
         let mut band = get_bool(out, "band_limit").unwrap_or(true);
         if ui.checkbox(&mut band, "Band-limit the signal (against the OFDM side lobes)").changed() {
@@ -1418,10 +1872,10 @@ fn output(ui: &mut Ui, doc: &mut DocumentMut, ctx: &mut FormCtx) -> bool {
                     remove(out, "device");
                     changed = true;
                 }
-                for name in ctx.devices.outputs().to_vec() {
-                    if ui.selectable_label(dev == name, &name).clicked() {
-                        dev.clone_from(&name);
-                        set(out, "device", name.as_str());
+                for d in ctx.devices.outputs().to_vec() {
+                    if ui.selectable_label(dev == d.name, d.label()).clicked() {
+                        dev.clone_from(&d.name);
+                        set(out, "device", d.name.as_str());
                         changed = true;
                     }
                 }
@@ -1444,7 +1898,35 @@ const CHANNEL_MODELS: &[(&str, &str)] = &[
     ("4", "4 — CCIR poor"),
     ("5", "5 — severe Doppler"),
     ("6", "6 — severe Doppler and delay"),
+    ("ra", "VHF RA — rural (COST 207)"),
+    ("tu6", "VHF TU6 — typical urban"),
+    ("ht", "VHF HT — hilly terrain"),
 ];
+
+/// Apply a propagation-model choice to `[simulate]`. The VHF presets are a different shape
+/// from the annex B number: they replace `channel` with `vhf` plus a speed and a band, so
+/// the keys the chosen model does not use are removed rather than left stale (the station's
+/// `deny_unknown_fields` would accept them, but they would silently describe another model).
+fn set_simulation_model(sim: &mut dyn TableLike, choice: &str) {
+    match choice {
+        "ra" | "tu6" | "ht" => {
+            remove(sim, "channel");
+            set(sim, "vhf", choice);
+            if get_num(sim, "speed_kmh").is_none() {
+                set(sim, "speed_kmh", 0.0);
+            }
+            if get_num(sim, "carrier_mhz").is_none() {
+                set(sim, "carrier_mhz", 200.0);
+            }
+        }
+        number => {
+            remove(sim, "vhf");
+            remove(sim, "speed_kmh");
+            remove(sim, "carrier_mhz");
+            set(sim, "channel", number.parse::<i64>().unwrap_or(1));
+        }
+    }
+}
 
 fn simulator(ui: &mut Ui, doc: &mut DocumentMut) -> bool {
     let mut changed = false;
@@ -1465,13 +1947,31 @@ fn simulator(ui: &mut Ui, doc: &mut DocumentMut) -> bool {
     }
     let sim = section(doc, "simulate");
     grid(ui, "tx_form_sim", |ui| {
-        row_label(ui, "Channel model");
-        let model = get_int(sim, "channel").unwrap_or(1).to_string();
-        if let Some(v) = combo(ui, "tx_sim_model", &model, CHANNEL_MODELS, 240.0) {
-            set(sim, "channel", v.parse::<i64>().unwrap_or(1));
+        row_label(ui, "Propagation");
+        let model = get_str(sim, "vhf").unwrap_or_else(|| get_int(sim, "channel").unwrap_or(1).to_string());
+        if let Some(v) = combo(ui, "tx_sim_model", &model, CHANNEL_MODELS, 260.0) {
+            set_simulation_model(sim, &v);
             changed = true;
         }
         ui.end_row();
+        if get_str(sim, "vhf").is_some() {
+            // VHF: the profile's shape depends on the speed (0 = parked, no fading) and on
+            // the band (the Doppler shift is v·f/c).
+            row_label(ui, "Speed");
+            let mut speed = get_num(sim, "speed_kmh").unwrap_or(0.0);
+            if ui.add(egui::DragValue::new(&mut speed).range(0.0..=300.0).speed(1.0).suffix(" km/h")).changed() {
+                set(sim, "speed_kmh", speed);
+                changed = true;
+            }
+            ui.end_row();
+            row_label(ui, "Band");
+            let mut mhz = get_num(sim, "carrier_mhz").unwrap_or(200.0);
+            if ui.add(egui::DragValue::new(&mut mhz).range(40.0..=300.0).speed(1.0).suffix(" MHz")).changed() {
+                set(sim, "carrier_mhz", mhz);
+                changed = true;
+            }
+            ui.end_row();
+        }
         row_label(ui, "Noise");
         let mut noisy = sim.contains_key("snr_db");
         ui.horizontal(|ui| {
@@ -1618,7 +2118,9 @@ fn clock(ui: &mut Ui, doc: &mut DocumentMut) -> bool {
 /// The multiplex as a bar: one segment per stream, sized by its bytes.
 pub fn capacity_bar(ui: &mut Ui, bar: &PlanBar) {
     let used: usize = bar.segments.iter().map(|s| s.bytes).sum();
-    let kbps = |bytes: usize| bytes as f64 * 8.0 / 400.0;
+    // Per transmission frame, whose duration is the mode's (400 ms for A-D, 100 ms for E).
+    let ms = f64::from(bar.frame_ms.max(1));
+    let kbps = |bytes: usize| bytes as f64 * 8.0 / ms;
     ui.horizontal_wrapped(|ui| {
         ui.label(RichText::new("Multiplex").strong());
         ui.label(RichText::new(format!("{:.2} kbit/s MSC capacity, {:.0} % used", kbps(bar.capacity), 100.0 * used as f64 / bar.capacity.max(1) as f64)).weak());
@@ -1680,11 +2182,372 @@ mod tests {
     use super::*;
 
     #[test]
-    fn names_match_like_the_station_does() {
-        assert_eq!(canon("64-QAM"), canon("QAM64"));
+    fn mode_e_is_recognised_in_the_form() {
+        // The form's own mode parser must know E, or a mode E document reads as invalid.
+        let doc: DocumentMut = "[channel]\nmode = \"E\"\noccupancy = 0\n".parse().unwrap();
+        let l = channel_layout(&doc).expect("mode E with occupancy 0 is a valid layout");
+        assert_eq!((l.mode, l.occupancy), (RobustnessMode::E, SpectrumOccupancy::SO_0));
+
+        // `canon` strips "-", "_" and spaces but NOT "+", so "DRM+" canonises to "drm+".
+        assert_eq!(canon("E"), "e");
+        assert_eq!(canon("DRM+"), "drm+");
+    }
+
+    #[test]
+    fn mode_e_is_offered_only_when_the_rate_allows_it() {
+        // The rule the mode selector applies: mode E is filtered out below 100 kHz.
+        let offered = |khz: i64| -> Vec<&'static str> {
+            MODES
+                .iter()
+                .copied()
+                .filter(|(v, _)| *v != "E" || khz * 1000 >= 100_000)
+                .map(|(v, _)| v)
+                .collect()
+        };
+        for khz in [48, 96] {
+            assert!(!offered(khz).contains(&"E"), "{khz} kHz must not offer mode E");
+        }
+        for khz in [120, 192] {
+            assert!(offered(khz).contains(&"E"), "{khz} kHz must offer mode E");
+        }
+        // Every mode is always offered, rate or not.
+        assert!(offered(48).contains(&"A") && offered(48).contains(&"D"));
+
+        // The rate selector lists exactly the four rates decdrm-core supports.
+        let rates: Vec<&str> = RATES.iter().map(|(v, _)| *v).collect();
+        assert_eq!(rates, ["48", "96", "120", "192"]);
+        for (v, _) in RATES {
+            let hz = v.parse::<u32>().unwrap() * 1000;
+            assert!(decdrm_core::params::WorkingRate::new(hz).is_some(), "{v} kHz must be a supported rate");
+        }
+    }
+
+    /// ES 201 980 §7.5.1: "The MSC may use either 64-QAM or 16-QAM mapping in robustness modes
+    /// A, B, C and D and 16-QAM or 4-QAM mapping in robustness mode E."
+    #[test]
+    fn the_msc_selector_follows_the_robustness_mode() {
+        // Mode E's list holds exactly what it defines: both its constellations, and none of
+        // the 64-QAM family (which DRM+ does not have).
+        assert_eq!(msc_modes_for("E").len(), 2, "mode E's two constellations: {:?}", msc_modes_for("E"));
+        assert_eq!(msc_modes_for("E")[0].0, "16-QAM");
+        assert_eq!(msc_modes_for("E")[1].0, "4-QAM");
+        assert!(msc_mode_allowed("E", "16-QAM"));
+        assert!(msc_mode_allowed("E", "4-QAM"), "mode E defines 4-QAM (§7.5.1)");
+        for msc in ["64-QAM", "HMsym", "HMmix"] {
+            assert!(!msc_mode_allowed("E", msc), "mode E must not offer {msc}");
+        }
+        // Modes A-D: 16-QAM and 64-QAM with its hierarchical variants; 4-QAM is not DRM30's.
+        for msc in ["16-QAM", "64-QAM", "HMsym", "HMmix"] {
+            assert!(msc_mode_allowed("A", msc), "mode A must offer {msc}");
+            assert!(msc_mode_allowed("B", msc));
+        }
+        assert!(!msc_mode_allowed("A", "4-QAM"));
+        // A-D keep the full list, so their selector is a real choice.
+        assert_eq!(msc_modes_for("A").len(), MSC_MODES.len());
+        // A document holding a constellation the mode cannot express falls back to the
+        // mode's default: 16-QAM for mode E, 64-QAM for the DRM30 modes.
+        assert_eq!(msc_mode_for("E", "64-QAM"), "16-QAM");
+        assert_eq!(msc_mode_for("E", "HMsym"), "16-QAM");
+        assert_eq!(msc_mode_for("E", "4-QAM"), "4-QAM", "an allowed choice is kept");
+        assert_eq!(msc_mode_for("B", "16-QAM"), "16-QAM", "an allowed choice is kept");
+        assert_eq!(msc_mode_for("B", "HMmix"), "HMmix", "an allowed choice is kept");
+        // Canonical spellings come back, so writing one does not rewrite the file forever.
+        assert_eq!(msc_mode_for("B", "qam64"), "64-QAM");
+    }
+
+    /// §7.5.2: "The SDC may use either 16-QAM or 4-QAM mapping with code rate 0,5 for
+    /// robustness modes A, B, C and D and 4-QAM mapping with code rate 0,5 or 0,25 for
+    /// robustness mode E."
+    #[test]
+    fn the_sdc_selector_follows_the_robustness_mode() {
+        // Mode E defines 4-QAM only, so its row is a label (one option is not a choice).
+        assert_eq!(sdc_modes_for("E").len(), 1, "mode E's SDC row is a label, not a selector");
+        assert_eq!(sdc_modes_for("E")[0].0, "4-QAM");
+        assert!(sdc_mode_allowed("E", "4-QAM"));
+        assert!(!sdc_mode_allowed("E", "16-QAM"), "DRM+ has no 16-QAM SDC");
+        // Modes A-D keep both, so their row stays a selector.
+        assert_eq!(sdc_modes_for("B").len(), 2);
+        assert!(sdc_mode_allowed("B", "16-QAM") && sdc_mode_allowed("B", "4-QAM"));
+        assert_eq!(sdc_mode_for("E", "16-QAM"), "4-QAM");
+        assert_eq!(sdc_mode_for("E", "4-QAM"), "4-QAM");
+        assert_eq!(sdc_mode_for("B", "4-QAM"), "4-QAM", "an allowed choice is kept");
+    }
+
+    /// §7.6: "For robustness mode E only one interleaver depth is available which corresponds
+    /// to the algorithm for high interleaver depth."
+    #[test]
+    fn mode_e_has_one_interleaving_depth() {
+        assert_eq!(interleaving_for("E", "short"), "long", "DRM+ only has the long depth");
+        assert_eq!(interleaving_for("E", "long"), "long");
+        assert_eq!(interleaving_for("B", "short"), "short", "DRM30 keeps both");
+        assert_eq!(interleaving_for("B", "long"), "long");
+        // Mode E's interleaver flag is fixed at 0, so short must never be written.
+        let mut doc: DocumentMut = "[channel]\nmode = \"E\"\ninterleaving = \"short\"\n".parse().unwrap();
+        repair_channel_for_mode(&mut doc);
+        assert_eq!(get_str(section(&mut doc, "channel"), "interleaving").as_deref(), Some("long"));
+    }
+
+    /// Switching to mode E must repair a DRM30 document, or the station refuses it: 64-QAM
+    /// does not exist in DRM+, nor a 16-QAM SDC, nor short interleaving, nor a hierarchical
+    /// layer (§7.5.1: "a hierarchical mapping scheme can only be used in a 64-QAM signal
+    /// constellation").
+    #[test]
+    fn switching_to_mode_e_repairs_the_document() {
+        let mut doc: DocumentMut = r#"
+[channel]
+mode = "E"
+occupancy = 0
+msc_mode = "HMsym"
+sdc_mode = "16-QAM"
+interleaving = "short"
+protection_b = 3
+[[service]]
+label = "R"
+id = 0xD0D001
+[service.audio]
+codec = "aac"
+input = { tone_hz = 1000.0 }
+hierarchical = true
+"#
+        .parse()
+        .unwrap();
+        assert!(repair_channel_for_mode(&mut doc));
+        let ch = section(&mut doc, "channel");
+        assert_eq!(get_str(ch, "msc_mode").as_deref(), Some("16-QAM"), "64-QAM does not exist in DRM+");
+        assert_eq!(get_str(ch, "sdc_mode").as_deref(), Some("4-QAM"), "DRM+ has 4-QAM SDC only");
+        assert_eq!(get_str(ch, "interleaving").as_deref(), Some("long"), "DRM+ has one depth");
+        // Level 3 is a real choice in mode E's own 16-QAM table (§7.5.1 table 31), so the
+        // document's level stands rather than being clamped to the DRM30 two.
+        assert_eq!(get_int(section(&mut doc, "channel"), "protection_b"), Some(3));
+        // The hierarchical mark cannot survive without a hierarchical constellation.
+        let text = doc.to_string();
+        assert!(!text.contains("hierarchical"), "{text}");
+        // The repaired document must be one the station accepts.
+        let cfg = decdrm_station::StationConfig::from_toml_str(&text)
+            .unwrap_or_else(|e| panic!("repaired mode E document must validate: {e}"));
+        assert_eq!(cfg.channel.mode.0, RobustnessMode::E);
+        // Repairing twice changes nothing more.
+        assert!(!repair_channel_for_mode(&mut doc));
+    }
+
+    /// The audio choices follow the mode: mode E's 200 ms AAC super frame has 5 or 10
+    /// frames at 24 or 48 kHz (§5.4.1, 48 kHz without SBR only).
+    #[test]
+    fn audio_choices_follow_the_mode() {
+        let values =
+            |rates: &'static [(&'static str, &'static str)]| rates.iter().map(|(v, _)| *v).collect::<Vec<_>>();
+        assert_eq!(values(core_rates(false, false)), ["12000", "24000"]);
+        assert_eq!(values(core_rates(false, true)), ["12000", "24000"]);
+        assert_eq!(values(core_rates(true, true)), ["24000"], "SBR: 48 kHz is not allowed");
+        assert_eq!(values(core_rates(true, false)), ["24000", "48000"]);
+    }
+
+    /// The external xHE-AAC encoder is offered only when its helper is beside the
+    /// executable, and a document that already names it keeps the entry (so the plan can
+    /// say what is missing instead of the codec silently changing).
+    #[test]
+    fn the_external_encoder_is_offered_only_with_its_helper() {
+        let has = |list: &[(&str, &str)], v: &str| list.iter().any(|(name, _)| *name == v);
+        let without = codec_choices("aac", true, false);
+        assert!(has(&without, "aac"), "the other codecs stay");
+        assert!(!has(&without, "xhe-aac-external"), "no helper, no entry");
+        assert!(has(&codec_choices("aac", true, true), "xhe-aac-external"), "helper found");
+        assert!(
+            has(&codec_choices("xhe-aac-external", true, false), "xhe-aac-external"),
+            "a document naming it keeps the entry"
+        );
+        // DAC follows the same rule with its build feature.
+        assert!(!has(&codec_choices("aac", false, false), "dac"));
+        assert!(has(&codec_choices("aac", true, false), "dac"));
+    }
+
+    /// The mode E rules must not touch a document already in order.
+    #[test]
+    fn a_valid_mode_e_document_is_left_alone() {        let mut doc: DocumentMut = "[channel]\nmode = \"E\"\noccupancy = 0\nmsc_mode = \"16-QAM\"\nsdc_mode = \"4-QAM\"\ninterleaving = \"long\"\n"
+            .parse()
+            .unwrap();
+        assert!(!repair_channel_for_mode(&mut doc), "nothing to repair");
+        // A DRM30 document keeps its own choices: 64-QAM, 16-QAM SDC, short interleaving.
+        let mut b: DocumentMut = "[channel]\nmode = \"B\"\nmsc_mode = \"64-QAM\"\nsdc_mode = \"16-QAM\"\ninterleaving = \"short\"\n"
+            .parse()
+            .unwrap();
+        assert!(!repair_channel_for_mode(&mut b));
+        assert_eq!(get_str(section(&mut b, "channel"), "msc_mode").as_deref(), Some("64-QAM"));
+    }
+
+    /// The repair runs on every frame the Channel card is drawn, so a document already in
+    /// order must come back byte for byte — comments, key order, absent keys and equivalent
+    /// spellings included. Otherwise merely *looking* at the form would dirty the file and
+    /// rewrite what the user wrote.
+    #[test]
+    fn a_valid_document_keeps_its_text_exactly() {
+        // Mode B with no constellation keys at all (their defaults are valid there), a
+        // comment on the mode line and a hand-written spelling of the mode.
+        let text = "[channel]\nmode = \"b\"   # the usual choice\noccupancy = 3\n\n[[service]]\nlabel = \"R\"\nid = 0xD0D001\n[service.audio]\ncodec = \"aac\"\ninput = { tone_hz = 1000.0 }\n";
+        let mut doc: DocumentMut = text.parse().unwrap();
+        assert!(!repair_channel_for_mode(&mut doc), "a valid mode B document needs no repair");
+        assert_eq!(doc.to_string(), text, "the text must not change");
+
+        // Mode E already in order, with equivalent spellings and its own layout.
+        let text = "[channel]\nmode = \"E\"\noccupancy = 0\nmsc_mode = \"16qam\"\nsdc_mode = \"4qam\"\ninterleaving = \"long\"\n";
+        let mut doc: DocumentMut = text.parse().unwrap();
+        assert!(!repair_channel_for_mode(&mut doc), "an equivalent spelling is already correct");
+        assert_eq!(doc.to_string(), text, "the text must not change");
+    }
+
+    /// A protection level the station does not use is not rewritten: the station itself only
+    /// checks `protection_a` when a stream is in part A and `protection_hierarchical` when the
+    /// constellation is hierarchical, so a stale value there is harmless. Changing it would
+    /// dirty a document the station accepts, for nothing.
+    #[test]
+    fn unused_protection_levels_are_left_alone() {
+        // 16-QAM has levels 0-1, so protection_b = 3 is out of range and must be clamped; the
+        // part A and hierarchical levels are unused here and keep their values.
+        let text = "[channel]\nmode = \"B\"\nmsc_mode = \"16-QAM\"\nprotection_a = 3\nprotection_b = 3\nprotection_hierarchical = 3\n";
+        let mut doc: DocumentMut = text.parse().unwrap();
+        assert!(repair_channel_for_mode(&mut doc));
+        let ch = section(&mut doc, "channel");
+        assert_eq!(get_int(ch, "protection_b"), Some(1), "the used level is clamped");
+        assert_eq!(get_int(ch, "protection_a"), Some(3), "part A is unused: left alone");
+        assert_eq!(get_int(ch, "protection_hierarchical"), Some(3), "no hierarchical layer: left alone");
+    }
+
+    /// The protection levels a selector offers follow the constellation (§7.5.1 tables 29-32).
+    #[test]
+    fn protection_levels_follow_the_constellation() {
+        assert_eq!(protection_levels("A", "16-QAM").len(), 2, "16-QAM has levels 0-1 in DRM30");
+        assert_eq!(protection_levels("A", "64-QAM").len(), 4);
+        // Mode E has four of both its constellations (tables 31 and 29), and their code
+        // rates are not the DRM30 ones, so the labels differ too.
+        assert_eq!(protection_levels("E", "16-QAM").len(), 4, "mode E's 16-QAM has levels 0-3");
+        assert_eq!(protection_levels("E", "4-QAM").len(), 4, "mode E's 4-QAM has levels 0-3");
+        assert_ne!(
+            protection_levels("E", "16-QAM")[0].1,
+            protection_levels("A", "16-QAM")[0].1,
+            "the same level number is a different code rate in mode E"
+        );
+    }
+
+    #[test]
+    fn mode_e_has_a_fixed_bandwidth_and_cd_are_restricted() {
+        // Mode E's row shows a label (occupancy is pinned to 0), so it never uses the selector.
+        // C and D are restricted to 10 and 20 kHz; A and B keep all six.
+        let allowed = |mode: &str| -> Vec<&str> {
+            OCCUPANCIES
+                .iter()
+                .copied()
+                .filter(|(v, _)| !matches!(mode, "C" | "D") || matches!(*v, "3" | "5"))
+                .map(|(v, _)| v)
+                .collect()
+        };
+        assert_eq!(allowed("C"), ["3", "5"]);
+        assert_eq!(allowed("D"), ["3", "5"]);
+        assert_eq!(allowed("A").len(), 6);
+        assert_eq!(allowed("B").len(), 6);
+        // Mode E is defined at occupancy 0 only, which is what its row pins.
+        let (kmin, kmax) = decdrm_core::params::carrier_range(
+            RobustnessMode::E, decdrm_core::params::SpectrumOccupancy::SO_0).unwrap();
+        assert_eq!((kmin, kmax), (-106, 106));
+        assert!(decdrm_core::params::carrier_range(
+            RobustnessMode::E, decdrm_core::params::SpectrumOccupancy::SO_3).is_none());
+    }
+
+    /// A VHF preset replaces the annex B channel number with the profile plus its speed and
+    /// band, and choosing an HF model again removes them: `[simulate]` is
+    /// `deny_unknown_fields`, so a key left behind is either a load error or a stale lie.
+    #[test]
+    fn the_vhf_presets_replace_the_hf_channel_number() {
+        let mut doc = DocumentMut::new();
+        let sim = section(&mut doc, "simulate");
+        set(sim, "channel", 3i64);
+        set_simulation_model(sim, "tu6");
+        assert_eq!(get_str(sim, "vhf").as_deref(), Some("tu6"));
+        assert!(sim.get("channel").is_none(), "the HF number is removed");
+        assert_eq!(get_num(sim, "speed_kmh"), Some(0.0), "parked by default");
+        assert_eq!(get_num(sim, "carrier_mhz"), Some(200.0), "Band III by default");
+
+        // The speed and band are kept when switching between VHF profiles; only a missing
+        // one gets a default.
+        set(sim, "speed_kmh", 100.0);
+        set(sim, "carrier_mhz", 98.0);
+        set_simulation_model(sim, "ra");
+        assert_eq!(get_str(sim, "vhf").as_deref(), Some("ra"));
+        assert_eq!(get_num(sim, "speed_kmh"), Some(100.0));
+        assert_eq!(get_num(sim, "carrier_mhz"), Some(98.0));
+
+        set_simulation_model(sim, "4");
+        assert_eq!(get_int(sim, "channel"), Some(4));
+        for key in ["vhf", "speed_kmh", "carrier_mhz"] {
+            assert!(sim.get(key).is_none(), "{key} left behind");
+        }
+
+        // What the form writes is what the station parses.
+        let mut doc = DocumentMut::new();
+        let sim = section(&mut doc, "simulate");
+        set_simulation_model(sim, "tu6");
+        set(sim, "speed_kmh", 100.0);
+        let text = doc.to_string();
+        let cfg = decdrm_station::StationConfig::from_toml_str(&text)
+            .unwrap_or_else(|e| panic!("the form's VHF section must parse: {e}\n{text}"));
+        let sim = cfg.simulate.expect("the section survives");
+        assert_eq!(sim.vhf, Some(decdrm_station::VhfProfile::Tu6));
+        assert_eq!(sim.speed_kmh, 100.0);
+    }
+
+    #[test]
+    fn names_match_like_the_station_does() {        assert_eq!(canon("64-QAM"), canon("QAM64"));
         assert_eq!(canon("64qam"), "64qam");
         assert_eq!(canon("HE-AAC v2"), canon("he_aac_v2"));
         assert_ne!(canon("16-QAM"), canon("64-QAM"));
+    }
+
+    /// The sample rate is written as a **string** and must survive a round trip through the
+    /// station parser. Writing an integer (which this form did) produced a file the parser then
+    /// rejected, so the value silently did not apply.
+    #[test]
+    fn the_sample_rate_is_written_as_the_station_parses_it() {
+        use decdrm_station::config::RateSetting;
+        for khz in [48i64, 96, 120, 192] {
+            // Read: every spelling the station writes or accepts must come back as kHz.
+            for text in [format!("{khz}kHz"), format!("{khz}"), format!("{}", khz * 1000)] {
+                let mut doc: DocumentMut = "[channel]
+".parse().unwrap();
+                set(section(&mut doc, "channel"), "working_sample_rate", text.as_str());
+                let mut doc = doc;
+                let ch = section(&mut doc, "channel");
+                assert_eq!(sample_rate_khz(ch), khz, "reading {text:?}");
+            }
+            // Write: what the form writes must parse back through the station's own parser.
+            let mut doc: DocumentMut = "[channel]
+".parse().unwrap();
+            set(section(&mut doc, "channel"), "working_sample_rate", format!("{khz}kHz"));
+            let written = doc.to_string();
+            let cfg = decdrm_station::StationConfig::from_toml_str(&written)
+                .unwrap_or_else(|e| panic!("the form's output must parse for {khz} kHz: {e}"));
+            assert_eq!(cfg.channel.working_sample_rate.0.hz(), (khz * 1000) as u32);
+            assert_eq!(format!("{khz}kHz").parse::<RateSetting>().unwrap().0.hz(), (khz * 1000) as u32);
+        }
+    }
+
+    /// The bit rate must use the mode's own frame duration. Mode E's frame is 100 ms, so a
+    /// constant 400 reported a quarter of the real rate: a mode E station's 2488 bytes per frame
+    /// came out as ~50 kbit/s instead of ~199.
+    #[test]
+    fn the_multiplex_bit_rate_uses_the_modes_frame_duration() {
+        let seg = |bytes: usize| Segment {
+            label: "x".into(),
+            bytes,
+            audio: true,
+            part_a: false,
+            service: Some(0),
+        };
+        let e = PlanBar { capacity: 2488, frame_ms: 100, segments: vec![seg(2488)] };
+        assert!((e.audio_kbps(0).unwrap() - 199.04).abs() < 0.1, "{:?}", e.audio_kbps(0));
+        let b = PlanBar { capacity: 1228, frame_ms: 400, segments: vec![seg(1228)] };
+        assert!((b.audio_kbps(0).unwrap() - 24.56).abs() < 0.1, "{:?}", b.audio_kbps(0));
+        // The duration comes from the mode.
+        assert_eq!(RobustnessMode::E.frame_ms(), 100);
+        assert_eq!(RobustnessMode::B.frame_ms(), 400);
     }
 
     #[test]

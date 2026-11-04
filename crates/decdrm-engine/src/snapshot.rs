@@ -99,6 +99,9 @@ pub struct DiversityView {
     pub carriers: Option<CarrierMix>,
     /// Carrier spacing, Hz (0 before the robustness mode is known).
     pub spacing_hz: f64,
+    /// Seconds per multiplex frame of the mode being received: 0.4 in modes A–D, **0.1 in
+    /// mode E** (§8.1) — the unit the frame-based counts and plots use.
+    pub frame_seconds: f64,
     /// Each branch's latest equalised MSC cells: its constellation before combining
     /// (the combined one is [`Visuals`]' MSC constellation).
     pub msc: [Vec<Cplx>; 2],
@@ -198,6 +201,8 @@ pub struct AudioStatus {
     /// The SBR band smoother is switched on (see `Command::SetSmoothSbr`); it acts on audio
     /// with SBR only.
     pub smooth_sbr: bool,
+    /// Dropout concealment is switched on (see `Command::SetConcealDropouts`).
+    pub conceal_dropouts: bool,
     /// Where the SBR band of the current audio starts, Hz (`None`: no SBR, nothing to
     /// smooth).
     pub sbr_crossover_hz: Option<f64>,

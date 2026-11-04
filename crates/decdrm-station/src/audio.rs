@@ -1,15 +1,15 @@
 //! Audio services: the input (file, sound card, web stream — see [`crate::webstream`] —
 //! or test tone, converted to the encoder's rate and channel count), the encoder
 //! (FDK-AAC, libxaac for xHE-AAC, Opus, or DAC with the `dac` feature) and the
-//! logical frame of each 400 ms multiplex frame (audio super frame plus text message
-//! piece; a web stream's titles join the configured messages).
+//! logical frame of each multiplex frame (audio super frame plus text message piece; a
+//! web stream's titles join the configured messages).
 //!
-//! Timing: one call of [`AudioChain::next_logical_frame`] consumes exactly 400 ms of
-//! PCM at the encoder's input rate — five or ten AAC granules of 960 core samples
-//! (1920 input samples with SBR), twenty 20 ms Opus frames, 400 ms of xHE-AAC input
-//! (1024-, 2048- or 4096-sample frames that do not align with the super frames), or
-//! thirty 320-sample DAC frames at 24 kHz — and produces one audio super frame
-//! (ES 201 980 §5.3.1, §5.4.1).
+//! Timing: one call of [`AudioChain::next_logical_frame`] consumes the PCM of one **audio
+//! super frame** — 400 ms in modes A–D (five or ten AAC granules of 960 core samples, 1920
+//! input samples with SBR; twenty 20 ms Opus frames; 400 ms of xHE-AAC input; thirty
+//! 320-sample DAC frames at 24 kHz) and **200 ms in mode E, which is two 100 ms logical
+//! frames** (§5.3.1.0): the call returns the super frame's first half and holds the second
+//! for the next one. The return value is one logical frame (ES 201 980 §5.3.1, §5.4.1).
 //!
 //! FDK-AAC has an encoder delay: its first calls return no frame. The encoder is primed
 //! with silence at start-up until it delivers its first frame, after which every
@@ -720,7 +720,9 @@ impl OpusEncoder {
         let enc = OpusDrmEncoder::new(OpusEncoderConfig::new(plan.input_channels, plan.opus_packet_bytes))?;
         Ok(Self {
             enc,
-            fmt: AacSuperFrameFormat::opus(stream),
+            // 20 packets per 400 ms super frame, 10 per mode E's 200 ms one: the count the
+            // plan computed for the mode, not the DRM30 constant.
+            fmt: AacSuperFrameFormat::opus_for(stream, plan.frames_per_super_frame),
             granule: decdrm_codecs::OPUS_FRAME_LEN * plan.input_channels,
             encoder_errors: 0,
         })
@@ -841,6 +843,75 @@ impl XheEncoder {
     }
 }
 
+/// The external xHE-AAC encoder (the optional 32-bit helper beside the executables,
+/// `decdrm_codecs::xhe_external`). It returns whole DRM super frames — the DLL frames them
+/// and runs its own rate control — so there is no framer, lead or padding here; the helper
+/// holds about 640 ms of audio internally and pads with silence until it has enough, which
+/// is the encoder's delay, exactly like libxaac's lead.
+struct XheExternalEncoder {
+    enc: decdrm_codecs::ExternalXheEncoder,
+    config: decdrm_codecs::ExternalConfig,
+    /// The SDC type-9 body the plan announces; the encoder must produce the same.
+    static_config: Vec<u8>,
+    encoder_errors: u64,
+}
+
+impl XheExternalEncoder {
+    fn new(plan: &AudioPlan) -> std::result::Result<Self, CodecError> {
+        // Mode E's audio super frame spans two logical frames (DAC's four); A–D's one.
+        let config = decdrm_codecs::ExternalConfig::new(
+            plan.parts_per_super_frame > 1,
+            plan.input_channels as u8,
+            plan.super_frame_len,
+        );
+        let static_config = plan.params.codec_config.clone();
+        let enc = Self::open(&config, &static_config)?;
+        Ok(Self { enc, config, static_config, encoder_errors: 0 })
+    }
+
+    fn open(
+        config: &decdrm_codecs::ExternalConfig,
+        static_config: &[u8],
+    ) -> std::result::Result<decdrm_codecs::ExternalXheEncoder, CodecError> {
+        let enc = decdrm_codecs::ExternalXheEncoder::open(config)?;
+        // The greeting's type-9 body is the two header bytes plus the static config the
+        // plan kept (`plugins` aside, the header's text flag is ours to choose).
+        if enc.info().type9.get(2..) != Some(static_config) {
+            return Err(CodecError::InvalidConfig(
+                "the external xHE-AAC encoder produced another SDC type-9 config than the plan announces".into(),
+            ));
+        }
+        Ok(enc)
+    }
+
+    /// One super frame of `len` bytes after encoding `pcm`. A helper that died (the DLL
+    /// lives in its own process) is replaced; the frame it owed becomes zeros, which the
+    /// receiver conceals.
+    fn super_frame(&mut self, pcm: &[f32], len: usize, service: &str) -> Result<Vec<u8>> {
+        match self.enc.super_frame(pcm) {
+            Ok(f) if f.len() == len => Ok(f),
+            Ok(f) => {
+                self.encoder_errors += 1;
+                Err(StationError::Codec {
+                    service: service.to_string(),
+                    source: CodecError::InvalidConfig(format!(
+                        "the external xHE-AAC encoder returned {} bytes, the stream holds {len}",
+                        f.len()
+                    )),
+                })
+            }
+            Err(_) => {
+                self.encoder_errors += 1;
+                self.enc = Self::open(&self.config, &self.static_config).map_err(|source| StationError::Codec {
+                    service: service.to_string(),
+                    source,
+                })?;
+                Ok(vec![0; len])
+            }
+        }
+    }
+}
+
 /// DAC encoder producing DecDRM's DAC super frames (the `dac` feature).
 #[cfg(feature = "dac")]
 struct DacEncoder {
@@ -882,6 +953,7 @@ fn open_dac(_plan: &AudioPlan) -> std::result::Result<Encoder, decdrm_codecs::Co
 enum Encoder {
     Aac(AacEncoder),
     Xhe(Box<XheEncoder>),
+    XheExternal(XheExternalEncoder),
     Opus(OpusEncoder),
     #[cfg(feature = "dac")]
     Dac(DacEncoder),
@@ -922,6 +994,9 @@ pub(crate) struct AudioChain {
     /// The title currently in the text message cycle.
     title: Option<String>,
     stream_len: usize,
+    /// The remaining logical frames of the current audio super frame, in order (mode E:
+    /// two, or **four for DAC**, whose super frame is 400 ms by construction).
+    pending: VecDeque<Vec<u8>>,
     pcm: Vec<f32>,
     pub counters: AudioCounters,
 }
@@ -941,6 +1016,7 @@ impl AudioChain {
         let encoder = match plan.codec {
             Codec::Opus => OpusEncoder::new(plan, stream).map(Encoder::Opus),
             Codec::XheAac => XheEncoder::new(plan).map(|e| Encoder::Xhe(Box::new(e))),
+            Codec::XheAacExternal => XheExternalEncoder::new(plan).map(Encoder::XheExternal),
             Codec::Dac => open_dac(plan),
             _ => AacEncoder::new(plan, stream).map(Encoder::Aac),
         }
@@ -962,6 +1038,7 @@ impl AudioChain {
             titles: settings.input.sends_titles(),
             title: None,
             stream_len: stream.total(),
+            pending: VecDeque::new(),
             pcm: Vec::new(),
             counters: AudioCounters::default(),
         })
@@ -984,10 +1061,19 @@ impl AudioChain {
         self.title = title;
     }
 
-    /// The stream bytes of the next multiplex frame.
+    /// The stream bytes of the next logical frame.
+    ///
+    /// One call per transmission frame. In modes A–D the logical frame *is* the audio super
+    /// frame (400 ms). **Mode E's audio super frame is 200 ms over two 100 ms logical
+    /// frames** (§5.3.1.0), so every second call returns the other half of the super frame
+    /// the previous call encoded (`pending`).
     pub fn next_logical_frame(&mut self, service_name: &str) -> Result<Vec<u8>> {
-        // 400 ms at the encoder's input rate.
-        let frames = self.plan.input_rate as usize * 2 / 5;
+        if let Some(part) = self.pending.pop_front() {
+            return Ok(self.finish_logical_frame(part));
+        }
+        // One audio super frame at the encoder's input rate.
+        let super_s = self.plan.frame_seconds * self.plan.parts_per_super_frame as f64;
+        let frames = (f64::from(self.plan.input_rate) * super_s).round() as usize;
         self.pcm.clear();
         self.source
             .read(frames, &mut self.pcm)
@@ -998,7 +1084,7 @@ impl AudioChain {
         self.counters.input_drift_ppm = self.source.drift_ppm();
         self.update_title();
         let len = self.plan.super_frame_len;
-        let mut lf = match &mut self.encoder {
+        let mut sf = match &mut self.encoder {
             Encoder::Aac(e) => {
                 let sf = e.super_frame(&self.pcm, len)?;
                 self.counters.frames_dropped = e.dropped;
@@ -1008,6 +1094,12 @@ impl AudioChain {
             Encoder::Xhe(e) => {
                 let sf = e.super_frame(&self.pcm, len, service_name)?;
                 self.counters.frames_dropped = e.dropped;
+                self.counters.encoder_errors = e.encoder_errors;
+                sf
+            }
+            Encoder::XheExternal(e) => {
+                let sf = e.super_frame(&self.pcm, len, service_name)?;
+                self.counters.frames_dropped = e.encoder_errors;
                 self.counters.encoder_errors = e.encoder_errors;
                 sf
             }
@@ -1025,13 +1117,33 @@ impl AudioChain {
                 sf
             }
         };
+        self.counters.super_frames += 1;
+        // One super frame, `parts` logical frames: return the first part and keep the rest.
+        sf.resize(len, 0);
+        let parts = self.plan.parts_per_super_frame.max(1);
+        if parts > 1 {
+            let per_part = len / parts;
+            let mut start = 0;
+            for i in 0..parts {
+                // The last part takes any remainder (the plan makes the length divisible).
+                let end = if i + 1 == parts { len } else { start + per_part };
+                self.pending.push_back(sf[start..end].to_vec());
+                start = end;
+            }
+            sf = self.pending.pop_front().expect("the super frame has at least one part");
+        }
+        Ok(self.finish_logical_frame(sf))
+    }
+
+    /// Add the next text message piece and pad the part to the stream length: what the
+    /// multiplex takes as one logical frame.
+    fn finish_logical_frame(&mut self, mut lf: Vec<u8>) -> Vec<u8> {
         if let Some(t) = self.text.as_mut() {
             lf.resize(self.stream_len, 0);
             insert_text_message(&mut lf, t.next_piece());
         }
         debug_assert_eq!(lf.len(), self.stream_len);
-        self.counters.super_frames += 1;
-        Ok(lf)
+        lf
     }
 
     /// Whether the input is a non-looping file that has ended.

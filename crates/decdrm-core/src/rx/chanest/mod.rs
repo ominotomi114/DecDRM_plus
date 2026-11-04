@@ -25,11 +25,32 @@ const INIT_SNR_ESTIM_DB: Real = 20.0;
 const TICONST_SNREST_FAST: Real = 30.0;
 const TICONST_SNREST_MSC: Real = 1.0;
 
-fn freq_wiener_len(mode: RobustnessMode) -> usize {
+/// Overrides for the channel estimator's Wiener parameters.
+///
+/// The defaults come from the per-mode tables (annex B for modes A–D; mode E's are tuned
+/// against synthesised VHF channels — see DESIGN). A sweep (or a diagnostic build) can set
+/// them here instead of recompiling; `examples/modee_sweep.rs` is one.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct ChanEstTuning {
+    /// Time-Wiener filter length, pilots (per-mode default when `None`).
+    pub time_len: Option<usize>,
+    /// Maximum Doppler σ of the time Wiener, Hz (per-mode default when `None`).
+    pub time_sigma_hz: Option<Real>,
+    /// Frequency-Wiener filter length, carriers (per-mode default when `None`).
+    pub freq_len: Option<usize>,
+}
+
+fn freq_wiener_len(mode: RobustnessMode, tuning: ChanEstTuning) -> usize {
+    if let Some(len) = tuning.freq_len {
+        return len;
+    }
     match mode {
         RobustnessMode::A => 6,
         RobustnessMode::B | RobustnessMode::C => 11,
         RobustnessMode::D => 13,
+        // Mode E (DRM+): the widest DRM30 value (mode D's), tuned against the VHF sweeps in
+        // DESIGN; see `examples/modee_sweep.rs`.
+        RobustnessMode::E => 13,
     }
 }
 
@@ -38,6 +59,10 @@ fn freq_wiener_len(mode: RobustnessMode) -> usize {
 pub struct EqSymbol {
     /// Symbol index within the frame.
     pub symbol: usize,
+    /// Symbol index within the **super frame**: the row of the cell map this symbol was
+    /// actually modulated on. The estimator's output is delayed by `delay` symbols, so
+    /// this is not `frame_id * symbols_per_frame + symbol` at the time it is returned.
+    pub sf_sym: usize,
     /// Equalised cells with channel power as reliability.
     pub cells: Vec<EqCell>,
     /// Channel estimate per carrier.
@@ -77,7 +102,7 @@ pub struct ChannelEstimator {
     dc_grid: Option<usize>,
     tw: TimeWiener,
     track: PdsTracker,
-    hist: VecDeque<(Vec<Cplx>, usize, i64)>,
+    hist: VecDeque<(Vec<Cplx>, usize, usize, i64)>,
     cum_shift: i64,
     init_cnt: usize,
     grid: Vec<Cplx>,
@@ -122,6 +147,16 @@ pub struct ChannelEstimator {
 
 impl ChannelEstimator {
     pub fn new(map: Arc<CellMap>) -> Self {
+        Self::new_at(map, crate::params::WorkingRate::R48)
+    }
+
+    /// [`Self::new`] at an explicit working sample rate (mode E needs 120 or 192 kHz).
+    pub fn new_at(map: Arc<CellMap>, rate: crate::params::WorkingRate) -> Self {
+        Self::new_with(map, rate, ChanEstTuning::default())
+    }
+
+    /// [`Self::new_at`] with the Wiener parameters overridden (see [`ChanEstTuning`]).
+    pub fn new_with(map: Arc<CellMap>, rate: crate::params::WorkingRate, tuning: ChanEstTuning) -> Self {
         let n_car = map.num_carriers;
         let x = map.scattered.freq_int;
         let num_pil = (n_car - 1) / x + 1;
@@ -130,14 +165,18 @@ impl ChannelEstimator {
         } else {
             None
         };
-        let tw = TimeWiener::new(&map);
+        let tw = TimeWiener::new_with(&map, rate, tuning);
         let delay = tw.delay;
-        let track = PdsTracker::new(&map, num_pil, delay + 1);
-        let fw_len = freq_wiener_len(map.mode());
+        let track = PdsTracker::new_at(&map, num_pil, delay + 1, rate);
+        let fw_len = freq_wiener_len(map.mode(), tuning);
         let ns = map.symbols_per_frame;
-        let sym_rate = Real::from(SAMPLE_RATE) / map.mode().symbol_len() as Real;
-        let sys_bw = n_car as Real / map.mode().fft_size() as Real * Real::from(SAMPLE_RATE);
-        let nom_bw = map.occupancy().bandwidth_khz() * 1000.0;
+        let sym_rate = Real::from(rate.hz()) / map.mode().symbol_len_at(rate) as Real;
+        let sys_bw = n_car as Real / map.mode().fft_size_at(rate) as Real * Real::from(rate.hz());
+        // The nominal bandwidth is the mode's, not the occupancy's alone: §6.3.3 gives
+        // occupancy 0 a second meaning for mode E (100 kHz, not 4.5), and this ratio is
+        // how the SNR is referred from the system bandwidth to the nominal one. Using the
+        // DRM30 reading here would scale a DRM+ SNR by ~21x (+13.5 dB).
+        let nom_bw = map.layout.bandwidth_khz() * 1000.0;
         let mut est = Self {
             n_car,
             x,
@@ -262,20 +301,29 @@ impl ChannelEstimator {
         }
     }
 
-    /// Process one demodulated symbol (`s` = frame symbol index, `shift` = timing
-    /// shift of this window). Returns the equalised symbol `delay` symbols later.
-    pub fn process(&mut self, sym: &[Cplx], s: usize, shift: i64) -> Option<EqSymbol> {
+    /// Process one demodulated symbol. `sf_sym` is its **super-frame** symbol index and
+    /// `shift` the timing shift of this window. Returns the equalised symbol `delay`
+    /// symbols later.
+    ///
+    /// The map must be indexed by `sf_sym`, not by the frame-relative symbol: for modes
+    /// A–D every frame's rows are identical so the two agree, but mode E's AFS
+    /// references sit at super-frame symbols 4 and 159 only (§8.4.5).
+    pub fn process(&mut self, sym: &[Cplx], sf_sym: usize, shift: i64) -> Option<EqSymbol> {
         let map = Arc::clone(&self.map);
+        let sf = sf_sym % map.symbols_per_superframe;
+        // Per-frame indices (`fac_noise_sym`, the scattered filter phase, the caller's
+        // demapper) count within the frame; only the map rows span the super frame.
+        let s_frame = sf % map.symbols_per_frame;
         self.cum_shift += shift;
-        self.hist.push_back((sym.to_vec(), s, self.cum_shift));
+        self.hist.push_back((sym.to_vec(), sf, s_frame, self.cum_shift));
         if self.hist.len() > self.tw.delay + 1 {
             self.hist.pop_front();
         }
-        let out_cum = self.hist.front().map(|h| h.2).unwrap_or(self.cum_shift);
+        let out_cum = self.hist.front().map(|h| h.3).unwrap_or(self.cum_shift);
 
         let snr_pil = self.snr_estimate * self.snr_pil_corr;
         let mut grid = std::mem::take(&mut self.grid);
-        let snr_after_ti = self.tw.estimate(&map, sym, s, self.cum_shift, out_cum, snr_pil, &mut grid);
+        let snr_after_ti = self.tw.estimate(&map, sym, sf, self.cum_shift, out_cum, snr_pil, &mut grid);
         if let Some(dc) = self.dc_grid {
             grid[dc] = Cplx::new(0.0, 0.0);
         }
@@ -304,8 +352,8 @@ impl ChannelEstimator {
         self.grid = grid;
 
         // Equalise the delayed symbol.
-        let (data, out_s, cum_shift) = self.hist.front().expect("history filled");
-        let (out_s, cum_shift) = (*out_s, *cum_shift);
+        let (data, out_s, out_s_frame, cum_shift) = self.hist.front().expect("history filled");
+        let (out_s, out_s_frame, cum_shift) = (*out_s, *out_s_frame, *cum_shift);
         let cells: Vec<EqCell> = data
             .iter()
             .zip(&chan)
@@ -315,12 +363,16 @@ impl ChannelEstimator {
             })
             .collect();
 
+        // The map row is per super frame; the caller demaps and captures by the
+        // frame-relative symbol, which is what `EqSymbol::symbol` has always meant.
         self.update_quality(&map, &cells, out_s);
-        Some(EqSymbol { symbol: out_s, cells, chan, cum_shift })
+        Some(EqSymbol { symbol: out_s_frame, sf_sym: out_s, cells, chan, cum_shift })
     }
 
-    fn update_quality(&mut self, map: &CellMap, cells: &[EqCell], s: usize) {
-        let row = map.symbol_cells(s);
+    fn update_quality(&mut self, map: &CellMap, cells: &[EqCell], sf_sym: usize) {
+        // The map row is per super frame; the running per-symbol sums are per frame.
+        let row = map.symbol_cells(sf_sym);
+        let s = sf_sym % map.symbols_per_frame;
         let min_dist4 = |c: Cplx| -> Real { nearest_err(c.re, &QAM4).powi(2) + nearest_err(c.im, &QAM4).powi(2) };
 
         // SNR from FAC decisions.

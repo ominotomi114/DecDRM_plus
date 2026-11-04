@@ -388,6 +388,7 @@ impl DecDrmApp {
             &mut self.settings.volume,
             &mut self.settings.record_dir,
             &mut self.settings.smooth_sbr_services,
+            &mut self.settings.conceal_dropouts,
         );
         // A moved volume slider goes to the running receiver at once.
         if self.applied_volume != Some(self.settings.volume) {
@@ -444,6 +445,7 @@ impl eframe::App for DecDrmApp {
         let now = Instant::now();
         self.rx.poll(now);
         self.rx.sync_smooth_sbr(&self.settings.smooth_sbr_services);
+        self.rx.sync_conceal_dropouts(self.settings.conceal_dropouts);
         self.tx.poll(now);
         if self.schedule.poll() {
             ctx.request_repaint();

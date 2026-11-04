@@ -4,6 +4,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
 use decdrm_engine::{
     Command, Engine, EngineConfig, EngineEvent, InputFormat, InputSpec, LogConfig, RealChannel, ReceiverConfig,
+    RobustnessMode, SpectrumOccupancy, WorkingRate,
 };
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -77,6 +78,25 @@ struct RxArgs {
     /// Do not try spectrally inverted signals automatically.
     #[arg(long)]
     no_auto_flip: bool,
+    /// Working sample rate, kHz: the rate the OFDM chain demodulates at (the input is
+    /// resampled to it). Default: the recording's own rate, rounded to one DecDRM supports
+    /// (48, 96, 120 or 192 kHz), so a 192 kHz DRM+ file decodes without choosing anything;
+    /// 48 kHz for a sound card or a KiwiSDR.
+    #[arg(long, value_name = "KHZ")]
+    sample_rate: Option<u32>,
+    /// Decode robustness mode E (DRM+) instead of searching for one. Not needed to receive
+    /// DRM+ any more: the search finds the signal's spectrum, and the guard interval refines
+    /// the carrier to within a few Hz, so the automatic path decodes it too. Pinning skips
+    /// both and runs at DC, which is useful on a weak signal if the carrier is known; being
+    /// a few tens of Hz off is still corrected by the guard interval. Raises a working rate
+    /// that cannot carry mode E (a 48 kHz input) to 120 kHz.
+    #[arg(long)]
+    drm_plus: bool,
+    /// DC carrier frequency of the input in Hz, for a pinned receiver: the mixer runs here
+    /// instead of at 0. Ignored while searching for a signal, which finds the carrier itself
+    /// (the reference DRM+ recordings carry +20 kHz).
+    #[arg(long, value_name = "HZ", default_value_t = 0.0)]
+    dc: f64,
     /// Pace file decoding to real time.
     #[arg(long)]
     realtime: bool,
@@ -98,6 +118,11 @@ struct RxArgs {
     /// delay; played and written audio alike).
     #[arg(long)]
     smooth_sbr: bool,
+    /// Let audio dropouts cut to silence instead of being masked. On by default the last
+    /// clean audio is repeated at a falling level while the audio is lost, so a brief gap is
+    /// heard as a dip rather than a cut (played and written audio alike).
+    #[arg(long)]
+    no_conceal_dropouts: bool,
     /// Write the decoded audio to a WAV/FLAC file (as decoded, 16-bit; a change of the
     /// audio format carries on in FILE-2.wav, …).
     #[arg(long, value_name = "FILE")]
@@ -213,7 +238,46 @@ fn rx(a: RxArgs) -> Result<()> {
         Format::Iq => InputFormat::Iq { swap: false },
         Format::IqSwapped => InputFormat::Iq { swap: true },
     };
-    let receiver = ReceiverConfig { input: format, flip: a.flip, auto_flip: !a.no_auto_flip, ..Default::default() };
+    // The working rate follows the input: the caller's --sample-rate, else the recording's
+    // own rate rounded to one DecDRM demodulates (a DRM+ recording is 192 kHz, and the
+    // 48 kHz default would resample its 100 kHz signal away), else 48 kHz for a sound card
+    // or a KiwiSDR.
+    let mut sample_rate = match a.sample_rate {
+        Some(khz) => khz,
+        None => match &a.file {
+            Some(path) => decdrm_io::probe_sample_rate(path)
+                .map_or(48, |hz| WorkingRate::closest(hz).hz() / 1000),
+            None => 48,
+        },
+    };
+    // Mode E needs 120 kHz or more: naming DRM+ for an input that cannot carry it (a 48 kHz
+    // file or sound card) raises the rate rather than leaving a receiver whose carriers fold.
+    if a.drm_plus
+        && !WorkingRate::new(sample_rate.saturating_mul(1000)).is_some_and(|r| r.allows(RobustnessMode::E))
+    {
+        sample_rate = 120;
+    }
+    let working_rate = WorkingRate::new(sample_rate.saturating_mul(1000)).ok_or_else(|| {
+        anyhow::anyhow!(
+            "--sample-rate {} kHz is not one DecDRM supports (48, 96, 120 or 192)",
+            sample_rate
+        )
+    })?;
+    let pinned = a.drm_plus.then(|| (RobustnessMode::E, SpectrumOccupancy::SO_0));
+    if let Some((m, _)) = pinned
+        && !working_rate.allows(m)
+    {
+        anyhow::bail!("--drm-plus needs --sample-rate 120 or 192");
+    }
+    let receiver = ReceiverConfig {
+        input: format,
+        flip: a.flip,
+        auto_flip: !a.no_auto_flip,
+        working_rate,
+        pinned,
+        dc_hz: a.dc,
+        ..Default::default()
+    };
     let engine = Engine::start(EngineConfig {
         input,
         receiver,
@@ -223,6 +287,7 @@ fn rx(a: RxArgs) -> Result<()> {
         record_audio: a.out.clone(),
         data_dir: a.data_dir.clone(),
         smooth_sbr: a.smooth_sbr,
+        conceal_dropouts: !a.no_conceal_dropouts,
         log: a.log.clone().map(|p| LogConfig { interval_s: a.log_interval, ..LogConfig::new(p) }),
         ..EngineConfig::default()
     });
@@ -327,7 +392,10 @@ fn print_status(s: &decdrm_engine::Snapshot) {
         s.input.position_s,
         r.state,
         r.mode.map(|m| m.to_string()).unwrap_or_else(|| "-".into()),
-        r.occupancy.map(|o| o.to_string()).unwrap_or_default(),
+        match (r.mode, r.occupancy) {
+            (Some(m), Some(o)) => format!("{o} ({} kHz)", o.bandwidth_khz(m)),
+            _ => String::new(),
+        },
         f1(r.dc_frequency_hz),
         f1(r.snr_db),
         f1(r.mer_db),

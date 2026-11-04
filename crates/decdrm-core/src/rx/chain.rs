@@ -3,7 +3,7 @@
 //! the robustness mode, spectrum occupancy or coding parameters change.
 
 use super::ReceiverConfig;
-use super::chanest::{ChanStats, ChannelEstimator, PdsAxis};
+use super::chanest::{ChanEstTuning, ChanStats, ChannelEstimator, PdsAxis};
 use super::framesync::{FrameSync, FrameSyncState};
 use super::ofdm::OfdmDemod;
 use super::timesync::SymbolWindow;
@@ -13,8 +13,8 @@ use crate::fec::crc::Crc;
 use crate::fec::mlc::{MlcDecoder, MlcParams, MscProtection};
 use crate::fec::qam::EqCell;
 use super::mscdec::MscDecoder;
-use crate::params::{FRAMES_PER_SUPERFRAME, RobustnessMode, SAMPLE_RATE, SpectrumOccupancy};
-use crate::tables::NUM_FAC_CELLS;
+use crate::params::{RobustnessMode, SpectrumOccupancy, WorkingRate};
+use crate::tables::num_fac_cells;
 use crate::{Cplx, Real};
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -129,6 +129,12 @@ pub struct MscConfig {
 }
 
 pub(super) struct SymbolChain {
+    /// The robustness mode being received (its frame geometry and FAC size).
+    mode: RobustnessMode,
+    /// Working sample rate of the input (mode E, DRM+, needs 120 or 192 kHz).
+    rate: WorkingRate,
+    /// Overrides for the estimator's Wiener parameters (see [`ChanEstTuning`]).
+    tuning: ChanEstTuning,
     map: Arc<CellMap>,
     ofdm: OfdmDemod,
     frame: FrameSync,
@@ -166,9 +172,10 @@ pub(super) struct SymbolChain {
     msc_cells: Vec<EqCell>,
     /// MSC cells before each super-frame symbol (position of its first MSC cell).
     msc_offset: Vec<usize>,
-    /// Carrier offset (`k − kmin`) of each MSC cell of the multiplex frames at
-    /// positions 0, 1, 2 of the super frame (diversity branches hand them out).
-    frame_carriers: [Arc<[u16]>; FRAMES_PER_SUPERFRAME],
+    /// Carrier offset (`k − kmin`) of each MSC cell of the multiplex frames of the super
+    /// frame, in order (diversity branches hand them out). A `Vec` because the count is
+    /// per-mode: 3 for A–D, 4 for mode E (DRM+).
+    frame_carriers: Vec<Arc<[u16]>>,
     /// Collecting a multiplex frame that started at a frame boundary.
     msc_collecting: bool,
     /// Frames were lost: restart the cell deinterleaver before the next frame.
@@ -197,16 +204,29 @@ impl SymbolChain {
     pub fn new(mode: RobustnessMode, so: SpectrumOccupancy, cfg: &ReceiverConfig) -> Option<Self> {
         let map = Arc::new(CellMap::new(mode, so)?);
         let last_fac_symbol = crate::tables::fac_positions(mode).iter().map(|&(s, _)| s as usize).max().unwrap_or(0);
-        let mut fac_dec = MlcDecoder::new(MlcParams::fac(), 0);
+        let mut fac_dec = MlcDecoder::new(MlcParams::fac_for(mode), 0);
         fac_dec.metric = cfg.metric;
-        let sdc_mode = SdcMode::Qam16;
-        let mut sdc_dec = MlcDecoder::new(MlcParams::sdc(sdc_mode.mapping(), map.sdc_cells_per_superframe), 1);
+        // Mode E's SDC is 4-QAM only (§8.5.3.2), so guess that there; modes A-D start on
+        // 16-QAM and the FAC corrects it either way.
+        let sdc_mode = if mode.is_drm_plus() { SdcMode::Qam4 } else { SdcMode::Qam16 };
+        let mut sdc_dec = MlcDecoder::new(
+            MlcParams::sdc_for(
+                mode,
+                sdc_mode.mapping(),
+                map.sdc_cells_per_superframe,
+                sdc_mode.protection(),
+            ),
+            1,
+        );
         sdc_dec.metric = cfg.metric;
         Some(Self {
-            ofdm: OfdmDemod::new(&map),
-            frame: FrameSync::new(&map),
-            chanest: ChannelEstimator::new(Arc::clone(&map)),
-            history: super::scatter::ChannelHistory::new(&map),
+            mode,
+            rate: cfg.working_rate,
+            tuning: cfg.chanest,
+            ofdm: OfdmDemod::new_at(&map, cfg.working_rate),
+            frame: FrameSync::new_at(&map, cfg.working_rate),
+            chanest: ChannelEstimator::new_with(Arc::clone(&map), cfg.working_rate, cfg.chanest),
+            history: super::scatter::ChannelHistory::new_at(&map, cfg.working_rate),
             cells: Vec::new(),
             recent: VecDeque::new(),
             frame_id: None,
@@ -216,7 +236,7 @@ impl SymbolChain {
             seek_sdc: false,
             sdc_found: false,
             sdc_misses: 0,
-            fac_cells: Vec::with_capacity(NUM_FAC_CELLS),
+            fac_cells: Vec::with_capacity(num_fac_cells(mode)),
             last_fac_symbol,
             fac_dec,
             sdc_mode,
@@ -285,9 +305,9 @@ impl SymbolChain {
             && let Some(map) = CellMap::new(self.map.mode(), fac.channel.occupancy)
         {
             let map = Arc::new(map);
-            self.ofdm = OfdmDemod::new(&map);
+            self.ofdm = OfdmDemod::new_at(&map, self.rate);
             self.frame.reconfigure(&map);
-            self.chanest = ChannelEstimator::new(Arc::clone(&map));
+            self.chanest = ChannelEstimator::new_with(Arc::clone(&map), self.rate, self.tuning);
             if self.tracking {
                 self.chanest.start_time_wiener_tracking();
             }
@@ -320,7 +340,19 @@ impl SymbolChain {
         }
         if fac.channel.sdc_mode != self.sdc_mode || self.sdc_dec.params().cells != self.map.sdc_cells_per_superframe {
             self.sdc_mode = fac.channel.sdc_mode;
-            let mut d = MlcDecoder::new(MlcParams::sdc(self.sdc_mode.mapping(), self.map.sdc_cells_per_superframe), 1);
+            // The FAC's SDC-mode bit is the modulation in modes A-D but a **protection
+            // level** in mode E (0 = rate 1/2, 1 = rate 1/4, table 38), which is why it is
+            // passed through here rather than assumed. Assuming level 0 decodes a mode E
+            // SDC sent at rate 1/4 with the wrong code rate and the CRC never passes.
+            let mut d = MlcDecoder::new(
+                MlcParams::sdc_for(
+                    self.mode,
+                    self.sdc_mode.mapping(),
+                    self.map.sdc_cells_per_superframe,
+                    self.sdc_mode.protection(),
+                ),
+                1,
+            );
             d.metric = cfg.metric;
             self.sdc_dec = d;
         }
@@ -338,7 +370,7 @@ impl SymbolChain {
                 // A diversity branch only needs the mapping (for its MER); the
                 // combiner decodes.
                 self.msc = (!self.cells_out)
-                    .then(|| MscDecoder::new(c, self.map.msc_cells_per_frame, self.msc_iterations, metric));
+                    .then(|| MscDecoder::new(c, self.mode, self.map.msc_cells_per_frame, self.msc_iterations, metric));
             }
         }
     }
@@ -370,7 +402,7 @@ impl SymbolChain {
         }
         if fs.id_changed {
             // Frame alignment changed: channel history and demapper are invalid.
-            self.chanest = ChannelEstimator::new(Arc::clone(&self.map));
+            self.chanest = ChannelEstimator::new_with(Arc::clone(&self.map), self.rate, self.tuning);
             if self.tracking {
                 self.chanest.start_time_wiener_tracking();
             }
@@ -386,9 +418,10 @@ impl SymbolChain {
             self.recent.clear();
             self.history.clear();
         }
-        let eq = self.chanest.process(&cells, fs.symbol, win.shift);
+        let sf_sym = self.super_symbol(fs.symbol);
+        let eq = self.chanest.process(&cells, sf_sym, win.shift);
         self.cells = cells;
-        self.remember(win, fs.symbol);
+        self.remember(win, sf_sym);
         let track = self.chanest.last_track;
         if self.chanest.timing_tracking() {
             out.timing_adjust = track.timing_adjust;
@@ -398,9 +431,33 @@ impl SymbolChain {
 
         let Some(eq) = eq else { return out };
         self.history.push(&eq.chan, eq.cum_shift);
-        self.capture(&eq.cells, eq.symbol, &eq.chan);
+        self.capture(&eq.cells, eq.sf_sym, &eq.chan);
         self.demap(&eq.cells, eq.symbol, &mut out.events);
         out
+    }
+
+    /// The super-frame index of the frame-relative symbol `s`.
+    ///
+    /// The cell map spans a super frame while the receiver's symbol counter is
+    /// frame-relative. For modes A-D every frame's rows are identical so the two
+    /// coincide, but **mode E is not frame-periodic**: its AFS references sit at
+    /// super-frame symbols 4 and 159 only (§8.4.5), so the map must be indexed by this.
+    ///
+    /// The estimator's output is delayed by `delay` symbols, so the symbol arriving now
+    /// belongs to the frame `delay` symbols *ahead* of the one being demapped: whenever
+    /// the current symbol is earlier in its frame than the delay, the frame boundary it
+    /// has not reached yet will have been passed by the demapper. Bumping only at `s == 0`
+    /// (the original code) left every `s < delay` symbol — 1..17 for mode E — tagged with
+    /// the previous frame, which is invisible for A-D but makes a mode E receiver read
+    /// frame 0's SDC carriers off a frame 3 symbol.
+    fn super_symbol(&self, s: usize) -> usize {
+        let ns = self.map.symbols_per_frame;
+        let frame = match self.frame_id {
+            Some(f) if s < self.chanest.delay() => (f + 1) % self.mode.frames_per_superframe(),
+            Some(f) => f,
+            None => 1,
+        };
+        frame * ns + s
     }
 
     /// Keep the window just given to the channel estimator for a possible replay
@@ -419,22 +476,17 @@ impl SymbolChain {
 
     /// Keep the latest cells of each channel for the constellation plots (a frame's
     /// worth of FAC and MSC cells, a super frame's worth of SDC cells, so the plots move
-    /// symbol by symbol) and the channel power per carrier. Called before `demap`, so at
-    /// symbol 0 the frame index has not advanced yet.
-    fn capture(&mut self, cells: &[EqCell], s: usize, chan: &[Cplx]) {
+    /// symbol by symbol) and the channel power per carrier.
+    ///
+    /// `sf_sym` is the **super-frame** symbol index of the equalised symbol (from the
+    /// estimator, which tags each symbol when it is received); FAC carriers are the same
+    /// in every frame so they use its frame-relative part.
+    fn capture(&mut self, cells: &[EqCell], sf_sym: usize, chan: &[Cplx]) {
         let map = &self.map;
         let ns = map.symbols_per_frame;
-        for &c in map.fac_carriers(s) {
+        for &c in map.fac_carriers(sf_sym % ns) {
             self.vis_fac.push_back(cells[c as usize].sig);
         }
-        // Frame within the super frame (unknown before the first FAC: assume a frame
-        // without SDC so MSC cells are still plotted).
-        let frame = match self.frame_id {
-            Some(f) if s == 0 => (f + 1) % FRAMES_PER_SUPERFRAME,
-            Some(f) => f,
-            None => 1,
-        };
-        let sf_sym = frame * ns + s;
         if sf_sym < map.mode().sdc_symbols() {
             for &c in map.sdc_carriers(sf_sym) {
                 self.vis_sdc.push_back(cells[c as usize].sig);
@@ -443,7 +495,7 @@ impl SymbolChain {
         for &c in map.msc_carriers(sf_sym) {
             self.vis_msc.push_back(cells[c as usize].sig);
         }
-        keep_last(&mut self.vis_fac, NUM_FAC_CELLS);
+        keep_last(&mut self.vis_fac, num_fac_cells(self.mode));
         keep_last(&mut self.vis_sdc, map.sdc_cells_per_superframe);
         keep_last(&mut self.vis_msc, map.msc_cells_per_frame);
         let mut row = if self.chan_rows.len() >= CHAN_ROWS {
@@ -476,7 +528,7 @@ impl SymbolChain {
         v.msc = self.vis_msc.iter().copied().collect();
         v.chan_rows = self.chan_rows.iter().cloned().collect();
         v.chan_seq = self.chan_seq;
-        v.symbol_s = self.map.mode().symbol_len() as Real / Real::from(SAMPLE_RATE);
+        v.symbol_s = self.map.mode().symbol_len_at(self.rate) as Real / Real::from(self.rate.hz());
         let (pds, axis) = self.chanest.power_delay_profile();
         v.pds = pds;
         v.pds_axis = Some(axis);
@@ -497,7 +549,7 @@ impl SymbolChain {
             self.fac_cells.push(cells[c as usize]);
         }
         if s == self.last_fac_symbol {
-            if self.fac_cells.len() == NUM_FAC_CELLS {
+            if self.fac_cells.len() == num_fac_cells(self.mode) {
                 let mut bits = Vec::new();
                 self.fac_dec.decode(&self.fac_cells, &mut bits);
                 match Fac::parse(&bits) {
@@ -516,7 +568,7 @@ impl SymbolChain {
         if s == 0
             && let Some(f) = self.frame_id.as_mut()
         {
-            *f = (*f + 1) % FRAMES_PER_SUPERFRAME;
+            *f = (*f + 1) % self.mode.frames_per_superframe();
         }
         let Some(mut f) = self.frame_id else { return };
 
@@ -526,6 +578,10 @@ impl SymbolChain {
         // the CRC.
         let sdc_symbols = map.mode().sdc_symbols();
         let seeking = !self.identity_trusted && self.seek_sdc;
+        // SDC carriers come from the *frame-relative* symbol, not the super-frame index:
+        // while the super-frame start is sought, the trial asks "does the super frame
+        // start at this frame?", which makes the current symbol super-frame row `s`. In
+        // frame 0 the two are the same row anyway.
         if s < sdc_symbols && (f == 0 || seeking) {
             if s == 0 {
                 self.sf_synced = true;
@@ -535,7 +591,7 @@ impl SymbolChain {
                 for &c in map.sdc_carriers(s) {
                     self.sdc_cells.push(cells[c as usize]);
                 }
-                if s == sdc_symbols - 1 && self.sdc_cells.len() == map.sdc_cells_per_superframe {
+               if s == sdc_symbols - 1 && self.sdc_cells.len() == map.sdc_cells_per_superframe {
                     let block = self.decode_sdc();
                     self.sdc_cells.clear();
                     if f != 0 {
@@ -573,7 +629,9 @@ impl SymbolChain {
         // followed by 0..=2 dummy cells. Collection may start at any multiplex-frame
         // boundary, so audio can begin up to a super frame earlier after sync.
         let n_mux = map.msc_cells_per_frame;
-        let useful = 3 * n_mux;
+        // Must be the mode's frame count, not 3: a hardcoded 3 silently dropped every
+        // fourth multiplex frame for mode E (3 frames for A-D, 4 for E, §7.7).
+        let useful = self.mode.frames_per_superframe() * n_mux;
         let first = self.msc_offset[sf_sym];
         for (pos, &c) in (first..).zip(map.msc_carriers(sf_sym)) {
             if pos < useful {
@@ -707,14 +765,15 @@ fn msc_offsets(map: &CellMap) -> Vec<usize> {
 
 /// The carrier offsets of the MSC cells of each multiplex frame of a super frame, in
 /// transmission order (the frames' cells follow `msc_carriers` symbol by symbol).
-fn msc_frame_carriers(map: &CellMap) -> [Arc<[u16]>; FRAMES_PER_SUPERFRAME] {
+fn msc_frame_carriers(map: &CellMap) -> Vec<Arc<[u16]>> {
+    let nframes = map.mode().frames_per_superframe();
     let n = map.msc_cells_per_frame.max(1);
-    let mut frames: [Vec<u16>; FRAMES_PER_SUPERFRAME] = Default::default();
+    let mut frames: Vec<Vec<u16>> = vec![Vec::new(); nframes];
     let carriers = (0..map.symbols_per_superframe).flat_map(|sym| map.msc_carriers(sym).iter().copied());
-    for (pos, c) in carriers.take(FRAMES_PER_SUPERFRAME * n).enumerate() {
+    for (pos, c) in carriers.take(nframes * n).enumerate() {
         frames[pos / n].push(c);
     }
-    frames.map(Arc::from)
+    frames.into_iter().map(Arc::from).collect()
 }
 
 fn track_reset(chanest: &mut ChannelEstimator) {

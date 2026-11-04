@@ -14,10 +14,8 @@ use std::time::{Duration, Instant};
 /// stall timeout are checked again.
 const WAIT_SLICE: Duration = Duration::from_millis(50);
 
-/// The working sample rate of the transmitter.
-const RATE: u32 = decdrm_core::params::SAMPLE_RATE;
-
-/// Create the output file of `cfg`, if any.
+/// Create the output file of `cfg`, if any, at the station's working sample rate (the file
+/// holds the signal as generated, so a mode E station writes a 120 or 192 kHz file).
 pub(crate) fn open_file(cfg: &StationConfig, channels: usize) -> Result<Option<FileWriter>> {
     let Some(f) = &cfg.output.file else { return Ok(None) };
     let path = cfg.resolve(f);
@@ -28,7 +26,10 @@ pub(crate) fn open_file(cfg: &StationConfig, channels: usize) -> Result<Option<F
         SampleFormat::Int24 => Encoding::Int24,
         SampleFormat::Float32 => Encoding::Float32,
     };
-    FileWriter::create(&path, AudioFormat::new(RATE, channels), container, encoding).map(Some).map_err(StationError::Output)
+    let rate = cfg.channel.working_sample_rate.0.hz();
+    FileWriter::create(&path, AudioFormat::new(rate, channels), container, encoding)
+        .map(Some)
+        .map_err(StationError::Output)
 }
 
 /// Playback starts once this much signal is queued on the sound card.
@@ -56,12 +57,13 @@ pub(crate) struct DeviceSink {
 }
 
 impl DeviceSink {
-    /// Open the device of `out` for a signal of `channels` channels at 48 kHz.
-    pub fn open(out: &OutputSettings, channels: usize) -> Result<Option<Self>> {
+    /// Open the device of `out` for a signal of `channels` channels at the station's working
+    /// sample rate, resampling to whatever rate the card gives us.
+    pub fn open(out: &OutputSettings, channels: usize, rate: u32) -> Result<Option<Self>> {
         let (Some(name), Some(capacity)) = (&out.device, device_queue(out)) else { return Ok(None) };
         let opts = OutputOptions {
             device: (!name.eq_ignore_ascii_case("default")).then(|| name.clone()),
-            sample_rate: Some(RATE),
+            sample_rate: Some(rate),
             channels: Some(channels),
             buffer: capacity,
             start_threshold: device_buffer(out),
@@ -75,8 +77,8 @@ impl DeviceSink {
                 fmt.channels
             )));
         }
-        let resampler = (fmt.sample_rate != RATE)
-            .then(|| Resampler::new(RATE, fmt.sample_rate, channels, ResamplerQuality::High))
+        let resampler = (fmt.sample_rate != rate)
+            .then(|| Resampler::new(rate, fmt.sample_rate, channels, ResamplerQuality::High))
             .transpose()
             .map_err(StationError::Output)?;
         Ok(Some(Self {

@@ -151,6 +151,9 @@ pub struct RxSession {
     /// The SBR band smoothing last asked of the engine: for which service (DRM service
     /// ID), on or off (see [`Self::sync_smooth_sbr`]).
     smooth_sent: Option<(u32, bool)>,
+    /// The dropout concealment switch last sent to the engine (see
+    /// [`Self::sync_conceal_dropouts`]).
+    conceal_sent: Option<bool>,
     epoch: Instant,
 }
 
@@ -178,6 +181,7 @@ impl Default for RxSession {
             rci_tunable: false,
             live: false,
             smooth_sent: None,
+            conceal_sent: None,
             epoch: Instant::now(),
         }
     }
@@ -215,6 +219,7 @@ impl RxSession {
         self.log.push(format!("── start: {label}"));
         self.source_label = label;
         self.smooth_sent = None;
+        self.conceal_sent = None;
         self.engine = Some(Engine::start(cfg));
     }
 
@@ -340,6 +345,17 @@ impl RxSession {
         }
     }
 
+    /// Dropout concealment: tell the engine when the switch changes (see
+    /// [`Command::SetConcealDropouts`]).
+    pub fn sync_conceal_dropouts(&mut self, on: bool) {
+        if self.conceal_sent != Some(on)
+            && let Some(e) = &self.engine
+        {
+            e.command(Command::SetConcealDropouts(on));
+            self.conceal_sent = Some(on);
+        }
+    }
+
     /// Ask the engine to decode / show service `short_id`, and show the expected
     /// result right away (see [`selection_preview`]); the next snapshot confirms it.
     pub fn select_service(&mut self, short_id: u8) {
@@ -426,7 +442,13 @@ impl RxSession {
             }
             self.plots = PlotData::from_snapshot(&snap);
             let v = &snap.visuals;
-            self.waterfall.push_rows(&v.waterfall_rows, v.spectrum_seq, v.real_input, v.spectrum_row_s);
+            self.waterfall.push_rows(
+                &v.waterfall_rows,
+                v.spectrum_seq,
+                v.real_input,
+                v.spectrum_row_s,
+                v.spectrum_span_hz,
+            );
             let chain = &v.chain;
             self.fading.push_rows(&chain.chan_rows, chain.chan_seq, chain.kmin, chain.spacing_hz, chain.symbol_s);
             self.history.push(&snap);
