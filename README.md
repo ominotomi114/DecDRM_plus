@@ -126,7 +126,8 @@ development package (`libasound2-dev`).
 weights built in, about 320 MB each) are attached to the
 [releases](https://github.com/ominotomi114/DecDRM_plus/releases), or built into `exe\`
 using the `.bat` scripts in the `scripts/` folder.
-To compile the external xHE-AAC tool, use `scripts/build-xhe-host.bat`. This script produces a directory inside `exe/` named `xhe` with the tool's exe (`exe/xhe/decdrm-xhe-host.exe`) inside. Make sure to put your `fhgio.dll` in the tool's directory, alongside the exe. The `xhe` directory with its contents must be in the same directory as the portable executables. 
+
+**External xHE-AAC tool:** To compile the external xHE-AAC tool, use `scripts/build-xhe-host.bat`. This script produces a directory inside `exe/` named `xhe` with the tool's exe (`exe/xhe/decdrm-xhe-host.exe`) inside. Make sure to put your `fhgio.dll` in the tool's directory, alongside the exe. The `xhe` directory with its contents must be in the same directory as the portable executables. 
 
 ## Usage
 
