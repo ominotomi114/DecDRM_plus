@@ -21,8 +21,12 @@
 //!
 //! The encoder takes 48 kHz interleaved `f32` and holds about 640 ms of audio internally,
 //! so the first super frames it returns are silence (that is the encoder's delay, exactly
-//! like libxaac's lead). [`ExternalXheEncoder::super_frame`] therefore pads with silence if
-//! the caller has not supplied enough PCM yet, and always returns one super frame.
+//! like libxaac's lead). It takes its PCM in blocks of [`ExternalInfo::n_smp`] floats while a
+//! super frame is not a whole number of blocks, so it alternates between asking for one
+//! block more and one less than a super frame holds: the FIFO is pre-filled with a super
+//! frame of silence ([`ExternalXheEncoder::open`]) to absorb that rotation, and
+//! [`ExternalXheEncoder::super_frame`] pads only if the caller itself is short, always
+//! returning one super frame.
 
 use std::collections::{HashMap, VecDeque};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -223,6 +227,22 @@ pub fn probe(cfg: &ExternalConfig) -> Result<ExternalInfo, CodecError> {
     Ok(info)
 }
 
+/// PCM samples of silence to put in the encoder's FIFO before the first call: one audio
+/// super frame.
+///
+/// The encoder takes PCM in blocks of [`ExternalInfo::n_smp`] floats, and a super frame is
+/// not a whole number of blocks — 200 ms at 48 kHz is 9.375 blocks of 1024 stereo frames —
+/// so it asks for 9 or 10 blocks per super frame (18432 or 20480 floats here) against the
+/// 19200 a super frame holds. Fed from an empty FIFO it runs dry on every ten-block frame,
+/// and the silence inserted to keep it going is audible: a few milliseconds of silence and
+/// a click, again and again for as long as the station runs. A super frame in hand absorbs
+/// the whole nine/ten rotation, so the FIFO only ever pads if the caller really is short
+/// (a live input slower than real time).
+fn prefill(info: &ExternalInfo, cfg: &ExternalConfig) -> usize {
+    let super_seconds = if cfg.drm_plus { 0.2 } else { 0.4 };
+    (f64::from(info.sample_rate) * f64::from(cfg.channels) * super_seconds).round() as usize
+}
+
 /// A running external encoder.
 pub struct ExternalXheEncoder {
     child: Option<Child>,
@@ -244,14 +264,15 @@ impl ExternalXheEncoder {
     /// Start the helper and open the encoder for `cfg`.
     pub fn open(cfg: &ExternalConfig) -> Result<Self, CodecError> {
         let (child, stdin, out, info) = spawn(cfg, false)?;
+        let silence = prefill(&info, cfg);
         Ok(Self {
             child: Some(child),
             stdin,
             out,
             info,
-            fifo: VecDeque::new(),
+            fifo: VecDeque::from(vec![0.0f32; silence]),
             pending: None,
-            padded_samples: 0,
+            padded_samples: silence as u64,
             frames: 0,
         })
     }
@@ -263,7 +284,9 @@ impl ExternalXheEncoder {
 
     /// Feed one super frame's worth of interleaved PCM (at [`ExternalInfo::sample_rate`])
     /// and return one DRM audio super frame. Pads with silence when the encoder wants more
-    /// PCM than the caller has supplied (its start-up delay); never returns early.
+    /// PCM than the caller has supplied — one super frame of silence is in hand from
+    /// [`ExternalXheEncoder::open`], which is what keeps the encoder's nine/ten block
+    /// rotation from starving it (see `prefill`); never returns early.
     pub fn super_frame(&mut self, pcm: &[f32]) -> Result<Vec<u8>, CodecError> {
         self.fifo.extend(pcm.iter().copied());
         loop {
@@ -343,5 +366,26 @@ mod tests {
         assert_eq!(ExternalConfig::new(true, 2, 600).bitrate(), 24_000);
         assert_eq!(ExternalConfig::new(true, 2, 2400).bitrate(), 96_000);
         assert_eq!(ExternalConfig::new(false, 2, 1200).bitrate(), 24_000);
+    }
+
+    #[test]
+    fn the_prefill_holds_one_super_frame() {
+        let stereo = ExternalInfo {
+            frame_bytes: 600,
+            n_smp: 2048,
+            sample_rate: 48_000,
+            channels: 2,
+            drm_plus: true,
+            type9: Vec::new(),
+        };
+        // 200 ms at 48 kHz stereo; 400 ms in DRM30; half of it in mono.
+        assert_eq!(prefill(&stereo, &ExternalConfig::new(true, 2, 600)), 19_200);
+        assert_eq!(prefill(&stereo, &ExternalConfig::new(false, 2, 600)), 38_400);
+        assert_eq!(prefill(&stereo, &ExternalConfig::new(true, 1, 600)), 9_600);
+        // It has to cover a whole ten-block super frame's shortfall with room to spare:
+        // ten blocks of 2048 floats want 20480 where a super frame holds 19200.
+        let short_by = 10 * stereo.n_smp as i64 - 19_200;
+        assert_eq!(short_by, 1_280, "a ten-block super frame is 1280 floats short");
+        assert!(prefill(&stereo, &ExternalConfig::new(true, 2, 600)) as i64 > short_by);
     }
 }

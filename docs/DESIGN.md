@@ -1384,6 +1384,16 @@ needs 120 or 192 kHz; the input is resampled to whatever the receiver is configu
   survives only where a result is needed on the spot (pressing *Transmit*), and it is fast
   because the background check has already cached that configuration.
 
+  It also has to be fed at the rate it *asks*, not at the rate a super frame implies. The encoder
+  takes PCM in blocks of `n_smp` floats (1024 stereo frames on this build), and a 200 ms super
+  frame is 9.375 of those, so it asks for 9 or 10 blocks per frame — 18432 or 20480 floats against
+  the 19200 a super frame holds. Fed from an empty FIFO it starved on the ten-block frames, and the
+  silence inserted to keep it going is audible: brief silences and clicks, whose frequency depended
+  on the phase of that rotation (so they came and went with unrelated setting changes). The FIFO now
+  starts with one super frame of silence (19200 floats stereo in DRM+, 9600 mono, 38400 in DRM30),
+  which absorbs the whole rotation; against the helper itself, 3 of 24 super frames starved before
+  and none after. It costs that much extra latency, which the DLL's own 640 ms delay makes free.
+
   Measured (mode E, 192 kHz, 16-QAM protection 1): one stereo service at 122.4 kbit/s decodes
   **141 audio frames of 4 s, none concealed**, the 800 Hz tone intact; two services at 61.2 kbit/s
   each decode 70 frames each with none concealed — and the reference DRM+ recordings (from the
