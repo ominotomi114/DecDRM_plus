@@ -121,9 +121,8 @@ Requirements: Rust 1.88 or newer (1.95 for the GUI), a C/C++ compiler (MSVC Buil
 on Windows, gcc on Linux) and CMake for the vendored codecs, and on Linux the ALSA
 development package (`libasound2-dev`).
 
-**Portable Windows executables**: `decdrm-gui.exe` and `decdrm.exe` that run on any
-64-bit Windows 10/11 with nothing installed (C runtime linked statically, DAC with its
-weights built in, about 320 MB each) are attached to the
+**Portable Windows executables**: `decdrm-gui.exe`, `decdrm.exe` and `full.zip` (same pair with DAC weights included) that run on any
+64-bit Windows 10/11 with nothing installed (C runtime linked statically, about 15 MB each) are attached to the
 [releases](https://github.com/ominotomi114/DecDRM_plus/releases), or built into `exe\`
 using the `.bat` scripts in the `scripts/` folder.
 
