@@ -20,7 +20,7 @@
 //
 // Modes:
 //   --probe     open, print OK, close, exit (a smoke test for the DLL and the parameters)
-//   --selftest  feed a 1 kHz sine, check every super frame has the expected size
+//   [--bytes N] [--probe|--selftest  feed a 1 kHz sine, check every super frame has the expected size
 //   (default)   the stdio protocol above
 //
 // Licensing: the DLL is a commercial Fraunhofer encoder under its embedded licence blob.
@@ -113,8 +113,7 @@ static void print_ok(int frame_bytes, int n_smp, int channels, int drm_plus, con
     fflush(stdout);
 }
 
-static int open_encoder(const char *dll_path, int drm_plus, int channels, int frame_bytes, enc_t *h,
-                        int *n_smp, unsigned char *sdc) {
+static int open_encoder(const char *dll_path, int drm_plus, int channels, int frame_bytes, enc_t *h, int *n_smp, unsigned char *sdc) {
     int n_sdc = 128;
     int bitrate = bitrate_for(frame_bytes, drm_plus);
     HMODULE dll = load_dll(dll_path);
@@ -212,6 +211,7 @@ int main(int argc, char **argv) {
     // Feeding a new block every time instead loses up to a fifth of the audio at the
     // lower bit rates, where the encoder's frame is not a whole number of blocks.
     int have = 0;
+    int xhe_debug = getenv("XHE_DEBUG") != NULL;
     for (;;) {
         if (have < n_smp) {
             int want = n_smp - have;
@@ -223,7 +223,14 @@ int main(int argc, char **argv) {
         int n_bytes = frame_bytes, n_io = n_smp, left = 0;
         int rc = g_encode(h, pcm, n_smp, out, frame_bytes, &n_bytes, &n_io, &left);
         if (rc != 0) fail("encode failed", rc);
-        int used = n_io > 0 && n_io < n_smp ? n_io : n_smp;
+        if (xhe_debug)
+            fprintf(stderr, "call in %d -> nSmp %d nBytes %d left %d\n", n_smp, n_io, n_bytes, left);
+        // `nSmp` is in/out: the encoder says how many of the samples it actually took. It
+        // can take none at all (it emits a super frame from what it already holds), and at
+        // the lower bit rates it does that often. Whatever it did not take is audio that
+        // must be offered again, so it stays in the buffer and the next NEED asks only for
+        // what is missing; reading a fresh block over it loses that much of the programme.
+        int used = n_io >= 0 && n_io <= n_smp ? n_io : n_smp;
         if (used < n_smp) {
             unused_total += n_smp - used;
             memmove(pcm, pcm + used, (size_t)(n_smp - used) * sizeof(float));

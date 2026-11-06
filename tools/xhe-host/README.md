@@ -65,9 +65,13 @@ FRAME <len>    followed by len bytes of single super frame (plain bytes)
 ERROR <code> <text>   the encoder failed; the host exits
 ```
 
-`n` is normally the whole block the encoder asked for, but it can be smaller: the encoder only
-consumes part of each block (`n_io`), and the helper keeps the rest of the audio instead of
-reading a fresh block over it — so after a short block it asks only for what is missing.
+`n` is normally the whole block the encoder asked for, but it can be smaller. The DLL's `nSmp` is
+an *in/out* parameter: it reports how many of the samples it actually took, and it can take **none**
+of them — it then emits a super frame from what it already holds — while `left` says it still has
+audio of its own. The helper keeps whatever the encoder did not take and asks only for the rest, so
+no PCM is lost; reading a fresh block over it costs up to a fifth of the programme at the lower bit
+rates, where the encoder does this often. Set `XHE_DEBUG=1` to see `nSmp`/`nBytes`/`left` per call on
+stderr.
 
 The DLL's JNI exports expect a Java VM, which DecDRM has no reason to embed, so the host
 calls the encoder entry points of the module it loaded. Nothing in the DLL's licence blob
