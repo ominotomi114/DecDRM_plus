@@ -1576,6 +1576,11 @@ fn xhe_external_plan(
         f64::from(bitrate) / 1000.0
     );
     // The DLL's limits (refs/dll/fhgio-api.md): a clearer message than an encoder error code.
+    // Measured against the DLL at 600..900 bytes per super frame: there it asks for ~23100
+    // floats of PCM per 200 ms frame instead of 19200 (240 ms instead of 200) and drops the
+    // surplus, so a fifth of the audio is skipped — audibly chopped. Every other super frame
+    // size asks for 19200 ±0.5 %.
+    let mis_timed = (24_000..=36_000).contains(&bitrate);
     let refused = if !(6_000..=163_920).contains(&bitrate) {
         Some("it takes 6.0–163.9 kbit/s")
     } else if a.stereo && bitrate < 12_000 {
@@ -1584,11 +1589,19 @@ fn xhe_external_plan(
         Some("its mono mode takes at most 39.9 kbit/s")
     } else if !drm_plus && bitrate > 71_960 {
         Some("in DRM30 (modes A–D) it takes at most 71.9 kbit/s")
+    } else if mis_timed {
+        Some(
+            "it mis-times frames between 24.0 and 36.0 kbit/s: it asks for 240 ms of audio \
+             per 200 ms super frame and throws the rest away, which sounds like chopping",
+        )
     } else {
         None
     };
     if let Some(reason) = refused {
-        let hint = if bitrate < 12_000 {
+        let hint = if mis_timed {
+            "use at most 20.0 kbit/s or at least 40.0 kbit/s (a lower or a higher share of the \
+             channel, or another protection level)"
+        } else if bitrate < 12_000 {
             "give the audio stream more of the channel (a wider channel or a lower protection level)"
         } else {
             stream_remedy(stream)
@@ -1750,6 +1763,49 @@ mod tests {
 
     /// The chosen bit rate keeps the worst measured super frame within the safety
     /// margin, grows with the payload, and does not exist below FDK's floor.
+    /// The external encoder mistimes its frames between 24 and 36 kbit/s — it asks for
+    /// 240 ms of audio per 200 ms super frame and drops the surplus — so the plan refuses
+    /// those instead of transmitting chopped audio. This station splits 59.6 kbit/s
+    /// between two services: 29.8 kbit/s each, in the middle of the band.
+    #[test]
+    fn the_external_encoder_refuses_the_mistimed_bit_rates() {
+        let toml = r#"
+[channel]
+mode = "E"
+occupancy = 0
+msc_mode = "4-QAM"
+sdc_mode = "4-QAM"
+protection_b = 2
+working_sample_rate = "192kHz"
+
+[output]
+file = "test.wav"
+
+[[service]]
+label = "One"
+id = 1
+
+[service.audio]
+codec = "xhe-aac-external"
+stereo = true
+input = { tone_hz = 1000.0 }
+
+[[service]]
+label = "Two"
+id = 2
+
+[service.audio]
+codec = "xhe-aac-external"
+stereo = true
+input = { tone_hz = 500.0 }
+"#;
+        let cfg = StationConfig::from_toml_str(toml).expect("the example parses");
+        let err = cfg.validate().expect_err("29.8 kbit/s must be refused");
+        let text = format!("{err} {}", err.problems().join(" "));
+        assert!(text.contains("mis-times"), "{text}");
+        assert!(text.contains("29.8"), "the message names the bit rate: {text}");
+    }
+
     #[test]
     fn aac_bitrate_selection() {
         for codec in [Codec::Aac, Codec::HeAac, Codec::HeAacV2] {

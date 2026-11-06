@@ -1394,6 +1394,14 @@ needs 120 or 192 kHz; the input is resampled to whatever the receiver is configu
   which absorbs the whole rotation; against the helper itself, 3 of 24 super frames starved before
   and none after. It costs that much extra latency, which the DLL's own 640 ms delay makes free.
 
+  The DLL is not uniform across bit rates, either. Between 24.0 and 36.0 kbit/s it asks for ~23100
+  floats of PCM per 200 ms super frame instead of 19200 — 240 ms of audio for a 200 ms slot — and
+  drops the surplus, so about a fifth of the audio is skipped: gaps of 40–55 ms, several times a
+  second, with the tone's pitch untouched (measured through the whole chain on a mode E, 4-QAM,
+  protection 2 station with two services at 29.8 kbit/s). Every other super frame size asks for
+  19200 ±0.5 %. The plan refuses that band with a message that says so, rather than transmitting
+  chopped audio.
+
   Measured (mode E, 192 kHz, 16-QAM protection 1): one stereo service at 122.4 kbit/s decodes
   **141 audio frames of 4 s, none concealed**, the 800 Hz tone intact; two services at 61.2 kbit/s
   each decode 70 frames each with none concealed — and the reference DRM+ recordings (from the

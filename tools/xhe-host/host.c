@@ -205,19 +205,37 @@ int main(int argc, char **argv) {
 
     unsigned char *out = malloc((size_t)frame_bytes);
     float *pcm = malloc((size_t)n_smp * sizeof(float));
+    long unused_total = 0;
+    // The encoder often uses only part of the block it is given (`n_io` floats, the rest
+    // is not consumed yet). Those samples are audio: they stay in the buffer and are
+    // offered again, so `NEED` asks for what is missing rather than for a whole block.
+    // Feeding a new block every time instead loses up to a fifth of the audio at the
+    // lower bit rates, where the encoder's frame is not a whole number of blocks.
+    int have = 0;
     for (;;) {
-        printf("NEED %d\n", n_smp);
-        fflush(stdout);
-        if (fread(pcm, sizeof(float), (size_t)n_smp, stdin) != (size_t)n_smp) break; // EOF
+        if (have < n_smp) {
+            int want = n_smp - have;
+            printf("NEED %d\n", want);
+            fflush(stdout);
+            if (fread(pcm + have, sizeof(float), (size_t)want, stdin) != (size_t)want) break; // EOF
+            have = n_smp;
+        }
         int n_bytes = frame_bytes, n_io = n_smp, left = 0;
         int rc = g_encode(h, pcm, n_smp, out, frame_bytes, &n_bytes, &n_io, &left);
         if (rc != 0) fail("encode failed", rc);
+        int used = n_io > 0 && n_io < n_smp ? n_io : n_smp;
+        if (used < n_smp) {
+            unused_total += n_smp - used;
+            memmove(pcm, pcm + used, (size_t)(n_smp - used) * sizeof(float));
+        }
+        have = n_smp - used;
         if (n_bytes > 0) {
             printf("FRAME %d\n", n_bytes);
             fwrite(out, 1, (size_t)n_bytes, stdout);
             fflush(stdout);
         }
     }
+    fprintf(stderr, "decdrm-xhe-host: %ld samples re-offered instead of being dropped\n", unused_total);
     g_close(&h);
     free(out);
     free(pcm);

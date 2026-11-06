@@ -65,6 +65,10 @@ FRAME <len>    followed by len bytes of single super frame (plain bytes)
 ERROR <code> <text>   the encoder failed; the host exits
 ```
 
+`n` is normally the whole block the encoder asked for, but it can be smaller: the encoder only
+consumes part of each block (`n_io`), and the helper keeps the rest of the audio instead of
+reading a fresh block over it — so after a short block it asks only for what is missing.
+
 The DLL's JNI exports expect a Java VM, which DecDRM has no reason to embed, so the host
 calls the encoder entry points of the module it loaded. Nothing in the DLL's licence blob
 is touched: the blob still decides which profiles may be instantiated.
