@@ -633,9 +633,30 @@ impl TimeSync {
     }
 }
 
+/// Smallest mode score that counts as a correlation at all.
+///
+/// Silence scores exactly zero in every mode, and a ratio between two zeros is infinite, so
+/// without this floor a stretch of digital silence is a "certain" detection — of whichever
+/// mode comes last in `RobustnessMode::ALL`, because `max_by` returns the last maximum on a
+/// tie. That is mode **E**, so a quiet lead-in was detected as DRM+ (see [`decide`]).
+///
+/// The floor is two orders of magnitude below a real signal's score: on the loopback a clean
+/// signal scores about 0.08 in mode A (whose guard is a tenth of the symbol) up to ~0.4 in
+/// mode D (nearly half of it), while the modes that are not on the air sit at ~0.005, which
+/// is the estimator's own noise.
+const MIN_MODE_SCORE: Real = 1e-3;
+
 /// Best mode and its ratio to the second best, if the ratio exceeds `threshold`.
+///
+/// Two guards, both needed: the score must be above [`MIN_MODE_SCORE`] (no signal at all
+/// must never decide a mode), and the best must beat the second best by `threshold`. The
+/// second is what separates the modes; it is meaningless when neither score is real.
 fn decide(scores: &[Real; NMODES], threshold: Real) -> Option<(RobustnessMode, Real)> {
     let (best, &max) = scores.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1))?;
+    // `NaN` would slip through a plain `<` comparison, hence the explicit test.
+    if max.is_nan() || max < MIN_MODE_SCORE {
+        return None;
+    }
     let second = scores.iter().enumerate().filter(|&(i, _)| i != best).map(|(_, &v)| v).fold(0.0, Real::max);
     let rel = if second > 0.0 { max / second } else { Real::INFINITY };
     (rel > threshold).then(|| (RobustnessMode::ALL[best], rel))
@@ -681,5 +702,23 @@ mod tests {
             let est = -c.arg() / (2.0 * std::f64::consts::PI * tu_s);
             assert!((est - df).abs() < 0.5, "{rate}: estimated {est} Hz, expected {df}");
         }
+    }
+
+    /// Silence is not a detection. Every mode's score is exactly zero then, and the ratio
+    /// test turned that into `∞ > threshold` — with `max_by` picking the *last* maximum on a
+    /// tie, i.e. mode E. That is what made a 192 kHz recording starting with a moment of
+    /// silence report DRM+ (see `tests/modes_at_rates.rs`).
+    #[test]
+    fn silence_is_not_a_mode_detection() {
+        assert!(decide(&[0.0; NMODES], RM_RELIABILITY).is_none());
+        assert!(decide(&[0.0; NMODES], RM_RELIABILITY_LONG).is_none());
+        // A real (if small) score still decides, and a tie between two real scores does not.
+        let mut one = [0.0; NMODES];
+        one[1] = 0.05;
+        assert_eq!(decide(&one, RM_RELIABILITY).map(|(m, _)| m), Some(RobustnessMode::B));
+        let mut tie = [0.0; NMODES];
+        tie[1] = 0.05;
+        tie[2] = 0.05;
+        assert!(decide(&tie, RM_RELIABILITY).is_none());
     }
 }

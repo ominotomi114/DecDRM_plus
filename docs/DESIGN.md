@@ -1012,6 +1012,34 @@ needs 120 or 192 kHz; the input is resampled to whatever the receiver is configu
      stays at 48). A sound card or a KiwiSDR has no file to ask, so those keep 48 kHz unless
      the caller says otherwise.
 
+     **A quiet lead-in above 48 kHz used to be "detected" as mode E** (2026-11-09). Silence
+     scores exactly zero in every mode, and `decide` compared the best score with the
+     second-best as a *ratio* — 0/0 = ∞, an infinitely certain detection — while `max_by`
+     returns the **last** maximum on a tie, which among the five modes is mode E. So a stretch
+     of digital silence decided DRM+, and the receiver switched to mode E, built its chain for
+     a signal that is not there, and only got back to the right mode after a restart (measured
+     at 192 kHz, mode A behind 0.5 s of silence: mode detection reported `[E, A]`, and the
+     acquisition it threw away costs the first seconds of the recording).
+     The window is a coincidence of two lengths: `freqacq` hands time sync the ~0.45 s of
+     samples it buffered before acquiring, and mode detection needs `RM_BLOCKS` = 16 symbols
+     before it decides — **41 ms** for mode E's 100 ms frames, but 0.43 s for mode B's 400 ms
+     ones. Only above 48 kHz is the mode E window short enough to fire inside the pre-signal
+     buffer, which is why this never showed in the 48 kHz loopback. `decide` now requires a
+     score above `MIN_MODE_SCORE` (1e-3) before it compares anything: a clean mode A scores
+     ~0.08 and the modes that are not on the air ~0.005, so the floor is two orders of
+     magnitude below a real detection. The same floor makes the all-zero case at 48 kHz
+     (where mode D is the last maximum) impossible too.
+
+     That bug was found while looking at DRM30 at 192 kHz, and the look turned up a **test
+     gap rather than more faults**: `loopback.rs` runs every layout at the 48 kHz default and
+     `mode_e_rx.rs` only mode E, so nothing exercised modes A–D at another rate. The new
+     `tests/modes_at_rates.rs` decodes all four DRM30 modes, unpinned, at **48, 96, 120 and
+     192 kHz** (FAC ≥ 8 of 15 frames each, and the detected mode is the transmitted one), and
+     adds the lead-in regression: four lead lengths of digital silence at 192 kHz — 0.5–0.55 s
+     is where the old code reported mode E — plus a noise-floor lead at 120 and 192 kHz for
+     every mode. Verified the other way round as well: with the floor removed the lead-in test
+     fails at 0.5 s with `detected [E, A]`, and passes with it.
+
   The `TimeWiener` `params(E)` filter length/Doppler pair and `freq_wiener_len(E)` were
   **placeholders** copied from mode C/D. They are tuned now (2026-11-02): **mode E is
   (3 pilots, σ = 12 Hz)** and the frequency length stays 13, which a 7–15 tap sweep could not
